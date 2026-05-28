@@ -677,15 +677,20 @@ enable_bbr() {
 # ============================================================
 
 self_install() {
-    local self_path
-    self_path="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+    mkdir -p "$BASE_DIR"
     
-    # 复制到 /opt/pd/
-    if [ "$self_path" != "$BASE_DIR/install.sh" ]; then
-        mkdir -p "$BASE_DIR"
-        cp "$self_path" "$BASE_DIR/install.sh"
-        chmod +x "$BASE_DIR/install.sh"
+    # 检测运行模式：curl|bash (stdin) vs 本地文件
+    if [ ! -f "$0" ] || [ "$0" = "bash" ] || echo "$0" | grep -qE '^(/dev/fd|pipe:)'; then
+        # 通过 curl|bash 运行 — 从 GitHub 下载
+        curl -fsSL "$SCRIPT_URL" -o "$BASE_DIR/install.sh"
+    else
+        local self_path
+        self_path="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+        if [ "$self_path" != "$BASE_DIR/install.sh" ]; then
+            cp "$self_path" "$BASE_DIR/install.sh"
+        fi
     fi
+    chmod +x "$BASE_DIR/install.sh"
     
     # pd 命令
     ln -sf "$BASE_DIR/install.sh" /usr/local/bin/pd 2>/dev/null || true
