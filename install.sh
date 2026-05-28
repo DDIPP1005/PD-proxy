@@ -141,8 +141,10 @@ flock -n 200 || { err "已有 PD-proxy 进程在运行"; exit 1; }
 
 get_snell_version() {
     local v
-    v=$(curl -s https://manual.nssurge.com/others/snell.html | grep -oP 'snell-server-v\K5\.[0-9]+\.[0-9]+[a-z0-9]*' | grep -v b | head -1)
-    [ -n "$v" ] && echo "v$v" || echo "v5.0.0"
+    # 从 Surge 官方页面抓取最新版本号
+    v=$(curl -s https://manual.nssurge.com/others/snell.html 2>/dev/null | grep -oP 'snell-server-v\K5\.[0-9]+\.[0-9]+[a-z0-9]*' | grep -v b | head -1)
+    [ -z "$v" ] && v=$(curl -s https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell 2>/dev/null | grep -oP 'snell-server-v\K5\.[0-9]+\.[0-9]+[a-z0-9]*' | grep -v b | head -1)
+    [ -n "$v" ] && echo "v${v}" || echo "v5.0.1"
 }
 
 install_snell() {
@@ -166,7 +168,7 @@ install_snell() {
     
     # 下载
     step "下载 Snell $SNELL_VER..."
-    local url="https://dl.nssurge.com/snell/snell-server-${SNELL_VER#v}-linux-${ARCH}.zip"
+    local url="https://dl.nssurge.com/snell/snell-server-${SNELL_VER}-linux-${ARCH}.zip"
     mkdir -p "$SNELL_DIR"
     curl -fsSL --retry 3 --connect-timeout 10 -o /tmp/pd-snell.zip "$url"
     unzip -o /tmp/pd-snell.zip -d "$SNELL_DIR" &>/dev/null
