@@ -617,6 +617,110 @@ check_status() {
     fi
 }
 
+# ============================================================
+# 查看协议配置
+# ============================================================
+
+show_snell_config() {
+    local port="$1"
+    local psk=$(grep -oP 'psk\s*=\s*\K.+' "$SNELL_DIR/snell.conf" 2>/dev/null || echo "未知")
+    echo -e "${BOLD}${GREEN}══ Snell v5 ══${RESET}"
+    echo -e "端口: ${GREEN}${port}${RESET}"
+    echo -e "PSK:  ${GREEN}${psk}${RESET}"
+    echo ""
+    echo -e "${CYAN}[Surge 配置]${RESET}"
+    echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true${RESET}"
+}
+
+show_hy2_config() {
+    local port="$1"
+    local pwd=$(grep -oP 'password:\s*\K.+' "$HY2_DIR/config.yaml" 2>/dev/null || echo "未知")
+    echo -e "${BOLD}${GREEN}══ Hysteria2 ══${RESET}"
+    echo -e "端口: ${GREEN}${port}${RESET}"
+    echo -e "密码: ${GREEN}${pwd}${RESET}"
+    echo ""
+    echo -e "${CYAN}[Surge 配置]${RESET}"
+    echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}, password=${pwd}, sni=www.bing.com, skip-cert-verify=true${RESET}"
+    echo ""
+    echo -e "${CYAN}[Shadowrocket]${RESET}"
+    gen_qr "hysteria2://${pwd}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
+}
+
+show_vless_config() {
+    local port="$1"
+    # 用 python3 解析 JSON（Debian 自带）
+    local info=$(python3 -c "
+import json
+with open('$XRAY_DIR/config.json') as f:
+    c = json.load(f)
+inb = c['inbounds'][0]
+uid = inb['settings']['clients'][0]['id']
+pk = inb['streamSettings']['realitySettings']['privateKey']
+sid = inb['streamSettings']['realitySettings']['shortIds'][0]
+print(f'{uid}|{pk}|{sid}')
+" 2>/dev/null)
+    local uuid=$(echo "$info" | cut -d'|' -f1)
+    local privkey=$(echo "$info" | cut -d'|' -f2)
+    local shortid=$(echo "$info" | cut -d'|' -f3)
+    # 用 xray 推导公钥
+    local pubkey=$("$XRAY_DIR/xray" x25519 -i "$privkey" 2>/dev/null | grep -oP 'Public key:\s*\K.+' || echo "未知")
+    local link="vless://${uuid}@${IP}:${port}?encryption=none&security=reality&sni=addons.mozilla.org&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp&flow=xtls-rprx-vision#PD-VLESS"
+    echo -e "${BOLD}${GREEN}══ VLESS Reality ══${RESET}"
+    echo -e "端口: ${GREEN}${port}${RESET}"
+    echo -e "UUID: ${GREEN}${uuid}${RESET}"
+    echo ""
+    echo -e "${YELLOW}⚠ Surge 不支持 VLESS Reality，请用 Shadowrocket${RESET}"
+    echo ""
+    echo -e "${CYAN}[Shadowrocket]${RESET}"
+    gen_qr "$link"
+    echo ""
+    echo -e "${CYAN}[通用链接]${RESET}"
+    echo -e "${GREEN}${link}${RESET}"
+}
+
+show_anytls_config() {
+    local port="$1"
+    local pwd=$(grep -oP '\-p\s+\K\S+' /etc/systemd/system/anytls.service 2>/dev/null || echo "未知")
+    local link="anytls://${pwd}@${IP}:${port}#PD-AnyTLS"
+    echo -e "${BOLD}${GREEN}══ AnyTLS ══${RESET}"
+    echo -e "端口: ${GREEN}${port}${RESET}"
+    echo -e "密码: ${GREEN}${pwd}${RESET}"
+    echo ""
+    echo -e "${CYAN}[Surge]${RESET}"
+    echo -e "${YELLOW}⚠ Surge 对 AnyTLS 的支持未官方确认，可能需要外部代理模块${RESET}"
+    echo -e "${GREEN}anytls, ${IP}, ${port}, password=${pwd}${RESET}"
+    echo ""
+    echo -e "${CYAN}[Shadowrocket]${RESET}"
+    gen_qr "$link"
+    echo ""
+    echo -e "${CYAN}[通用链接]${RESET}"
+    echo -e "${GREEN}${link}${RESET}"
+}
+
+show_config() {
+    title "协议配置"
+    echo -e "${CYAN}══════════════════════════════════════════${RESET}"
+    local has_any=false
+    for proto in snell hy2 vless anytls; do
+        local port=$(get_state_port "$proto")
+        if [ "$(get_state_status "$proto")" = "installed" ] && [ -n "$port" ]; then
+            has_any=true
+            case $proto in
+                snell) show_snell_config "$port" ;;
+                hy2) show_hy2_config "$port" ;;
+                vless) show_vless_config "$port" ;;
+                anytls) show_anytls_config "$port" ;;
+            esac
+            echo ""
+        fi
+    done
+    if ! $has_any; then
+        echo -e "  ${YELLOW}暂无已安装的协议${RESET}"
+        echo ""
+    fi
+    echo -e "${CYAN}══════════════════════════════════════════${RESET}"
+}
+
 show_status() {
     title "PD-proxy"
     echo -e "${CYAN}══════════════════════════════════════════${RESET}"
@@ -752,12 +856,13 @@ main_menu() {
     echo "3) 安装 VLESS Reality (仅 Shadowrocket)"
     echo "4) 安装 AnyTLS (beta) (Surge + Shadowrocket)"
     echo "5) 查看状态"
-    echo "6) 卸载协议"
-    echo "7) 开启 BBR"
-    echo "8) 全部卸载"
-    echo "9) 退出"
+    echo "6) 查看配置"
+    echo "7) 卸载协议"
+    echo "8) 开启 BBR"
+    echo "9) 全部卸载"
+    echo "0) 退出"
     echo ""
-    read -rp "选择 [1-9]: " choice
+    read -rp "选择 [0-9]: " choice
     
     case "$choice" in
         1) install_snell; press_enter; main_menu ;;
@@ -765,10 +870,11 @@ main_menu() {
         3) install_vless; press_enter; main_menu ;;
         4) install_anytls; press_enter; main_menu ;;
         5) show_status; press_enter; main_menu ;;
-        6) remove_menu; press_enter; main_menu ;;
-        7) enable_bbr; press_enter; main_menu ;;
-        8) remove_all ;;
-        9) info "再见 👋"; exit 0 ;;
+        6) show_config; press_enter; main_menu ;;
+        7) remove_menu; press_enter; main_menu ;;
+        8) enable_bbr; press_enter; main_menu ;;
+        9) remove_all ;;
+        0) info "再见 👋"; exit 0 ;;
         *) main_menu ;;
     esac
 }
@@ -822,6 +928,10 @@ case "${1:-}" in
         check_root; remove_all
         exit 0
         ;;
+    --show|--config)
+        check_root; detect_os; detect_arch; get_ip; get_mem; show_config
+        exit 0
+        ;;
 esac
 
 # 初始化
@@ -838,16 +948,18 @@ if is_installed snell || is_installed hy2 || is_installed vless || is_installed 
     show_status
     echo ""
     echo "1) 加装新协议"
-    echo "2) 卸载某协议"
-    echo "3) 开启 BBR"
-    echo "4) 全部卸载"
-    echo "5) 退出"
+    echo "2) 查看配置"
+    echo "3) 卸载某协议"
+    echo "4) 开启 BBR"
+    echo "5) 全部卸载"
+    echo "0) 退出"
     read -rp "选择: " cc
     case "$cc" in
         1) main_menu ;;
-        2) remove_menu ;;
-        3) enable_bbr ;;
-        4) remove_all ;;
+        2) show_config ;;
+        3) remove_menu ;;
+        4) enable_bbr ;;
+        5) remove_all ;;
         *) info "再见 👋"; exit 0 ;;
     esac
 else
