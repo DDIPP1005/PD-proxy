@@ -284,7 +284,11 @@ state_set() {
     if echo "$line" | grep -q "${field}="; then
         line=$(echo "$line" | sed "s/${field}=\\S*/${field}=${value}/")
     else
-        line="${line} ${field}=${value}"
+        if [ -n "$line" ]; then
+            line="${line} ${field}=${value}"
+        else
+            line="${key} ${field}=${value}"
+        fi
     fi
     line=$(echo "$line" | sed 's/^ *//;s/ *$//')
     echo "$line" >> "$STATE_FILE"
