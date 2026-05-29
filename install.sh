@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本
+# PD-proxy — 多协议代理一键部署脚本 v2.0.0
 # 协议: Snell v5 | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
+# 架构：数据驱动 — 所有协议定义为元数据表，安装引擎统一处理
+# 原则：零静默错误 — 每步失败显式报错退出，不再吞噬错误
+# ============================================================
 set -euo pipefail
+
+VERSION="2.0.0"
+SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # ============================================================
 # 颜色 & 常量
@@ -12,89 +18,131 @@ set -euo pipefail
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
-VERSION="1.0.0"
-SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 BASE_DIR="/opt/pd"
-SNELL_DIR="/opt/snell"; HY2_DIR="/opt/hysteria2"
-XRAY_DIR="/opt/xray"; ANYTLS_DIR="/opt/anytls"
+STATE_FILE="$BASE_DIR/state.json"
+INSTALLED_BIN="/usr/local/bin/pd"
 
 # ============================================================
-# 日志函数
+# 日志（永不静默）
 # ============================================================
 info()  { echo -e "${GREEN}[✓]${RESET} $*"; }
 warn()  { echo -e "${YELLOW}[!]${RESET} $*"; }
 err()   { echo -e "${RED}[✗]${RESET} $*" >&2; }
 step()  { echo -e "${CYAN}[>]${RESET} $*"; }
 title() { echo -e "\n${BOLD}${CYAN}$*${RESET}"; }
+die()   { err "$@"; exit 1; }
 
 # ============================================================
 # 公共工具
 # ============================================================
 
 check_root() {
-    [ "$(id -u)" = "0" ] || { err "请用 root 运行: sudo bash install.sh"; exit 1; }
+    [ "$(id -u)" = "0" ] || die "请用 root 运行: sudo bash install.sh"
 }
 
 detect_os() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         OS_ID="${ID:-unknown}"
+        OS_PRETTY="${PRETTY_NAME:-unknown}"
     else
         OS_ID="unknown"
+        OS_PRETTY="unknown"
     fi
     case "$OS_ID" in
-        debian|ubuntu) OS="debian" ;;
-        *) OS="unknown" ;;
+        debian|ubuntu) OS_FAMILY="debian" ;;
+        *) die "仅支持 Debian/Ubuntu，当前系统: $OS_ID" ;;
     esac
-    [ "$OS" = "debian" ] || { err "仅支持 Debian/Ubuntu，当前: $OS_ID"; exit 1; }
 }
 
 detect_arch() {
     case "$(uname -m)" in
         x86_64|amd64)  ARCH="amd64" ;;
         aarch64|arm64) ARCH="arm64" ;;
-        *) err "不支持的架构: $(uname -m)"; exit 1 ;;
+        *) die "不支持的架构: $(uname -m)" ;;
     esac
 }
 
 get_ip() {
-    IP=$(curl -s4 ifconfig.me 2>/dev/null || curl -s4 ip.sb 2>/dev/null || echo "未知")
+    IP=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null \
+      || curl -s4 --max-time 5 ip.sb 2>/dev/null \
+      || curl -s4 --max-time 5 icanhazip.com 2>/dev/null \
+      || echo "未知")
 }
 
 get_mem() {
-    MEM_TOTAL=$(free -m | awk '/^Mem:/{print $2}')
-    MEM_AVAIL=$(free -m | awk '/^Mem:/{print $7}')
+    MEM_TOTAL=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo "0")
+    MEM_AVAIL=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}' || echo "0")
+}
+
+has_ipv6() {
+    ip -6 addr show scope global 2>/dev/null | grep -q inet6 && return 0 || return 1
+}
+
+check_disk() {
+    local need_mb="$1"
+    local avail_kb
+    avail_kb=$(df -k /opt 2>/dev/null | awk 'NR==2{print $4}' || echo "0")
+    [ "$avail_kb" -gt $((need_mb * 1024)) ] || die "磁盘空间不足，需要 ${need_mb}MB，剩余 $((avail_kb / 1024))MB"
 }
 
 rand_port() {
-    while true; do
-        PORT=$(( RANDOM % 50001 + 10000 ))
-        ss -tlnp | grep -q ":${PORT} " || { echo "$PORT"; return; }
+    local used_ports=" $(get_all_ports) "
+    local attempts=0
+    while [ $attempts -lt 100 ]; do
+        local p=$(( $(od -An -N2 -i /dev/urandom | tr -d ' ') % 50001 + 10000 ))
+        if ! echo "$used_ports" | grep -q " $p "; then
+            echo "$p"
+            return 0
+        fi
+        attempts=$((attempts + 1))
     done
+    die "无法分配空闲端口（10000-60000），请手动指定"
 }
 
 rand_pass() {
-    openssl rand -base64 32 2>/dev/null || head -c 32 /dev/urandom | base64 | tr -d '='
+    openssl rand -base64 32 2>/dev/null || {
+        local raw
+        raw=$(head -c 32 /dev/urandom | base64 2>/dev/null | tr -d '=\n') 
+        [ -n "$raw" ] || raw=$(date +%s%N | sha256sum | cut -d' ' -f1)
+        echo "$raw"
+    }
 }
 
-install_qrencode() {
-    command -v qrencode &>/dev/null && return
-    info "安装 qrencode..."
-    apt-get update -qq && apt-get install -y -qq qrencode &>/dev/null || true
+verify_download() {
+    local file="$1" label="$2" min_bytes="${3:-100000}"
+    if [ ! -f "$file" ]; then
+        die "$label 下载失败：文件不存在"
+    fi
+    local size
+    size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo "0")
+    if [ "$size" -lt "$min_bytes" ]; then
+        die "$label 下载失败：文件大小异常（${size} bytes < ${min_bytes}）"
+    fi
+    # 验证可执行头（ELF magic = \x7fELF）
+    if ! head -c 4 "$file" | grep -q $'\x7fELF'; then
+        die "$label 损坏：不是有效的 ELF 二进制文件"
+    fi
 }
 
-gen_qr() {
-    local text="$1"
-    command -v qrencode &>/dev/null || return
-    qrencode -t ANSIUTF8 -m 1 -s 1 "$text" 2>/dev/null
+verify_port() {
+    local port="$1" service="$2"
+    sleep 2
+    if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+        info "端口 $port 监听确认 ✅"
+        return 0
+    fi
+    err "端口 $port 未监听，服务可能启动失败"
+    warn "查看日志: journalctl -u $service -n 30 --no-pager"
+    return 1
 }
 
 add_firewall() {
     local port="$1"
-    if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
-        ufw allow "$port"/tcp &>/dev/null || true
-        ufw allow "$port"/udp &>/dev/null || true
-    elif command -v iptables &>/dev/null; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "$port"/tcp >/dev/null 2>&1 || true
+        ufw allow "$port"/udp >/dev/null 2>&1 || true
+    elif command -v iptables >/dev/null 2>&1; then
         iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
         iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
     fi
@@ -102,190 +150,346 @@ add_firewall() {
 
 del_firewall() {
     local port="$1"
-    if command -v ufw &>/dev/null; then
-        ufw delete allow "$port"/tcp &>/dev/null || true
-        ufw delete allow "$port"/udp &>/dev/null || true
-    elif command -v iptables &>/dev/null; then
+    if command -v ufw >/dev/null 2>&1; then
+        ufw delete allow "$port"/tcp >/dev/null 2>&1 || true
+        ufw delete allow "$port"/udp >/dev/null 2>&1 || true
+    elif command -v iptables >/dev/null 2>&1; then
         iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
     fi
 }
 
-verify_port() {
-    local port="$1"
-    sleep 1
-    ss -tlnp | grep -q ":${port} " && return 0
-    warn "端口 $port 未监听，请检查: journalctl -u $2 -n 20"
-    return 1
-}
-
 install_deps() {
-    local pkgs="curl ca-certificates"
-    apt-get update -qq &>/dev/null
-    apt-get install -y -qq $pkgs &>/dev/null
+    local missing=""
+    command -v curl >/dev/null 2>&1 || missing="$missing curl"
+    command -v unzip >/dev/null 2>&1 || missing="$missing unzip"
+    command -v python3 >/dev/null 2>&1 || missing="$missing python3"
+    [ -z "$missing" ] && return 0
+    info "安装依赖: $missing"
+    apt-get update -qq || die "apt-get update 失败，请检查网络"
+    apt-get install -y -qq $missing >/dev/null || die "依赖安装失败"
 }
 
-trap_cleanup() {
-    rm -f /tmp/pd-proxy.lock
-    rm -rf /tmp/pd-*
+install_qrencode() {
+    command -v qrencode >/dev/null 2>&1 && return 0
+    info "安装 qrencode..."
+    apt-get install -y -qq qrencode >/dev/null 2>&1 || warn "qrencode 安装失败，跳过二维码生成"
 }
-trap trap_cleanup EXIT
 
-# Lock file to prevent concurrent runs
-exec 200>/tmp/pd-proxy.lock
-flock -n 200 || { err "已有 PD-proxy 进程在运行"; exit 1; }
+gen_qr() {
+    command -v qrencode >/dev/null 2>&1 || return
+    qrencode -t ANSIUTF8 -m 1 -s 1 "$1" 2>/dev/null || true
+}
 
 # ============================================================
-# Snell v5
+# 状态管理（JSON，用 python3 读写）
 # ============================================================
 
-get_snell_version() {
-    local v
-    # 从 Surge 官方页面抓取最新版本号
-    v=$(curl -s https://manual.nssurge.com/others/snell.html 2>/dev/null | grep -oP 'snell-server-v\K5\.[0-9]+\.[0-9]+[a-z0-9]*' | grep -v b | head -1)
-    [ -z "$v" ] && v=$(curl -s https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell 2>/dev/null | grep -oP 'snell-server-v\K5\.[0-9]+\.[0-9]+[a-z0-9]*' | grep -v b | head -1)
-    [ -n "$v" ] && echo "v${v}" || echo "v5.0.1"
+state_read() {
+    [ -f "$STATE_FILE" ] || { echo "{}"; return; }
+    python3 -c "
+import json
+with open('$STATE_FILE') as f:
+    data = json.load(f)
+print(json.dumps(data))
+"
 }
 
-install_snell() {
-    title "安装 Snell v5"
-    
-    # 版本
-    step "获取最新版本..."
-    SNELL_VER=$(get_snell_version)
-    info "版本: $SNELL_VER"
-    
-    # 端口
-    if [ -n "${PD_SNELL_PORT:-}" ]; then
-        SNELL_PORT="$PD_SNELL_PORT"
-    else
-        SNELL_PORT=$(rand_port)
-    fi
-    info "端口: $SNELL_PORT"
-    
-    # PSK
-    SNELL_PSK=$(rand_pass)
-    
-    # 下载
-    step "下载 Snell $SNELL_VER..."
-    local url="https://dl.nssurge.com/snell/snell-server-${SNELL_VER}-linux-${ARCH}.zip"
-    mkdir -p "$SNELL_DIR"
-    curl -fsSL --retry 3 --connect-timeout 10 -o /tmp/pd-snell.zip "$url"
-    unzip -o /tmp/pd-snell.zip -d "$SNELL_DIR" &>/dev/null
-    chmod +x "$SNELL_DIR/snell-server"
-    info "Snell 安装完成"
-    
-    # 配置
-    step "写入配置..."
-    cat > "$SNELL_DIR/snell.conf" <<EOF
-[snell-server]
-listen = 0.0.0.0:${SNELL_PORT}
-psk = ${SNELL_PSK}
-ipv6 = true
-EOF
-    chmod 600 "$SNELL_DIR/snell.conf"
-    
-    # systemd
-    step "注册服务..."
-    cat > /etc/systemd/system/snell.service <<EOF
+state_get() {
+    local key="$1" field="${2:-}"
+    python3 -c "
+import json
+try:
+    with open('$STATE_FILE') as f:
+        data = json.load(f)
+    v = data.get('$key', {})
+    if '$field':
+        print(v.get('$field', ''))
+    else:
+        print(json.dumps(v))
+except:
+    print('{}' if not '$field' else '')
+"
+}
+
+state_set() {
+    local key="$1" field="$2" value="$3"
+    mkdir -p "$BASE_DIR"
+    python3 -c "
+import json
+try:
+    with open('$STATE_FILE') as f:
+        data = json.load(f)
+except:
+    data = {}
+if '$key' not in data:
+    data['$key'] = {}
+data['$key']['$field'] = '$value'
+with open('$STATE_FILE', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+}
+
+state_del() {
+    local key="$1"
+    python3 -c "
+import json
+try:
+    with open('$STATE_FILE') as f:
+        data = json.load(f)
+    data.pop('$key', None)
+    with open('$STATE_FILE', 'w') as f:
+        json.dump(data, f, indent=2)
+except:
+    pass
+"
+}
+
+state_installed() {
+    local key="$1"
+    local s
+    s=$(state_get "$key" "status")
+    [ "$s" = "installed" ] && return 0 || return 1
+}
+
+get_all_ports() {
+    python3 -c "
+import json
+try:
+    with open('$STATE_FILE') as f:
+        data = json.load(f)
+    for k, v in data.items():
+        p = v.get('port', '')
+        if p:
+            print(p)
+except:
+    pass
+" 2>/dev/null
+}
+
+# ============================================================
+# 协议注册表（数据驱动核心 — 新增协议只需加一块定义）
+# ============================================================
+
+# 协议元数据: key, name, dir, bin, service, mem_mb, disk_mb, clients
+# clients: s=Surge, q=Shadowrocket二维码, l=通用链接
+declare -A PROTO=()
+
+register_protocols() {
+    # ---- Snell v5 ----
+    PROTO[snell_key]="snell"
+    PROTO[snell_name]="Snell v5"
+    PROTO[snell_dir]="/opt/snell"
+    PROTO[snell_bin]="/opt/snell/snell-server"
+    PROTO[snell_service]="snell"
+    PROTO[snell_mem]="5MB"
+    PROTO[snell_disk]="20"
+    PROTO[snell_clients]="s"
+
+    # ---- Hysteria2 ----
+    PROTO[hy2_key]="hy2"
+    PROTO[hy2_name]="Hysteria2"
+    PROTO[hy2_dir]="/opt/hysteria2"
+    PROTO[hy2_bin]="/opt/hysteria2/hysteria"
+    PROTO[hy2_service]="hysteria2"
+    PROTO[hy2_mem]="18MB"
+    PROTO[hy2_disk]="30"
+    PROTO[hy2_clients]="s,q"
+
+    # ---- VLESS Reality ----
+    PROTO[vless_key]="vless"
+    PROTO[vless_name]="VLESS Reality"
+    PROTO[vless_dir]="/opt/xray"
+    PROTO[vless_bin]="/opt/xray/xray"
+    PROTO[vless_service]="xray"
+    PROTO[vless_mem]="30MB"
+    PROTO[vless_disk]="60"
+    PROTO[vless_clients]="q,l"
+
+    # ---- AnyTLS ----
+    PROTO[anytls_key]="anytls"
+    PROTO[anytls_name]="AnyTLS"
+    PROTO[anytls_dir]="/opt/anytls"
+    PROTO[anytls_bin]="/opt/anytls/anytls-server"
+    PROTO[anytls_service]="anytls"
+    PROTO[anytls_mem]="5MB"
+    PROTO[anytls_disk]="20"
+    PROTO[anytls_clients]="s,q,l"
+}
+
+# 获取协议元数据
+pkey()   { echo "${PROTO[${1}_key]}"; }
+pname()  { echo "${PROTO[${1}_name]}"; }
+pdir()   { echo "${PROTO[${1}_dir]}"; }
+pbin()   { echo "${PROTO[${1}_bin]}"; }
+psvc()   { echo "${PROTO[${1}_service]}"; }
+pmem()   { echo "${PROTO[${1}_mem]}"; }
+pdisk()  { echo "${PROTO[${1}_disk]}"; }
+pclients() { echo "${PROTO[${1}_clients]}"; }
+
+ALL_PROTOS="snell hy2 vless anytls"
+
+# ============================================================
+# systemd 辅助
+# ============================================================
+
+write_systemd() {
+    local svc="$1" bin="$2" args="$3"
+    cat > "/etc/systemd/system/${svc}.service" <<EOF
 [Unit]
-Description=Snell v5 Proxy
+Description=PD-proxy: ${svc}
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=$SNELL_DIR/snell-server -c $SNELL_DIR/snell.conf
+ExecStart=${bin} ${args}
 Restart=always
 RestartSec=5
 LimitNOFILE=32768
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=${pdir}
+RestrictAddressFamilies=AF_INET AF_INET6
+PrivateTmp=yes
 
 [Install]
 WantedBy=multi-user.target
 EOF
+}
+
+register_and_start() {
+    local svc="$1"
     systemctl daemon-reload
-    systemctl enable snell &>/dev/null
-    systemctl restart snell
-    
-    # 防火墙 & 验证
-    add_firewall "$SNELL_PORT"
-    verify_port "$SNELL_PORT" "snell"
-    
-    # 输出
+    systemctl enable "$svc" >/dev/null 2>&1 || warn "systemctl enable $svc 失败"
+    systemctl restart "$svc" || die "启动 $svc 失败: journalctl -u $svc -n 20"
+}
+
+stop_and_remove() {
+    local svc="$1"
+    systemctl stop "$svc" 2>/dev/null || true
+    systemctl disable "$svc" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${svc}.service"
+    systemctl daemon-reload
+    systemctl reset-failed "${svc}.service" 2>/dev/null || true
+}
+
+# ============================================================
+# 协议专用逻辑（hook 函数）
+# ============================================================
+
+# ---- Snell v5 ----
+snell_get_version() {
+    local v cache_file="$BASE_DIR/.snell-version"
+    # 1. 尝试缓存
+    if [ -f "$cache_file" ] && [ "$(($(date +%s) - $(stat -f%m "$cache_file" 2>/dev/null || stat -c%Y "$cache_file" 2>/dev/null || echo 0)))" -lt 86400 ]; then
+        v=$(cat "$cache_file")
+        # 验证版本是否仍可下载
+        local test_url="https://dl.nssurge.com/snell/snell-server-${v}-linux-${ARCH}.zip"
+        if curl -fsI --max-time 10 "$test_url" >/dev/null 2>&1; then
+            echo "$v"; return 0
+        fi
+    fi
+    # 2. 从 Surge 手册抓取
+    v=$(curl -fs --max-time 15 "https://manual.nssurge.com/others/snell.html" 2>/dev/null \
+        | grep -oP 'snell-server-v\K5\.[0-9]+\.[0-9]+[a-z0-9]*' \
+        | grep -v 'b' | head -1)
+    if [ -n "$v" ]; then
+        echo "v${v}" | tee "$cache_file"; return 0
+    fi
+    # 3. 级联探测 (v5.0.1 → v5.0.5)
+    for minor in 1 2 3 4 5; do
+        local probe="v5.0.${minor}"
+        local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
+        if curl -fsI --max-time 10 "$probe_url" >/dev/null 2>&1; then
+            echo "$probe" | tee "$cache_file"; return 0
+        fi
+    done
+    die "Snell 版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v5.0.x"
+}
+
+snell_download() {
+    local ver="$1"
+    local url="https://dl.nssurge.com/snell/snell-server-${ver}-linux-${ARCH}.zip"
+    step "下载 Snell $ver ..."
+    mkdir -p "$(pdir snell)"
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o /tmp/pd-snell.zip "$url" \
+        || die "Snell 下载失败: $url"
+    unzip -o /tmp/pd-snell.zip -d "$(pdir snell)" >/dev/null \
+        || die "Snell 解压失败"
+    chmod +x "$(pbin snell)"
+    verify_download "$(pbin snell)" "Snell" 50000
+    info "Snell 下载完成"
+}
+
+snell_configure() {
+    local port="$1" psk="$2"
+    local ipv6_enabled="false"
+    has_ipv6 && ipv6_enabled="true"
+    cat > "$(pdir snell)/snell.conf" <<EOF
+[snell-server]
+listen = 0.0.0.0:${port}
+psk = ${psk}
+ipv6 = ${ipv6_enabled}
+EOF
+    chmod 600 "$(pdir snell)/snell.conf"
+}
+
+snell_service_args() {
+    echo "-c $(pdir snell)/snell.conf"
+}
+
+snell_output() {
+    local port="$1" psk="$2"
     echo ""
     echo -e "${BOLD}══════════════════════════════${RESET}"
     echo -e "${BOLD}  Snell v5 ✅ 安装完成${RESET}"
     echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "端口:   ${GREEN}${SNELL_PORT}${RESET}"
-    echo -e "PSK:    ${GREEN}${SNELL_PSK}${RESET}"
+    echo -e "端口:   ${GREEN}${port}${RESET}"
+    echo -e "PSK:    ${GREEN}${psk}${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
-    echo -e "${GREEN}HK-Snell = snell, ${IP}, ${SNELL_PORT}, psk=${SNELL_PSK}, version=5, reuse=true, tfo=true${RESET}"
+    echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true${RESET}"
     echo -e "${BOLD}══════════════════════════════${RESET}"
-    
-    save_state "snell" "$SNELL_PORT" "installed"
 }
 
-uninstall_snell() {
-    info "卸载 Snell v5..."
-    systemctl stop snell 2>/dev/null || true
-    systemctl disable snell 2>/dev/null || true
-    rm -f /etc/systemd/system/snell.service
-    systemctl daemon-reload
-    del_firewall "$(get_state_port snell)"
-    rm -rf "$SNELL_DIR"
-    save_state "snell" "" "uninstalled"
-    info "Snell 已卸载"
+snell_cleanup() {
+    rm -rf "$(pdir snell)"
+    del_firewall "${1:-}"
 }
 
-# ============================================================
-# Hysteria2
-# ============================================================
-
-get_hy2_version() {
-    curl -s "https://api.github.com/repos/apernet/hysteria/releases/latest" \
-        | grep -oP '"tag_name":\s*"app/\K[^"]+' | head -1
+# ---- Hysteria2 ----
+hy2_get_version() {
+    local v
+    v=$(curl -fs --max-time 15 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+        | grep -oP '"tag_name":\s*"app/\K[^"]+' | head -1)
+    [ -n "$v" ] && echo "$v" || die "Hysteria2 版本检测失败，请检查 GitHub 是否可达"
 }
 
-install_hy2() {
-    title "安装 Hysteria2"
-    
-    # 版本
-    step "获取最新版本..."
-    HY2_VER=$(get_hy2_version)
-    [ -z "$HY2_VER" ] && HY2_VER="v2.6.1"
-    info "版本: $HY2_VER"
-    
-    # 端口
-    if [ -n "${PD_HY2_PORT:-}" ]; then
-        HY2_PORT="$PD_HY2_PORT"
-    else
-        HY2_PORT=$(rand_port)
-    fi
-    info "端口: $HY2_PORT"
-    
-    # 密码
-    HY2_PASS=$(rand_pass)
-    
-    # 下载
-    step "下载 Hysteria2 $HY2_VER..."
-    local url="https://github.com/apernet/hysteria/releases/download/app/${HY2_VER}/hysteria-linux-${ARCH}"
-    mkdir -p "$HY2_DIR"
-    curl -fsSL --retry 3 --connect-timeout 10 -o "$HY2_DIR/hysteria" "$url"
-    chmod +x "$HY2_DIR/hysteria"
-    info "Hysteria2 安装完成"
-    
-    # 配置
-    step "写入配置..."
-    cat > "$HY2_DIR/config.yaml" <<EOF
-listen: :${HY2_PORT}
+hy2_download() {
+    local ver="$1"
+    local url="https://github.com/apernet/hysteria/releases/download/app/${ver}/hysteria-linux-${ARCH}"
+    step "下载 Hysteria2 $ver ..."
+    mkdir -p "$(pdir hy2)"
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o "$(pbin hy2)" "$url" \
+        || die "Hysteria2 下载失败: $url"
+    chmod +x "$(pbin hy2)"
+    verify_download "$(pbin hy2)" "Hysteria2" 5000000
+    info "Hysteria2 下载完成"
+}
+
+hy2_configure() {
+    local port="$1" pass="$2"
+    cat > "$(pdir hy2)/config.yaml" <<EOF
+listen: :${port}
 
 tls:
-  cert: $HY2_DIR/cert.crt
-  key: $HY2_DIR/cert.key
+  cert: $(pdir hy2)/cert.crt
+  key: $(pdir hy2)/cert.key
 
 auth:
   type: password
-  password: ${HY2_PASS}
+  password: ${pass}
 
 masquerade:
   type: proxy
@@ -293,112 +497,79 @@ masquerade:
     url: https://www.bing.com/
     rewriteHost: true
 EOF
-    # 自签证书
     openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -keyout "$HY2_DIR/cert.key" -out "$HY2_DIR/cert.crt" \
-        -days 3650 -nodes -subj "/CN=bing.com" &>/dev/null
-    chmod 600 "$HY2_DIR/config.yaml"
-    
-    # systemd
-    step "注册服务..."
-    cat > /etc/systemd/system/hysteria2.service <<EOF
-[Unit]
-Description=Hysteria2 Proxy
-After=network.target
+        -keyout "$(pdir hy2)/cert.key" -out "$(pdir hy2)/cert.crt" \
+        -days 3650 -nodes -subj "/CN=bing.com" >/dev/null 2>&1 \
+        || die "Hysteria2 证书生成失败"
+    chmod 600 "$(pdir hy2)/config.yaml" "$(pdir hy2)/cert.key"
+}
 
-[Service]
-Type=simple
-ExecStart=$HY2_DIR/hysteria server -c $HY2_DIR/config.yaml
-Restart=always
-RestartSec=5
-LimitNOFILE=32768
+hy2_service_args() {
+    echo "server -c $(pdir hy2)/config.yaml"
+}
 
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable hysteria2 &>/dev/null
-    systemctl restart hysteria2
-    
-    # 防火墙 & 验证
-    add_firewall "$HY2_PORT"
-    verify_port "$HY2_PORT" "hysteria2"
-    
-    # 输出
+hy2_output() {
+    local port="$1" pass="$2"
     echo ""
     echo -e "${BOLD}══════════════════════════════${RESET}"
     echo -e "${BOLD}  Hysteria2 ✅ 安装完成${RESET}"
     echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "端口:   ${GREEN}${HY2_PORT}${RESET}"
-    echo -e "密码:   ${GREEN}${HY2_PASS}${RESET}"
+    echo -e "端口:   ${GREEN}${port}${RESET}"
+    echo -e "密码:   ${GREEN}${pass}${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
-    echo -e "${GREEN}HK-HY2 = hysteria2, ${IP}, ${HY2_PORT}, password=${HY2_PASS}, sni=www.bing.com, skip-cert-verify=true${RESET}"
+    echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
-    gen_qr "hysteria2://${HY2_PASS}@${IP}:${HY2_PORT}?sni=www.bing.com&insecure=1#PD-HY2"
+    gen_qr "hysteria2://${pass}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
     echo -e "${BOLD}══════════════════════════════${RESET}"
-    
-    save_state "hy2" "$HY2_PORT" "installed"
 }
 
-uninstall_hy2() {
-    info "卸载 Hysteria2..."
-    systemctl stop hysteria2 2>/dev/null || true
-    systemctl disable hysteria2 2>/dev/null || true
-    rm -f /etc/systemd/system/hysteria2.service
-    systemctl daemon-reload
-    del_firewall "$(get_state_port hy2)"
-    rm -rf "$HY2_DIR"
-    save_state "hy2" "" "uninstalled"
-    info "Hysteria2 已卸载"
+hy2_cleanup() {
+    rm -rf "$(pdir hy2)"
+    del_firewall "${1:-}"
 }
 
-# ============================================================
-# VLESS Reality (Xray-core)
-# ============================================================
+# ---- VLESS Reality ----
+vless_download() {
+    local arch_suffix="64"
+    [ "$ARCH" = "arm64" ] && arch_suffix="arm64-v8a"
+    local url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch_suffix}.zip"
+    step "下载 Xray-core ..."
+    mkdir -p "$(pdir vless)"
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o /tmp/pd-xray.zip "$url" \
+        || die "Xray 下载失败: $url"
+    unzip -o /tmp/pd-xray.zip -d "$(pdir vless)" >/dev/null \
+        || die "Xray 解压失败"
+    chmod +x "$(pbin vless)"
+    verify_download "$(pbin vless)" "Xray" 5000000
+    info "Xray-core 下载完成"
+}
 
-install_vless() {
-    title "安装 VLESS Reality"
-    
-    # 端口
-    if [ -n "${PD_VLESS_PORT:-}" ]; then
-        VLESS_PORT="$PD_VLESS_PORT"
-    else
-        VLESS_PORT=$(rand_port)
-    fi
-    info "端口: $VLESS_PORT"
-    
-    # UUID
-    VLESS_UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || rand_pass | head -c 36)
-    
-    # Xray 安装
-    step "安装 Xray-core..."
-    if [ ! -f "$XRAY_DIR/xray" ]; then
-        mkdir -p "$XRAY_DIR"
-        curl -fsSL --retry 3 --connect-timeout 10 -o /tmp/pd-xray.zip \
-            "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${ARCH/amd64/64}.zip"
-        unzip -o /tmp/pd-xray.zip -d "$XRAY_DIR" &>/dev/null
-        chmod +x "$XRAY_DIR/xray"
-    fi
-    info "Xray-core 安装完成"
-    
-    # 生成密钥
+vless_configure() {
+    local port="$1" uuid="$2"
     step "生成 Reality 密钥..."
-    KEYS=$("$XRAY_DIR/xray" x25519 2>/dev/null)
-    PRIVATE_KEY=$(echo "$KEYS" | grep "Private" | awk '{print $3}')
-    PUBLIC_KEY=$(echo "$KEYS" | grep "Public" | awk '{print $3}')
-    SHORT_ID=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | xxd -p)
-    
-    # 配置
-    step "写入配置..."
-    cat > "$XRAY_DIR/config.json" <<EOF
+    local keys
+    keys=$("$(pbin vless)" x25519 2>/dev/null) || die "Xray x25519 密钥生成失败"
+    local privkey
+    privkey=$(echo "$keys" | grep "Private" | awk '{print $3}')
+    local pubkey
+    pubkey=$(echo "$keys" | grep "Public" | awk '{print $3}')
+    local shortid
+    shortid=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | xxd -p)
+    [ -n "$privkey" ] || die "Reality 私钥生成失败"
+
+    # 保存公钥供输出使用
+    echo "$pubkey" > "$(pdir vless)/.pubkey"
+    echo "$shortid" > "$(pdir vless)/.shortid"
+
+    cat > "$(pdir vless)/config.json" <<EOF
 {
   "inbounds": [{
-    "port": ${VLESS_PORT},
+    "port": ${port},
     "protocol": "vless",
     "settings": {
-      "clients": [{"id": "${VLESS_UUID}", "flow": "xtls-rprx-vision"}],
+      "clients": [{"id": "${uuid}", "flow": "xtls-rprx-vision"}],
       "decryption": "none"
     },
     "streamSettings": {
@@ -407,8 +578,8 @@ install_vless() {
       "realitySettings": {
         "dest": "addons.mozilla.org:443",
         "serverNames": ["addons.mozilla.org", "www.microsoft.com"],
-        "privateKey": "${PRIVATE_KEY}",
-        "shortIds": ["${SHORT_ID}"]
+        "privateKey": "${privkey}",
+        "shortIds": ["${shortid}"]
       }
     },
     "sniffing": {"enabled": true, "destOverride": ["http", "tls"]}
@@ -416,303 +587,261 @@ install_vless() {
   "outbounds": [{"protocol": "freedom"}]
 }
 EOF
-    chmod 600 "$XRAY_DIR/config.json"
-    
-    # systemd
-    step "注册服务..."
-    cat > /etc/systemd/system/xray.service <<EOF
-[Unit]
-Description=Xray (VLESS Reality)
-After=network.target
+    chmod 600 "$(pdir vless)/config.json"
+}
 
-[Service]
-Type=simple
-ExecStart=$XRAY_DIR/xray run -c $XRAY_DIR/config.json
-Restart=always
-RestartSec=5
-LimitNOFILE=32768
+vless_service_args() {
+    echo "run -c $(pdir vless)/config.json"
+}
 
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable xray &>/dev/null
-    systemctl restart xray
-    
-    # 防火墙 & 验证
-    add_firewall "$VLESS_PORT"
-    verify_port "$VLESS_PORT" "xray"
-    
-    # 输出
-    local vless_link="vless://${VLESS_UUID}@${IP}:${VLESS_PORT}?encryption=none&security=reality&sni=addons.mozilla.org&fp=chrome&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&type=tcp&flow=xtls-rprx-vision#PD-VLESS"
-    
+vless_output() {
+    local port="$1" uuid="$2"
+    local pubkey shortid
+    pubkey=$(cat "$(pdir vless)/.pubkey" 2>/dev/null || echo "未知")
+    shortid=$(cat "$(pdir vless)/.shortid" 2>/dev/null || echo "未知")
+    local link="vless://${uuid}@${IP}:${port}?encryption=none&security=reality&sni=addons.mozilla.org&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp&flow=xtls-rprx-vision#PD-VLESS"
+
     echo ""
     echo -e "${BOLD}══════════════════════════════${RESET}"
     echo -e "${BOLD}  VLESS Reality ✅ 安装完成${RESET}"
     echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "端口:   ${GREEN}${VLESS_PORT}${RESET}"
-    echo -e "UUID:   ${GREEN}${VLESS_UUID}${RESET}"
+    echo -e "端口:   ${GREEN}${port}${RESET}"
+    echo -e "UUID:   ${GREEN}${uuid}${RESET}"
     echo ""
     echo -e "${YELLOW}⚠ Surge 不支持 VLESS Reality，请用 Shadowrocket${RESET}"
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
-    gen_qr "$vless_link"
+    gen_qr "$link"
     echo ""
     echo -e "${CYAN}[通用链接]${RESET}"
-    echo -e "${GREEN}${vless_link}${RESET}"
+    echo -e "${GREEN}${link}${RESET}"
     echo -e "${BOLD}══════════════════════════════${RESET}"
-    
-    save_state "vless" "$VLESS_PORT" "installed"
 }
 
-uninstall_vless() {
-    info "卸载 VLESS Reality..."
-    systemctl stop xray 2>/dev/null || true
-    systemctl disable xray 2>/dev/null || true
-    rm -f /etc/systemd/system/xray.service
-    systemctl daemon-reload
-    del_firewall "$(get_state_port vless)"
-    rm -rf "$XRAY_DIR"
-    save_state "vless" "" "uninstalled"
-    info "VLESS Reality 已卸载"
+vless_cleanup() {
+    rm -rf "$(pdir vless)"
+    del_firewall "${1:-}"
 }
 
-# ============================================================
-# AnyTLS (anytls-go)
-# ============================================================
-
-get_anytls_version() {
-    curl -s "https://api.github.com/repos/anytls/anytls-go/releases/latest" \
-        | grep -oP '"tag_name":\s*"\K[^"]+' | head -1
+# ---- AnyTLS ----
+anytls_get_version() {
+    local v
+    v=$(curl -fs --max-time 15 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null \
+        | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
+    [ -n "$v" ] && echo "$v" || die "AnyTLS 版本检测失败，请检查 GitHub 是否可达"
 }
 
-install_anytls() {
-    title "安装 AnyTLS (beta)"
-    
-    # 版本
-    step "获取最新版本..."
-    ANYTLS_VER=$(get_anytls_version)
-    [ -z "$ANYTLS_VER" ] && ANYTLS_VER="v0.0.12"
-    info "版本: $ANYTLS_VER"
-    
-    # 端口
-    if [ -n "${PD_ANYTLS_PORT:-}" ]; then
-        ANYTLS_PORT="$PD_ANYTLS_PORT"
-    else
-        ANYTLS_PORT=$(rand_port)
-    fi
-    info "端口: $ANYTLS_PORT"
-    
-    # 密码
-    ANYTLS_PASS=$(rand_pass)
-    
-    # 下载
-    step "下载 AnyTLS $ANYTLS_VER..."
-    local ver_num="${ANYTLS_VER#v}"
-    local url="https://github.com/anytls/anytls-go/releases/download/${ANYTLS_VER}/anytls_${ver_num}_linux_${ARCH}.zip"
-    mkdir -p "$ANYTLS_DIR"
-    curl -fsSL --retry 3 --connect-timeout 10 -o /tmp/pd-anytls.zip "$url"
-    unzip -o /tmp/pd-anytls.zip -d "$ANYTLS_DIR" &>/dev/null
-    chmod +x "$ANYTLS_DIR/anytls-server"
-    info "AnyTLS 安装完成"
-    
-    # 密码文件
-    echo "$ANYTLS_PASS" > "$ANYTLS_DIR/.password"
-    chmod 600 "$ANYTLS_DIR/.password"
-    
-    # systemd
-    step "注册服务..."
-    cat > /etc/systemd/system/anytls.service <<EOF
-[Unit]
-Description=AnyTLS Proxy
-After=network.target
+anytls_download() {
+    local ver="$1"
+    local ver_num="${ver#v}"
+    local url="https://github.com/anytls/anytls-go/releases/download/${ver}/anytls_${ver_num}_linux_${ARCH}.zip"
+    step "下载 AnyTLS $ver ..."
+    mkdir -p "$(pdir anytls)"
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o /tmp/pd-anytls.zip "$url" \
+        || die "AnyTLS 下载失败: $url"
+    unzip -o /tmp/pd-anytls.zip -d "$(pdir anytls)" >/dev/null \
+        || die "AnyTLS 解压失败"
+    chmod +x "$(pbin anytls)"
+    verify_download "$(pbin anytls)" "AnyTLS" 1000000
+    info "AnyTLS 下载完成"
+}
 
-[Service]
-Type=simple
-ExecStart=$ANYTLS_DIR/anytls-server -l 0.0.0.0:${ANYTLS_PORT} -p ${ANYTLS_PASS}
-Restart=always
-RestartSec=5
-LimitNOFILE=32768
+anytls_configure() {
+    local port="$1" pass="$2"
+    echo "$pass" > "$(pdir anytls)/.password"
+    chmod 600 "$(pdir anytls)/.password"
+}
 
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
-    systemctl enable anytls &>/dev/null
-    systemctl restart anytls
-    
-    # 防火墙 & 验证
-    add_firewall "$ANYTLS_PORT"
-    verify_port "$ANYTLS_PORT" "anytls"
-    
-    # 输出
-    local anytls_link="anytls://${ANYTLS_PASS}@${IP}:${ANYTLS_PORT}#PD-AnyTLS"
-    
+anytls_service_args() {
+    local pass
+    pass=$(cat "$(pdir anytls)/.password")
+    echo "-l 0.0.0.0:${1} -p ${pass}"
+}
+
+anytls_output() {
+    local port="$1" pass="$2"
+    local link="anytls://${pass}@${IP}:${port}#PD-AnyTLS"
     echo ""
     echo -e "${BOLD}══════════════════════════════${RESET}"
     echo -e "${BOLD}  AnyTLS ✅ 安装完成${RESET}"
     echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "端口:   ${GREEN}${ANYTLS_PORT}${RESET}"
-    echo -e "密码:   ${GREEN}${ANYTLS_PASS}${RESET}"
+    echo -e "端口:   ${GREEN}${port}${RESET}"
+    echo -e "密码:   ${GREEN}${pass}${RESET}"
     echo ""
     echo -e "${CYAN}[Surge]${RESET}"
-    echo -e "${YELLOW}⚠ Surge 对 AnyTLS 的支持未官方确认，可能需要外部代理模块${RESET}"
-    echo -e "${GREEN}anytls, ${IP}, ${ANYTLS_PORT}, password=${ANYTLS_PASS}${RESET}"
+    echo -e "${YELLOW}⚠ Surge 对 AnyTLS 的支持未官方确认${RESET}"
+    echo -e "${GREEN}anytls, ${IP}, ${port}, password=${pass}${RESET}"
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
-    gen_qr "$anytls_link"
+    gen_qr "$link"
     echo ""
     echo -e "${CYAN}[通用链接]${RESET}"
-    echo -e "${GREEN}${anytls_link}${RESET}"
+    echo -e "${GREEN}${link}${RESET}"
     echo -e "${BOLD}══════════════════════════════${RESET}"
-    
-    save_state "anytls" "$ANYTLS_PORT" "installed"
 }
 
-uninstall_anytls() {
-    info "卸载 AnyTLS..."
-    systemctl stop anytls 2>/dev/null || true
-    systemctl disable anytls 2>/dev/null || true
-    rm -f /etc/systemd/system/anytls.service
-    systemctl daemon-reload
-    del_firewall "$(get_state_port anytls)"
-    rm -rf "$ANYTLS_DIR"
-    save_state "anytls" "" "uninstalled"
-    info "AnyTLS 已卸载"
+anytls_cleanup() {
+    rm -rf "$(pdir anytls)"
+    del_firewall "${1:-}"
 }
 
 # ============================================================
-# 状态管理
+# 统一安装流水线（核心 — 所有协议走同一套流程）
 # ============================================================
 
-STATE_FILE="$BASE_DIR/state"
-[ -d "$BASE_DIR" ] || mkdir -p "$BASE_DIR"
+install_protocol() {
+    local proto="$1"
+    local name key dir bin svc clients
+    name=$(pname "$proto")
+    key=$(pkey "$proto")
+    dir=$(pdir "$proto")
+    bin=$(pbin "$proto")
+    svc=$(psvc "$proto")
+    clients=$(pclients "$proto")
 
-save_state() {
-    local name="$1" port="$2" status="$3"
-    touch "$STATE_FILE"
-    grep -v "^${name} " "$STATE_FILE" > /tmp/pd-state-tmp 2>/dev/null || true
-    echo "${name} ${port} ${status}" >> /tmp/pd-state-tmp
-    mv /tmp/pd-state-tmp "$STATE_FILE"
-}
+    title "安装 $name"
 
-get_state_port() {
-    grep "^${1} " "$STATE_FILE" 2>/dev/null | awk '{print $2}' || echo ""
-}
-
-get_state_status() {
-    grep "^${1} " "$STATE_FILE" 2>/dev/null | awk '{print $3}' || echo "uninstalled"
-}
-
-is_installed() {
-    [ "$(get_state_status "$1")" = "installed" ]
-}
-
-check_status() {
-    local name="$1" service="$2"
-    if systemctl is-active --quiet "$service" 2>/dev/null; then
-        echo "✅ 运行中"
-    else
-        echo "❌ 已停止"
+    # 0. 预检
+    check_disk "$(pdisk "$proto")"
+    if state_installed "$key"; then
+        warn "$name 已安装，跳过"
+        return 0
     fi
+
+    # 1. 端口
+    local port
+    local port_var="PD_$(echo "$key" | tr '[:lower:]' '[:upper:]')_PORT"
+    if [ -n "${!port_var:-}" ]; then
+        port="${!port_var}"
+        info "端口(手动): $port"
+    else
+        port=$(rand_port)
+        info "端口(自动): $port"
+    fi
+
+    # 2. 密码
+    local pass
+    pass=$(rand_pass)
+
+    # 3. 版本
+    local ver=""
+    if declare -f "${proto}_get_version" >/dev/null 2>&1; then
+        step "获取版本..."
+        ver=$("${proto}_get_version")
+        info "版本: $ver"
+    fi
+
+    # 4. 下载
+    "${proto}_download" "$ver"
+
+    # 5. 配置
+    step "写入配置..."
+    "${proto}_configure" "$port" "$pass"
+
+    # 6. systemd
+    step "注册服务..."
+    write_systemd "$svc" "$bin" "$("${proto}_service_args" "$port")"
+    register_and_start "$svc"
+
+    # 7. 防火墙 & 验证
+    add_firewall "$port"
+    verify_port "$port" "$svc" || warn "请检查服务状态"
+
+    # 8. 保存状态
+    state_set "$key" "port" "$port"
+    state_set "$key" "status" "installed"
+    state_set "$key" "version" "$ver"
+
+    # 9. 输出配置
+    "${proto}_output" "$port" "$pass"
+}
+
+uninstall_protocol() {
+    local proto="$1"
+    local key=$(pkey "$proto")
+    local svc=$(psvc "$proto")
+
+    info "卸载 $(pname "$proto") ..."
+    if ! state_installed "$key"; then
+        warn "$(pname "$proto") 未安装"
+        return 0
+    fi
+
+    local port
+    port=$(state_get "$key" "port")
+
+    systemctl stop "$svc" 2>/dev/null || true
+    systemctl disable "$svc" 2>/dev/null || true
+    rm -f "/etc/systemd/system/${svc}.service"
+    systemctl daemon-reload
+    systemctl reset-failed "${svc}.service" 2>/dev/null || true
+
+    [ -n "$port" ] && del_firewall "$port"
+    rm -rf "$(pdir "$proto")"
+    state_del "$key"
+    info "$(pname "$proto") 已卸载"
 }
 
 # ============================================================
-# 查看协议配置
+# 状态 & 配置查看
 # ============================================================
 
-show_snell_config() {
-    local port="$1"
-    local psk=$(grep -oP 'psk\s*=\s*\K.+' "$SNELL_DIR/snell.conf" 2>/dev/null || echo "未知")
-    echo -e "${BOLD}${GREEN}══ Snell v5 ══${RESET}"
-    echo -e "端口: ${GREEN}${port}${RESET}"
-    echo -e "PSK:  ${GREEN}${psk}${RESET}"
-    echo ""
-    echo -e "${CYAN}[Surge 配置]${RESET}"
-    echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true${RESET}"
-}
-
-show_hy2_config() {
-    local port="$1"
-    local pwd=$(grep -oP 'password:\s*\K.+' "$HY2_DIR/config.yaml" 2>/dev/null || echo "未知")
-    echo -e "${BOLD}${GREEN}══ Hysteria2 ══${RESET}"
-    echo -e "端口: ${GREEN}${port}${RESET}"
-    echo -e "密码: ${GREEN}${pwd}${RESET}"
-    echo ""
-    echo -e "${CYAN}[Surge 配置]${RESET}"
-    echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}, password=${pwd}, sni=www.bing.com, skip-cert-verify=true${RESET}"
-    echo ""
-    echo -e "${CYAN}[Shadowrocket]${RESET}"
-    gen_qr "hysteria2://${pwd}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
-}
-
-show_vless_config() {
-    local port="$1"
-    # 用 python3 解析 JSON（Debian 自带）
-    local info=$(python3 -c "
-import json
-with open('$XRAY_DIR/config.json') as f:
-    c = json.load(f)
-inb = c['inbounds'][0]
-uid = inb['settings']['clients'][0]['id']
-pk = inb['streamSettings']['realitySettings']['privateKey']
-sid = inb['streamSettings']['realitySettings']['shortIds'][0]
-print(f'{uid}|{pk}|{sid}')
-" 2>/dev/null)
-    local uuid=$(echo "$info" | cut -d'|' -f1)
-    local privkey=$(echo "$info" | cut -d'|' -f2)
-    local shortid=$(echo "$info" | cut -d'|' -f3)
-    # 用 xray 推导公钥
-    local pubkey=$("$XRAY_DIR/xray" x25519 -i "$privkey" 2>/dev/null | grep -oP 'Public key:\s*\K.+' || echo "未知")
-    local link="vless://${uuid}@${IP}:${port}?encryption=none&security=reality&sni=addons.mozilla.org&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp&flow=xtls-rprx-vision#PD-VLESS"
-    echo -e "${BOLD}${GREEN}══ VLESS Reality ══${RESET}"
-    echo -e "端口: ${GREEN}${port}${RESET}"
-    echo -e "UUID: ${GREEN}${uuid}${RESET}"
-    echo ""
-    echo -e "${YELLOW}⚠ Surge 不支持 VLESS Reality，请用 Shadowrocket${RESET}"
-    echo ""
-    echo -e "${CYAN}[Shadowrocket]${RESET}"
-    gen_qr "$link"
-    echo ""
-    echo -e "${CYAN}[通用链接]${RESET}"
-    echo -e "${GREEN}${link}${RESET}"
-}
-
-show_anytls_config() {
-    local port="$1"
-    local pwd=$(grep -oP '\-p\s+\K\S+' /etc/systemd/system/anytls.service 2>/dev/null || echo "未知")
-    local link="anytls://${pwd}@${IP}:${port}#PD-AnyTLS"
-    echo -e "${BOLD}${GREEN}══ AnyTLS ══${RESET}"
-    echo -e "端口: ${GREEN}${port}${RESET}"
-    echo -e "密码: ${GREEN}${pwd}${RESET}"
-    echo ""
-    echo -e "${CYAN}[Surge]${RESET}"
-    echo -e "${YELLOW}⚠ Surge 对 AnyTLS 的支持未官方确认，可能需要外部代理模块${RESET}"
-    echo -e "${GREEN}anytls, ${IP}, ${port}, password=${pwd}${RESET}"
-    echo ""
-    echo -e "${CYAN}[Shadowrocket]${RESET}"
-    gen_qr "$link"
-    echo ""
-    echo -e "${CYAN}[通用链接]${RESET}"
-    echo -e "${GREEN}${link}${RESET}"
+show_status() {
+    title "PD-proxy 状态"
+    echo -e "${CYAN}══════════════════════════════════════════${RESET}"
+    local has_any=false
+    for proto in $ALL_PROTOS; do
+        local key=$(pkey "$proto")
+        local name=$(pname "$proto")
+        if state_installed "$key"; then
+            has_any=true
+            local port=$(state_get "$key" "port")
+            local ver=$(state_get "$key" "version")
+            local svc=$(psvc "$proto")
+            local st
+            if systemctl is-active --quiet "$svc" 2>/dev/null; then
+                st="✅ 运行中"
+            else
+                st="❌ 已停止"
+            fi
+            printf "  %-15s 端口 %-7s %s  %s\n" "$name" "$port" "$st" "$(pmem "$proto")"
+        else
+            printf "  %-15s ${YELLOW}未安装${RESET}\n" "$name"
+        fi
+    done
+    echo -e "${CYAN}══════════════════════════════════════════${RESET}"
+    echo -e "系统: ${OS_PRETTY} | IP: ${IP} | 内存: ${MEM_AVAIL}MB 可用"
+    echo -e "${CYAN}══════════════════════════════════════════${RESET}"
 }
 
 show_config() {
     title "协议配置"
     echo -e "${CYAN}══════════════════════════════════════════${RESET}"
     local has_any=false
-    for proto in snell hy2 vless anytls; do
-        local port=$(get_state_port "$proto")
-        if [ "$(get_state_status "$proto")" = "installed" ] && [ -n "$port" ]; then
-            has_any=true
-            case $proto in
-                snell) show_snell_config "$port" ;;
-                hy2) show_hy2_config "$port" ;;
-                vless) show_vless_config "$port" ;;
-                anytls) show_anytls_config "$port" ;;
-            esac
-            echo ""
-        fi
+    for proto in $ALL_PROTOS; do
+        local key=$(pkey "$proto")
+        if ! state_installed "$key"; then continue; fi
+        has_any=true
+        local port=$(state_get "$key" "port")
+        case $proto in
+            snell)
+                local psk
+                psk=$(grep -oP 'psk\s*=\s*\K.+' "$(pdir snell)/snell.conf" 2>/dev/null || echo "未知")
+                snell_output "$port" "$psk" ;;
+            hy2)
+                local pass
+                pass=$(grep -oP 'password:\s*\K.+' "$(pdir hy2)/config.yaml" 2>/dev/null || echo "未知")
+                hy2_output "$port" "$pass" ;;
+            vless)
+                local uuid
+                uuid=$(python3 -c "import json; c=json.load(open('$(pdir vless)/config.json')); print(c['inbounds'][0]['settings']['clients'][0]['id'])" 2>/dev/null || echo "未知")
+                vless_output "$port" "$uuid" ;;
+            anytls)
+                local pass
+                pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "未知")
+                anytls_output "$port" "$pass" ;;
+        esac
+        echo ""
     done
     if ! $has_any; then
         echo -e "  ${YELLOW}暂无已安装的协议${RESET}"
@@ -721,60 +850,27 @@ show_config() {
     echo -e "${CYAN}══════════════════════════════════════════${RESET}"
 }
 
-show_status() {
-    title "PD-proxy"
-    echo -e "${CYAN}══════════════════════════════════════════${RESET}"
-    
-    for proto in snell hysteria2 xray anytls; do
-        local sname=""
-        case $proto in
-            snell) sname="Snell v5     " ;;
-            hysteria2) sname="Hysteria2    " ;;
-            xray) sname="VLESS Reality" ;;
-            anytls) sname="AnyTLS       " ;;
-        esac
-        
-        local port=$(get_state_port "$proto")
-        if [ "$(get_state_status "$proto")" = "installed" ] && [ -n "$port" ]; then
-            local svc=""
-            case $proto in
-                snell) svc="snell" ;;
-                hysteria2) svc="hysteria2" ;;
-                xray) svc="xray" ;;
-                anytls) svc="anytls" ;;
-            esac
-            local st=$(check_status "$proto" "$svc")
-            local mem=""
-            case $proto in
-                snell) mem="5MB" ;;
-                hysteria2) mem="18MB" ;;
-                xray) mem="30MB" ;;
-                anytls) mem="5MB" ;;
-            esac
-            echo -e "  ${sname} 端口 ${port}  ${st}  ${mem}"
-        else
-            echo -e "  ${sname} ${YELLOW}未安装${RESET}"
-        fi
-    done
-    
-    echo -e "${CYAN}══════════════════════════════════════════${RESET}"
-    echo -e "系统: $(. /etc/os-release && echo "$PRETTY_NAME") | IP: $IP"
-    echo -e "${CYAN}══════════════════════════════════════════${RESET}"
-}
-
 # ============================================================
-# BBR 优化
+# BBR
 # ============================================================
 
 enable_bbr() {
     local kernel_ver=$(uname -r | cut -d. -f1)
     if [ "$kernel_ver" -lt 4 ]; then
-        warn "内核版本过低，不支持 BBR"
+        warn "内核版本过低 ($(uname -r))，不支持 BBR"
+        return
+    fi
+    if lsmod 2>/dev/null | grep -q tcp_bbr; then
+        info "BBR 已开启，跳过"
+        return
+    fi
+    if grep -q "net.core.default_qdisk=fq" /etc/sysctl.conf 2>/dev/null; then
+        info "BBR 已配置，跳过"
         return
     fi
     echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
     echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    sysctl -p &>/dev/null
+    sysctl -p >/dev/null 2>&1
     info "BBR 已开启"
 }
 
@@ -784,22 +880,15 @@ enable_bbr() {
 
 self_install() {
     mkdir -p "$BASE_DIR"
-    # 直接从 GitHub 下载最新版（最稳健，避免管道模式下 $0 不可靠）
-    curl -fsSL "$SCRIPT_URL" -o "$BASE_DIR/install.sh" 2>/dev/null || true
-    chmod +x "$BASE_DIR/install.sh" 2>/dev/null || true
-    
-    # pd 命令
-    ln -sf "$BASE_DIR/install.sh" /usr/local/bin/pd 2>/dev/null || true
-    
-    # 更新脚本
-    cat > /usr/local/bin/pd-update <<'UEOF'
-#!/bin/bash
-echo "正在更新 PD-proxy..."
-curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh -o /opt/pd/install.sh
-chmod +x /opt/pd/install.sh
-echo "更新完成！运行 pd 进入管理"
-UEOF
-    chmod +x /usr/local/bin/pd-update
+    # 仅在首次安装或显式更新时下载
+    if [ ! -f "$BASE_DIR/install.sh" ] || [ "${PD_UPDATE:-}" = "1" ]; then
+        curl -fsSL "$SCRIPT_URL" -o "$BASE_DIR/install.sh" || {
+            warn "无法从 GitHub 同步最新脚本，使用当前版本"
+            return 1
+        }
+        chmod +x "$BASE_DIR/install.sh"
+    fi
+    ln -sf "$BASE_DIR/install.sh" "$INSTALLED_BIN" 2>/dev/null || true
 }
 
 # ============================================================
@@ -808,26 +897,55 @@ UEOF
 
 remove_all() {
     echo -e "${RED}⚠ 即将卸载所有代理协议和 PD-proxy${RESET}"
-    read -rp "确认？输入 yes: " confirm
+    echo -n "确认？输入 yes: "
+    read -r confirm
     [ "$confirm" = "yes" ] || { info "已取消"; return; }
-    
-    for proto in snell hy2 vless anytls; do
-        if is_installed "$proto"; then
-            case $proto in
-                snell) uninstall_snell ;;
-                hysteria2|hy2) uninstall_hy2 ;;
-                vless|xray) uninstall_vless ;;
-                anytls) uninstall_anytls ;;
-            esac
-        fi
+
+    for proto in $ALL_PROTOS; do
+        uninstall_protocol "$proto" 2>/dev/null || true
     done
-    
-    rm -f /usr/local/bin/pd
+    rm -f "$INSTALLED_BIN"
     rm -f /usr/local/bin/pd-update
     rm -rf "$BASE_DIR"
-    
     info "全部已卸载。再见 👋"
     exit 0
+}
+
+# ============================================================
+# 命令行参数
+# ============================================================
+
+show_help() {
+    cat <<EOF
+PD-proxy v${VERSION} — 多协议代理一键部署
+
+用法:
+  pd                         进入交互菜单
+  pd --install <协议>         非交互安装指定协议
+  pd --uninstall <协议>       卸载协议
+  pd --status                查看所有协议状态
+  pd --show                  查看所有协议配置
+  pd --bbr                   开启 BBR 优化
+  pd --update                更新 pd 自身
+  pd --remove-all            卸载全部
+  pd --help                  显示此帮助
+
+协议:
+  snell       Snell v5 (Surge 主力)
+  hy2         Hysteria2 (Surge + Shadowrocket)
+  vless       VLESS Reality (仅 Shadowrocket)
+  anytls      AnyTLS (beta)
+
+环境变量:
+  PD_SNELL_PORT=12345        手动指定端口
+  PD_HY2_PORT=12346
+  PD_VLESS_PORT=12347
+  PD_ANYTLS_PORT=12348
+  
+示例:
+  curl -fsSL $SCRIPT_URL | bash -s -- --install snell
+  PD_SNELL_PORT=12345 pd --install snell
+EOF
 }
 
 # ============================================================
@@ -840,35 +958,36 @@ main_menu() {
     echo "╔══════════════════════════════════════════╗"
     echo "║            PD-proxy  v${VERSION}              ║"
     echo "╠══════════════════════════════════════════╣"
-    echo -e "║  ${RESET}${BOLD}系统:${RESET} $(. /etc/os-release && echo "$PRETTY_NAME" | cut -c1-25)${BOLD}${CYAN}        ║"
-    echo -e "║  ${RESET}${BOLD}架构:${RESET} ${ARCH}  |  ${BOLD}内存:${RESET} ${MEM_AVAIL}MB 可用${BOLD}${CYAN}      ║"
-    echo -e "║  ${RESET}${BOLD}IP:${RESET}   ${IP}${BOLD}${CYAN}          ║"
+    printf "║  ${RESET}${BOLD}系统:${RESET} %-26s${BOLD}${CYAN}║\n" "$(echo "$OS_PRETTY" | cut -c1-26)"
+    printf "║  ${RESET}${BOLD}架构:${RESET} %-5s | ${BOLD}内存:${RESET} %-6s MB${BOLD}${CYAN}       ║\n" "$ARCH" "$MEM_AVAIL"
+    printf "║  ${RESET}${BOLD}IP:${RESET}   %-28s${BOLD}${CYAN}║\n" "$IP"
     echo "╠══════════════════════════════════════════╣"
-    echo -e "║  ${RESET}${BOLD}Snell v5${RESET} [5MB]  Surge 主力协议              ${BOLD}${CYAN}║"
-    echo -e "║  ${RESET}${BOLD}Hysteria2${RESET} [20MB] UDP 加速                   ${BOLD}${CYAN}║"
-    echo -e "║  ${RESET}${BOLD}VLESS${RESET} [30MB] 仅 Shadowrocket               ${BOLD}${CYAN}║"
-    echo -e "║  ${RESET}${BOLD}AnyTLS${RESET} [5MB]  新兴协议 (beta)               ${BOLD}${CYAN}║"
+    printf "║  ${RESET}${BOLD}Snell v5${RESET}   [%s]  Surge 主力              ${BOLD}${CYAN}║\n" "$(pmem snell)"
+    printf "║  ${RESET}${BOLD}Hysteria2${RESET}  [%s] Surge + Shadowrocket     ${BOLD}${CYAN}║\n" "$(pmem hy2)"
+    printf "║  ${RESET}${BOLD}VLESS${RESET}      [%s] 仅 Shadowrocket           ${BOLD}${CYAN}║\n" "$(pmem vless)"
+    printf "║  ${RESET}${BOLD}AnyTLS${RESET}     [%s] 新兴协议 (beta)           ${BOLD}${CYAN}║\n" "$(pmem anytls)"
     echo "╚══════════════════════════════════════════╝"
     echo -e "${RESET}"
-    
-    echo "1) 安装 Snell v5      (Surge)"
-    echo "2) 安装 Hysteria2     (Surge + Shadowrocket)"
-    echo "3) 安装 VLESS Reality (仅 Shadowrocket)"
-    echo "4) 安装 AnyTLS (beta) (Surge + Shadowrocket)"
-    echo "5) 查看状态"
-    echo "6) 查看配置"
-    echo "7) 卸载协议"
-    echo "8) 开启 BBR"
-    echo "9) 全部卸载"
-    echo "0) 退出"
+
+    echo " 1) 安装 Snell v5     (Surge)"
+    echo " 2) 安装 Hysteria2    (Surge + Shadowrocket)"
+    echo " 3) 安装 VLESS Reality (仅 Shadowrocket)"
+    echo " 4) 安装 AnyTLS       (Surge + Shadowrocket, beta)"
+    echo " 5) 查看状态"
+    echo " 6) 查看配置"
+    echo " 7) 卸载协议"
+    echo " 8) 开启 BBR"
+    echo " 9) 全部卸载"
+    echo " 0) 退出"
     echo ""
-    read -rp "选择 [0-9]: " choice
-    
+    echo -n "选择 [0-9]: "
+    read -r choice
+
     case "$choice" in
-        1) install_snell; press_enter; main_menu ;;
-        2) install_hy2; press_enter; main_menu ;;
-        3) install_vless; press_enter; main_menu ;;
-        4) install_anytls; press_enter; main_menu ;;
+        1) install_protocol snell; press_enter; main_menu ;;
+        2) install_protocol hy2; press_enter; main_menu ;;
+        3) install_protocol vless; press_enter; main_menu ;;
+        4) install_protocol anytls; press_enter; main_menu ;;
         5) show_status; press_enter; main_menu ;;
         6) show_config; press_enter; main_menu ;;
         7) remove_menu; press_enter; main_menu ;;
@@ -881,7 +1000,8 @@ main_menu() {
 
 press_enter() {
     echo ""
-    read -rp "回车返回菜单..."
+    echo -n "回车返回菜单..."
+    read -r
 }
 
 remove_menu() {
@@ -892,12 +1012,13 @@ remove_menu() {
     echo "3) VLESS Reality"
     echo "4) AnyTLS"
     echo "0) 返回"
-    read -rp "选择: " rc
+    echo -n "选择: "
+    read -r rc
     case "$rc" in
-        1) uninstall_snell ;;
-        2) uninstall_hy2 ;;
-        3) uninstall_vless ;;
-        4) uninstall_anytls ;;
+        1) uninstall_protocol snell ;;
+        2) uninstall_protocol hy2 ;;
+        3) uninstall_protocol vless ;;
+        4) uninstall_protocol anytls ;;
         0) return ;;
     esac
 }
@@ -906,35 +1027,58 @@ remove_menu() {
 # 入口
 # ============================================================
 
-# 处理命令行参数
+# 注册协议表
+register_protocols
+
+# 解析命令行
 case "${1:-}" in
+    --help|-h)
+        show_help; exit 0 ;;
+    --version|-v)
+        echo "PD-proxy v${VERSION}"; exit 0 ;;
+    --install|-i)
+        [ -z "${2:-}" ] && die "用法: pd --install <snell|hy2|vless|anytls>"
+        check_root; detect_os; detect_arch; get_ip; get_mem
+        install_deps; self_install
+        case "${2}" in
+            snell) install_protocol snell ;;
+            hy2|hysteria2) install_protocol hy2 ;;
+            vless|xray) install_protocol vless ;;
+            anytls) install_protocol anytls ;;
+            *) die "未知协议: $2，可选: snell hy2 vless anytls" ;;
+        esac
+        exit 0 ;;
+    --uninstall|-r)
+        [ -z "${2:-}" ] && die "用法: pd --uninstall <snell|hy2|vless|anytls>"
+        check_root; detect_os
+        case "${2}" in
+            snell) uninstall_protocol snell ;;
+            hy2|hysteria2) uninstall_protocol hy2 ;;
+            vless|xray) uninstall_protocol vless ;;
+            anytls) uninstall_protocol anytls ;;
+            all|--all) remove_all ;;
+            *) die "未知协议: $2" ;;
+        esac
+        exit 0 ;;
     --status|-s)
         check_root; detect_os; detect_arch; get_ip; get_mem; show_status
-        exit 0
-        ;;
-    --remove|-r)
-        check_root
-        case "${2:-}" in
-            snell) uninstall_snell ;;
-            hysteria2|hy2) uninstall_hy2 ;;
-            vless|xray) uninstall_vless ;;
-            anytls) uninstall_anytls ;;
-            all|--all) remove_all ;;
-            *) echo "用法: pd --remove <snell|hy2|vless|anytls|all>" ;;
-        esac
-        exit 0
-        ;;
-    --remove-all)
-        check_root; remove_all
-        exit 0
-        ;;
+        exit 0 ;;
     --show|--config)
         check_root; detect_os; detect_arch; get_ip; get_mem; show_config
-        exit 0
-        ;;
+        exit 0 ;;
+    --bbr)
+        check_root; enable_bbr
+        exit 0 ;;
+    --update)
+        check_root; PD_UPDATE=1 self_install
+        info "PD-proxy 已更新到最新版"
+        exit 0 ;;
+    --remove-all)
+        check_root; remove_all
+        exit 0 ;;
 esac
 
-# 初始化
+# 交互模式
 check_root
 detect_os
 detect_arch
@@ -943,26 +1087,22 @@ get_mem
 install_deps
 self_install
 
-# 如果有已安装的协议 → 直接进管理
-if is_installed snell || is_installed hy2 || is_installed vless || is_installed anytls; then
+# 已有安装 → 精简入口
+if state_installed snell || state_installed hy2 || state_installed vless || state_installed anytls; then
     show_status
     echo ""
-    echo "1) 加装新协议"
-    echo "2) 查看配置"
-    echo "3) 卸载某协议"
-    echo "4) 开启 BBR"
-    echo "5) 全部卸载"
-    echo "0) 退出"
-    read -rp "选择: " cc
+    echo "1) 加装新协议     2) 查看配置     3) 卸载协议"
+    echo "4) 开启 BBR       5) 全部卸载     0) 退出"
+    echo -n "选择: "
+    read -r cc
     case "$cc" in
         1) main_menu ;;
-        2) show_config ;;
-        3) remove_menu ;;
-        4) enable_bbr ;;
+        2) show_config; press_enter; main_menu ;;
+        3) remove_menu; press_enter; main_menu ;;
+        4) enable_bbr; press_enter; main_menu ;;
         5) remove_all ;;
         *) info "再见 👋"; exit 0 ;;
     esac
 else
-    # 无已安装 → Snell 优先推荐
     main_menu
 fi
