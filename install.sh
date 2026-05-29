@@ -766,10 +766,6 @@ install_protocol() {
     fi
 
     # 4. 下载
-    if [ "$proto" = "vless" ] && ! command -v python3 >/dev/null 2>&1; then
-        info "安装 python3（VLESS 需要）..."
-        apt-get install -y -qq python3 >/dev/null || die "python3 安装失败"
-    fi
     "${proto}_download" "$ver"
 
     # 5. 配置
@@ -1111,20 +1107,18 @@ pick_proto() {
     local action="$1" func="$2"
     echo ""
     echo "选择要${action}的协议:"
-    local i=1
+    local -a _picks=()
     for p in $ALL_PROTOS; do
         if state_installed "$(pkey "$p")"; then
-            echo "  $i) $(pname "$p")"
-            eval "_pick_$i=$p"
-            i=$((i + 1))
+            _picks+=("$p")
+            echo "  ${#_picks[@]}) $(pname "$p")"
         fi
     done
-    [ $i -eq 1 ] && { warn "没有已安装的协议"; return; }
+    [ ${#_picks[@]} -eq 0 ] && { warn "没有已安装的协议"; return; }
     echo -n "选择: "
     read -r pick
-    local target
-    eval "target=\$_pick_$pick"
-    [ -n "${target:-}" ] || { warn "无效选择"; return; }
+    local target="${_picks[$((pick - 1))]:-}"
+    [ -n "$target" ] || { warn "无效选择"; return; }
     "$func" "$target"
 }
 
@@ -1160,7 +1154,7 @@ cli_dispatch() {
         install)
             [ -z "$proto" ] && die "用法: pd --install <snell|hy2|vless|anytls>"
             need_root; detect_os; detect_arch; get_ip; get_mem
-            install_deps; install_qrencode; self_install || warn "pd 更新失败，使用缓存版本"
+            self_install || warn "pd 更新失败，使用缓存版本"
             proto=$(resolve_proto "$proto") || die "未知协议: $proto，可选: snell hy2 vless anytls"
             install_protocol "$proto" ;;
         uninstall)
