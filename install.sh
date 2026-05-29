@@ -9,7 +9,7 @@
 # ============================================================
 set -euo pipefail
 
-VERSION="2.0.0"
+VERSION="2.0.4"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
