@@ -109,9 +109,8 @@ check_root() {
 
 detect_os() {
     if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS_ID="${ID:-unknown}"
-        OS_PRETTY="${PRETTY_NAME:-unknown}"
+        OS_ID=$(grep -oP '^ID=\K.+' /etc/os-release 2>/dev/null | tr -d '"' || echo "unknown")
+        OS_PRETTY=$(grep -oP '^PRETTY_NAME=\K.+' /etc/os-release 2>/dev/null | tr -d '"' || echo "unknown")
     else
         OS_ID="unknown"
         OS_PRETTY="unknown"
@@ -157,7 +156,7 @@ rand_port() {
     local used_ports=" $(get_all_ports) "
     local attempts=0
     while [ $attempts -lt 100 ]; do
-        local p=$(( $(od -An -N2 -i /dev/urandom | tr -d ' ') % 50001 + 10000 ))
+        local p=$(( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
         if ! echo "$used_ports" | grep -q " $p "; then
             echo "$p"
             return 0
