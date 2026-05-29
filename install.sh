@@ -192,6 +192,12 @@ add_firewall() {
     elif command -v iptables >/dev/null 2>&1; then
         iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
         iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        # 持久化：优先用 netfilter-persistent，否则手动 save
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save >/dev/null 2>&1 || true
+        elif [ -d /etc/iptables ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
     fi
 }
 
@@ -203,6 +209,11 @@ del_firewall() {
     elif command -v iptables >/dev/null 2>&1; then
         iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        if command -v netfilter-persistent >/dev/null 2>&1; then
+            netfilter-persistent save >/dev/null 2>&1 || true
+        elif [ -d /etc/iptables ]; then
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        fi
     fi
 }
 
@@ -453,12 +464,14 @@ snell_get_version() {
     for ver_prefix in "5.0" "5.1"; do
         local start=1 end=9
         [ "$ver_prefix" = "5.1" ] && end=5
-        for minor in $(seq $start $end); do
+        local minor=$start
+        while [ $minor -le $end ]; do
             local probe="v${ver_prefix}.${minor}"
             local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
             if curl -fsI --max-time 10 "$probe_url" >/dev/null 2>&1; then
                 echo "$probe" | tee "$cache_file"; return 0
             fi
+            minor=$((minor + 1))
         done
     done
     die "Snell 版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v5.0.x"
