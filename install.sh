@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.6.4
+# PD-proxy — 多协议代理一键部署脚本 v2.7.0
 # 协议: Snell v5 | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.6.4"
+VERSION="2.7.0"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -22,49 +22,24 @@ case "${1:-}" in
 PD-proxy v${VERSION} — 多协议代理一键部署
 
 用法:
-  pd                         进入交互菜单
-  pd --install <协议>         非交互安装指定协议
-  pd --uninstall <协议>       卸载协议
-  pd --upgrade <协议>         升级协议二进制（保留配置）
-  pd --restart <协议>         重启协议服务
-  pd --stop <协议>             停止协议服务
-  pd --start <协议>             启动已停止的协议服务
-  pd --log <协议>              查看协议日志（最近50行）
-  pd --config <协议>          仅输出客户端配置（无日志）
-  pd --config-all             输出所有已安装协议的配置
-  pd --export                 导出所有配置到 /opt/pd/export.conf
-  pd --status                查看所有协议状态
-  pd --show                  查看所有协议配置
-  pd --bbr                   开启 BBR 优化
-  pd --update                更新 pd 自身
-  pd --remove-all            卸载全部（加 --yes 跳过确认）
-  pd --help                  显示此帮助
+  pd                      交互菜单
+  pd --install    <协议>   安装  pd --uninstall <协议> 卸载
+  pd --upgrade    <协议>   升级  pd --restart   <协议> 重启
+  pd --stop/start <协议>   停止/启动
+  pd --log        <协议>   日志  pd --config    <协议> 配置
+  pd --config-all          全部配置  pd --export   导出
+  pd --status              状态  pd --show      详情
+  pd --bbr                 开启BBR  pd --update   更新
+  pd --remove-all [--yes]  卸载全部
 
-协议:
-  snell       Snell v5 (Surge 主力)
-  hy2         Hysteria2 (Surge + Shadowrocket)
-  vless       VLESS Reality (仅 Shadowrocket)
-  anytls      AnyTLS (Surge + Shadowrocket)
+协议: snell (Snell v5) | hy2 (Hysteria2) | vless (VLESS Reality) | anytls
 
-环境变量:
-  PD_SNELL_PORT=12345        手动指定端口
-  PD_HY2_PORT=12346
-  PD_VLESS_PORT=12347
-  PD_ANYTLS_PORT=12348
+增强选项(环境变量):
+  PD_SNELL_MODE=shadowtls  PD_HY2_HOP=5  PD_VLESS_DEST=...:443  PD_ANYTLS_PADDING=deep
 
-  # 协议增强选项
-  PD_SNELL_MODE=shadowtls     Snell + ShadowTLS 伪装
-  PD_SNELL_TLS_SNI=apple.com  ShadowTLS 伪装站点
-  PD_HY2_HOP=5                Hysteria2 端口跳跃数
-  PD_VLESS_DEST=swdist.apple.com:443  VLESS 伪装目标
-  PD_VLESS_TRANSPORT=grpc     VLESS 传输 (tcp|grpc|ws)
-  PD_VLESS_FP=ios             VLESS 浏览器指纹
-  PD_ANYTLS_PADDING=deep      AnyTLS 填充 (standard|deep|fixed|none)
-  PD_ANYTLS_SNI=microsoft.com AnyTLS SNI 伪装
-  
 示例:
   curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh | bash -s -- --install snell
-  PD_SNELL_PORT=12345 pd --install snell
+  PD_HY2_HOP=5 pd --install hy2
 EOF
         exit 0 ;;
     --version|-v)
@@ -241,6 +216,15 @@ verify_port() {
     return 1
 }
 
+save_iptables() {
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1 || true
+    elif [ -d /etc/iptables ]; then
+        cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak 2>/dev/null || true
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    fi
+}
+
 add_firewall() {
     local port="$1"
     if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
@@ -249,13 +233,7 @@ add_firewall() {
     elif command -v iptables >/dev/null 2>&1; then
         iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
         iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-        # 持久化：优先用 netfilter-persistent，否则手动 save
-        if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save >/dev/null 2>&1 || true
-        elif [ -d /etc/iptables ]; then
-            cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak 2>/dev/null || true
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        fi
+        save_iptables
     fi
 }
 
@@ -267,12 +245,7 @@ del_firewall() {
     elif command -v iptables >/dev/null 2>&1; then
         iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-        if command -v netfilter-persistent >/dev/null 2>&1; then
-            netfilter-persistent save >/dev/null 2>&1 || true
-        elif [ -d /etc/iptables ]; then
-            cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak 2>/dev/null || true
-            iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        fi
+        save_iptables
     fi
 }
 
@@ -356,7 +329,7 @@ get_all_ports() {
 # 协议注册表（数据驱动核心 — 新增协议只需加一块定义）
 # ============================================================
 
-# 协议元数据: key, name, dir, bin, service, mem_mb, disk_mb
+# 协议元数据: key, name, dir, bin, service, disk_mb
 declare -A PROTO=()
 
 register_protocols() {
@@ -366,7 +339,6 @@ register_protocols() {
     PROTO[snell_dir]="/opt/snell"
     PROTO[snell_bin]="/opt/snell/snell-server"
     PROTO[snell_service]="snell"
-    PROTO[snell_mem]="5MB"
     PROTO[snell_disk]="20"
 
     # ---- Hysteria2 ----
@@ -375,7 +347,6 @@ register_protocols() {
     PROTO[hy2_dir]="/opt/hysteria2"
     PROTO[hy2_bin]="/opt/hysteria2/hysteria"
     PROTO[hy2_service]="hysteria2"
-    PROTO[hy2_mem]="18MB"
     PROTO[hy2_disk]="30"
 
     # ---- VLESS Reality ----
@@ -384,7 +355,6 @@ register_protocols() {
     PROTO[vless_dir]="/opt/xray"
     PROTO[vless_bin]="/opt/xray/xray"
     PROTO[vless_service]="xray"
-    PROTO[vless_mem]="30MB"
     PROTO[vless_disk]="60"
 
     # ---- AnyTLS ----
@@ -393,7 +363,6 @@ register_protocols() {
     PROTO[anytls_dir]="/opt/anytls"
     PROTO[anytls_bin]="/opt/anytls/anytls-server"
     PROTO[anytls_service]="anytls"
-    PROTO[anytls_mem]="5MB"
     PROTO[anytls_disk]="20"
 }
 
@@ -403,7 +372,6 @@ pname()  { echo "${PROTO[${1}_name]}"; }
 pdir()   { echo "${PROTO[${1}_dir]}"; }
 pbin()   { echo "${PROTO[${1}_bin]}"; }
 psvc()   { echo "${PROTO[${1}_service]}"; }
-pmem()   { echo "${PROTO[${1}_mem]}"; }
 pdisk()  { echo "${PROTO[${1}_disk]}"; }
 
 ALL_PROTOS="snell hy2 vless anytls"
@@ -934,7 +902,6 @@ install_protocol() {
 
     title "安装 $name"
 
-    # 0. 依赖
     install_deps; install_qrencode
     check_disk "$(pdisk "$proto")"
     if state_installed "$key"; then
@@ -942,9 +909,7 @@ install_protocol() {
         return 0
     fi
 
-    # 1. 端口
-    local port
-    local port_var="PD_$(echo "$key" | tr '[:lower:]' '[:upper:]')_PORT"
+    local port port_var="PD_$(echo "$key" | tr '[:lower:]' '[:upper:]')_PORT"
     if [ -n "${!port_var:-}" ]; then
         port="${!port_var}"
         info "端口(手动): $port"
@@ -971,11 +936,8 @@ install_protocol() {
         die '安装失败，已回滚，检查上述错误信息'
     " ERR
 
-    # 2. 密码
-    local pass
-    pass=$(rand_pass)
+    local pass=$(rand_pass)
 
-    # 3. 版本
     local ver=""
     if declare -f "${proto}_get_version" >/dev/null 2>&1; then
         step "获取版本..."
@@ -983,10 +945,8 @@ install_protocol() {
         info "版本: $ver"
     fi
 
-    # 4. 下载
     "${proto}_download" "$ver"
 
-    # 5. 配置
     step "写入配置..."
     if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
         # ShadowTLS 模式：Snell 监听内部端口（50000+），先配 Snell，ShadowTLS 稍后部署
@@ -1002,7 +962,6 @@ install_protocol() {
         "${proto}_configure" "$port" "$pass"
     fi
 
-    # 6. systemd（必须先启动主服务，ShadowTLS 依赖 snell.service 存在）
     step "注册服务..."
     write_systemd "$svc" "$bin" "$("${proto}_service_args" "$port")"
     register_and_start "$svc"
@@ -1012,7 +971,6 @@ install_protocol() {
         snell_shadowtls_configure "$port" "$snell_int"
     fi
 
-    # 7. 防火墙 & 验证
     add_firewall "$port"
     # 端口跳跃：额外开放跳跃端口
     if [ "$proto" = "hy2" ] && [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
@@ -1029,12 +987,10 @@ install_protocol() {
         fi
     fi
 
-    # 8. 保存状态
     state_set "$key" "port" "$port"
     state_set "$key" "status" "installed"
     state_set "$key" "version" "$ver"
 
-    # 9. 输出配置
     "${proto}_output" "$port" "$pass"
 
     # 清除回滚陷阱
@@ -1438,7 +1394,6 @@ register_protocols
 # ============================================================
 
 # 写操作需要 root，读操作不需要
-need_root() { check_root; }
 
 # 一行式协议派发：resolve_proto 归一化 → 调用目标函数
 cli_dispatch() {
@@ -1446,7 +1401,7 @@ cli_dispatch() {
     case "$action" in
         install)
             [ -z "$proto" ] && die "用法: pd --install <snell|hy2|vless|anytls>"
-            need_root; detect_os; detect_arch; get_ip; get_mem
+            check_root; detect_os; detect_arch; get_ip; get_mem
             self_install || warn "pd 更新失败，使用缓存版本"
             proto=$(resolve_proto "$proto") || die "未知协议: $proto，可选: snell hy2 vless anytls"
             # CLI 路径：无环境变量时重置为默认值，防止交互菜单污染
@@ -1461,27 +1416,27 @@ cli_dispatch() {
             install_protocol "$proto" ;;
         uninstall)
             [ -z "$proto" ] && die "用法: pd --uninstall <snell|hy2|vless|anytls>"
-            need_root; detect_os
+            check_root; detect_os
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
             uninstall_protocol "$proto" ;;
         upgrade)
             [ -z "$proto" ] && die "用法: pd --upgrade <snell|hy2|vless|anytls>"
-            need_root; detect_os; detect_arch; get_ip
+            check_root; detect_os; detect_arch; get_ip
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
             upgrade_protocol "$proto" ;;
         restart)
             [ -z "$proto" ] && die "用法: pd --restart <snell|hy2|vless|anytls>"
-            need_root
+            check_root
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
             restart_service "$proto" ;;
         stop)
             [ -z "$proto" ] && die "用法: pd --stop <snell|hy2|vless|anytls>"
-            need_root
+            check_root
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
             stop_service "$proto" ;;
         start)
             [ -z "$proto" ] && die "用法: pd --start <snell|hy2|vless|anytls>"
-            need_root
+            check_root
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
             start_service "$proto" ;;
         log)
