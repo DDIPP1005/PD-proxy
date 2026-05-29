@@ -243,73 +243,41 @@ gen_qr() {
 }
 
 # ============================================================
-# 状态管理（JSON，用 python3 读写）
+# 状态管理（纯 bash flat file，零外部依赖）
+# 格式: <key> port=<port> status=<installed|uninstalled> version=<ver>
 # ============================================================
 
-state_read() {
-    [ -f "$STATE_FILE" ] || { echo "{}"; return; }
-    python3 -c "
-import json
-with open('$STATE_FILE') as f:
-    data = json.load(f)
-print(json.dumps(data))
-"
-}
-
 state_get() {
-    local key="$1" field="${2:-}"
-    python3 -c "
-import json
-key = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$key")
-field = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$field")
-try:
-    with open('$STATE_FILE') as f:
-        data = json.load(f)
-    v = data.get(key, {})
-    if field:
-        print(v.get(field, ''))
-    else:
-        print(json.dumps(v))
-except:
-    print('{}' if not field else '')
-"
+    local key="$1" field="$2"
+    [ -f "$STATE_FILE" ] || { echo ""; return; }
+    local line
+    line=$(grep "^${key} " "$STATE_FILE" 2>/dev/null) || { echo ""; return; }
+    echo "$line" | grep -oP "${field}=\\K\\S+" 2>/dev/null || echo ""
 }
 
 state_set() {
     local key="$1" field="$2" value="$3"
     mkdir -p "$BASE_DIR"
-    python3 -c "
-import json
-val = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$value")
-key = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$key")
-field = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$field")
-try:
-    with open('$STATE_FILE') as f:
-        data = json.load(f)
-except:
-    data = {}
-if key not in data:
-    data[key] = {}
-data[key][field] = val
-with open('$STATE_FILE', 'w') as f:
-    json.dump(data, f, indent=2)
-"
+    local line=""
+    if [ -f "$STATE_FILE" ]; then
+        line=$(grep "^${key} " "$STATE_FILE" 2>/dev/null || echo "")
+        grep -v "^${key} " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+        mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    fi
+    if echo "$line" | grep -q "${field}="; then
+        line=$(echo "$line" | sed "s/${field}=\\S*/${field}=${value}/")
+    else
+        line="${line} ${field}=${value}"
+    fi
+    line=$(echo "$line" | sed 's/^ *//;s/ *$//')
+    echo "$line" >> "$STATE_FILE"
 }
 
 state_del() {
     local key="$1"
-    python3 -c "
-import json
-key = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$key")
-try:
-    with open('$STATE_FILE') as f:
-        data = json.load(f)
-    data.pop(key, None)
-    with open('$STATE_FILE', 'w') as f:
-        json.dump(data, f, indent=2)
-except:
-    pass
-"
+    [ -f "$STATE_FILE" ] || return
+    grep -v "^${key} " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
+    mv "${STATE_FILE}.tmp" "$STATE_FILE"
 }
 
 state_installed() {
@@ -320,18 +288,8 @@ state_installed() {
 }
 
 get_all_ports() {
-    python3 -c "
-import json
-try:
-    with open('$STATE_FILE') as f:
-        data = json.load(f)
-    for k, v in data.items():
-        p = v.get('port', '')
-        if p:
-            print(p)
-except:
-    pass
-" 2>/dev/null
+    [ -f "$STATE_FILE" ] || return
+    grep -oP 'port=\K\S+' "$STATE_FILE" 2>/dev/null
 }
 
 # ============================================================
@@ -351,7 +309,6 @@ register_protocols() {
     PROTO[snell_service]="snell"
     PROTO[snell_mem]="5MB"
     PROTO[snell_disk]="20"
-    PROTO[snell_clients]="s"
 
     # ---- Hysteria2 ----
     PROTO[hy2_key]="hy2"
@@ -361,7 +318,6 @@ register_protocols() {
     PROTO[hy2_service]="hysteria2"
     PROTO[hy2_mem]="18MB"
     PROTO[hy2_disk]="30"
-    PROTO[hy2_clients]="s,q"
 
     # ---- VLESS Reality ----
     PROTO[vless_key]="vless"
@@ -371,7 +327,6 @@ register_protocols() {
     PROTO[vless_service]="xray"
     PROTO[vless_mem]="30MB"
     PROTO[vless_disk]="60"
-    PROTO[vless_clients]="q,l"
 
     # ---- AnyTLS ----
     PROTO[anytls_key]="anytls"
@@ -381,7 +336,6 @@ register_protocols() {
     PROTO[anytls_service]="anytls"
     PROTO[anytls_mem]="5MB"
     PROTO[anytls_disk]="20"
-    PROTO[anytls_clients]="s,q,l"
 }
 
 # 获取协议元数据
@@ -392,7 +346,6 @@ pbin()   { echo "${PROTO[${1}_bin]}"; }
 psvc()   { echo "${PROTO[${1}_service]}"; }
 pmem()   { echo "${PROTO[${1}_mem]}"; }
 pdisk()  { echo "${PROTO[${1}_disk]}"; }
-pclients() { echo "${PROTO[${1}_clients]}"; }
 
 ALL_PROTOS="snell hy2 vless anytls"
 
@@ -431,17 +384,22 @@ register_and_start() {
     systemctl restart "$svc" || die "启动 $svc 失败: journalctl -u $svc -n 20"
 }
 
-stop_and_remove() {
-    local svc="$1"
-    systemctl stop "$svc" 2>/dev/null || true
-    systemctl disable "$svc" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${svc}.service"
-    systemctl daemon-reload
-    systemctl reset-failed "${svc}.service" 2>/dev/null || true
+# ============================================================
+# 输出模板
+# ============================================================
+
+output_header() {
+    echo ""
+    echo -e "${BOLD}══════════════════════════════${RESET}"
+    echo -e "${BOLD}  $1 ✅ 安装完成${RESET}"
+    echo -e "${BOLD}══════════════════════════════${RESET}"
+    echo -e "端口:   ${GREEN}$2${RESET}"
 }
 
+output_footer() { echo -e "${BOLD}══════════════════════════════${RESET}"; }
+
 # ============================================================
-# 协议专用逻辑（hook 函数）
+# 协议注册表
 # ============================================================
 
 # ---- Snell v5 ----
@@ -515,21 +473,12 @@ snell_service_args() {
 
 snell_output() {
     local port="$1" psk="$2"
-    echo ""
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "${BOLD}  Snell v5 ✅ 安装完成${RESET}"
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "端口:   ${GREEN}${port}${RESET}"
+    output_header "Snell v5" "$port"
     echo -e "PSK:    ${GREEN}${psk}${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
     echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true${RESET}"
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-}
-
-snell_cleanup() {
-    rm -rf "$(pdir snell)"
-    del_firewall "${1:-}"
+    output_footer
 }
 
 # ---- Hysteria2 ----
@@ -584,11 +533,7 @@ hy2_service_args() {
 
 hy2_output() {
     local port="$1" pass="$2"
-    echo ""
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "${BOLD}  Hysteria2 ✅ 安装完成${RESET}"
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "端口:   ${GREEN}${port}${RESET}"
+    output_header "Hysteria2" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
@@ -596,12 +541,7 @@ hy2_output() {
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
     gen_qr "hysteria2://${pass}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-}
-
-hy2_cleanup() {
-    rm -rf "$(pdir hy2)"
-    del_firewall "${1:-}"
+    output_footer
 }
 
 # ---- VLESS Reality ----
@@ -677,11 +617,7 @@ vless_output() {
     shortid=$(cat "$(pdir vless)/.shortid" 2>/dev/null || echo "未知")
     local link="vless://${uuid}@${IP}:${port}?encryption=none&security=reality&sni=addons.mozilla.org&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp&flow=xtls-rprx-vision#PD-VLESS"
 
-    echo ""
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "${BOLD}  VLESS Reality ✅ 安装完成${RESET}"
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "端口:   ${GREEN}${port}${RESET}"
+    output_header "VLESS Reality" "$port"
     echo -e "UUID:   ${GREEN}${uuid}${RESET}"
     echo ""
     echo -e "${YELLOW}⚠ Surge 不支持 VLESS Reality，请用 Shadowrocket${RESET}"
@@ -691,12 +627,7 @@ vless_output() {
     echo ""
     echo -e "${CYAN}[通用链接]${RESET}"
     echo -e "${GREEN}${link}${RESET}"
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-}
-
-vless_cleanup() {
-    rm -rf "$(pdir vless)"
-    del_firewall "${1:-}"
+    output_footer
 }
 
 # ---- AnyTLS ----
@@ -739,11 +670,7 @@ anytls_service_args() {
 anytls_output() {
     local port="$1" pass="$2"
     local link="anytls://${pass}@${IP}:${port}#PD-AnyTLS"
-    echo ""
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "${BOLD}  AnyTLS ✅ 安装完成${RESET}"
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "端口:   ${GREEN}${port}${RESET}"
+    output_header "AnyTLS" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
     echo ""
     echo -e "${CYAN}[Surge]${RESET}"
@@ -755,12 +682,7 @@ anytls_output() {
     echo ""
     echo -e "${CYAN}[通用链接]${RESET}"
     echo -e "${GREEN}${link}${RESET}"
-    echo -e "${BOLD}══════════════════════════════${RESET}"
-}
-
-anytls_cleanup() {
-    rm -rf "$(pdir anytls)"
-    del_firewall "${1:-}"
+    output_footer
 }
 
 # ============================================================
@@ -769,13 +691,12 @@ anytls_cleanup() {
 
 install_protocol() {
     local proto="$1"
-    local name key dir bin svc clients
+    local name key dir bin svc
     name=$(pname "$proto")
     key=$(pkey "$proto")
     dir=$(pdir "$proto")
     bin=$(pbin "$proto")
     svc=$(psvc "$proto")
-    clients=$(pclients "$proto")
 
     title "安装 $name"
 
