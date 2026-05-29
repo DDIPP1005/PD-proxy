@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.6.1
+# PD-proxy — 多协议代理一键部署脚本 v2.6.2
 # 协议: Snell v5 | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.6.1"
+VERSION="2.6.2"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -191,6 +191,11 @@ rand_port() {
     while [ $attempts -lt 100 ]; do
         local p=$(( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
         if ! echo "$used_ports" | grep -q " $p "; then
+            # 额外检查：确保端口未被非 PD 服务占用
+            if ss -tlnp 2>/dev/null | grep -q ":${p} "; then
+                attempts=$((attempts + 1))
+                continue
+            fi
             echo "$p"
             return 0
         fi
@@ -214,7 +219,7 @@ verify_download() {
         die "$label 下载失败：文件不存在"
     fi
     local size
-    size=$(stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null || echo "0")
+    size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null || echo "0")
     if [ "$size" -lt "$min_bytes" ]; then
         die "$label 下载失败：文件大小异常（${size} bytes < ${min_bytes}）"
     fi
@@ -637,8 +642,10 @@ hy2_download() {
     local url="https://github.com/apernet/hysteria/releases/download/app/${ver}/hysteria-linux-${ARCH}"
     step "下载 Hysteria2 $ver ..."
     mkdir -p "$(pdir hy2)"
-    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$(pbin hy2)" "$url" \
-        || die "Hysteria2 下载失败: $url"
+    local tmpbin=$(mktemp_pd)
+    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpbin" "$url" \
+        || { rm -f "$tmpbin"; die "Hysteria2 下载失败: $url"; }
+    mv "$tmpbin" "$(pbin hy2)"
     chmod +x "$(pbin hy2)"
     verify_download "$(pbin hy2)" "Hysteria2" 5000000
     info "Hysteria2 下载完成"
@@ -1052,7 +1059,7 @@ uninstall_protocol() {
         local listen_line
         listen_line=$(grep 'listen:' "$(pdir hy2)/config.yaml" 2>/dev/null || echo "")
         local hop_count
-        hop_count=$(echo "$listen_line" | tr ',' '\n' | wc -l | tr -d ' ')
+        hop_count=$(echo "$listen_line" | tr ',' '\n' | wc -l | tr -d ' \n')
         if [ "$hop_count" -ge 2 ] 2>/dev/null; then
             local i
             for i in $(seq 1 $((hop_count - 1))); do
@@ -1081,6 +1088,9 @@ upgrade_protocol() {
 
     title "升级 $name"
 
+    # 检查磁盘空间
+    check_disk "$(pdisk "$proto")"
+
     local ver=""
     if declare -f "${proto}_get_version" >/dev/null 2>&1; then
         step "获取最新版本..."
@@ -1101,6 +1111,10 @@ upgrade_protocol() {
 
     step "启动服务..."
     systemctl start "$svc" || die "启动 $svc 失败: journalctl -u $svc -n 20"
+    # Snell + ShadowTLS: Requires= 只传播 stop 不传播 start，需手动拉起
+    if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+        systemctl start shadowtls-snell 2>/dev/null || warn "ShadowTLS 启动失败"
+    fi
 
     state_set "$key" "version" "$ver"
     info "$name 升级完成"
