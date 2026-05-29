@@ -447,11 +447,13 @@ snell_get_version() {
     if [ -n "$v" ]; then
         echo "v${v}" | tee "$cache_file"; return 0
     fi
-    # 3. 级联探测（每前缀 5 次，从高到低，共 10 次）
+    # 3. 级联探测（5.1探3次，5.0全探到底 — v5.0.1是amd64唯一可用版本）
     for ver_prefix in "5.1" "5.0"; do
         local minor=10
+        local group_limit=3
+        [ "$ver_prefix" = "5.0" ] && group_limit=10
         local group_count=0
-        while [ $minor -ge 0 ] && [ $group_count -lt 5 ]; do
+        while [ $minor -ge 1 ] && [ $group_count -lt $group_limit ]; do
             local probe="v${ver_prefix}.${minor}"
             local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
             if curl -fsI --max-time 10 "$probe_url" >/dev/null 2>&1; then
