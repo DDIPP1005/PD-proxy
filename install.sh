@@ -72,7 +72,7 @@ get_ip() {
 
 get_mem() {
     MEM_TOTAL=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo "0")
-    MEM_AVAIL=$(free -m 2>/dev/null | awk '/^Mem:/{print $7}' || echo "0")
+    MEM_AVAIL=$(free -m 2>/dev/null | awk '/^Mem:/{print $NF}' || echo "0")
 }
 
 has_ipv6() {
@@ -334,7 +334,7 @@ ALL_PROTOS="snell hy2 vless anytls"
 # ============================================================
 
 write_systemd() {
-    local svc="$1" bin="$2" args="$3"
+    local svc="$1" bin="$2" args="$3" dir="$4"
     cat > "/etc/systemd/system/${svc}.service" <<EOF
 [Unit]
 Description=PD-proxy: ${svc}
@@ -347,9 +347,8 @@ Restart=always
 RestartSec=5
 LimitNOFILE=32768
 NoNewPrivileges=yes
-ProtectSystem=strict
+ProtectSystem=full
 ProtectHome=yes
-ReadWritePaths=${pdir}
 RestrictAddressFamilies=AF_INET AF_INET6
 PrivateTmp=yes
 
@@ -397,13 +396,17 @@ snell_get_version() {
     if [ -n "$v" ]; then
         echo "v${v}" | tee "$cache_file"; return 0
     fi
-    # 3. 级联探测 (v5.0.1 → v5.0.5)
-    for minor in 1 2 3 4 5; do
-        local probe="v5.0.${minor}"
-        local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
-        if curl -fsI --max-time 10 "$probe_url" >/dev/null 2>&1; then
-            echo "$probe" | tee "$cache_file"; return 0
-        fi
+    # 3. 级联探测 (v5.0.1 → v5.0.9, v5.1.0 → v5.1.5)
+    for ver_prefix in "5.0" "5.1"; do
+        local start=1 end=9
+        [ "$ver_prefix" = "5.1" ] && end=5
+        for minor in $(seq $start $end); do
+            local probe="v${ver_prefix}.${minor}"
+            local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
+            if curl -fsI --max-time 10 "$probe_url" >/dev/null 2>&1; then
+                echo "$probe" | tee "$cache_file"; return 0
+            fi
+        done
     done
     die "Snell 版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v5.0.x"
 }
@@ -708,6 +711,19 @@ install_protocol() {
         return 0
     fi
 
+    # 回滚陷阱：任何未捕获的错误触发清理
+    local _rollback_port=""
+    trap "
+        err '安装失败，正在回滚...'
+        systemctl stop '$svc' 2>/dev/null || true
+        rm -f '/etc/systemd/system/${svc}.service'
+        systemctl daemon-reload
+        [ -n '$_rollback_port' ] && del_firewall '$_rollback_port'
+        rm -rf '$dir'
+        state_del '$key'
+        die '安装失败，已回滚，检查上述错误信息'
+    " ERR
+
     # 1. 端口
     local port
     local port_var="PD_$(echo "$key" | tr '[:lower:]' '[:upper:]')_PORT"
@@ -718,6 +734,7 @@ install_protocol() {
         port=$(rand_port)
         info "端口(自动): $port"
     fi
+    _rollback_port="$port"
 
     # 2. 密码
     local pass
@@ -740,7 +757,7 @@ install_protocol() {
 
     # 6. systemd
     step "注册服务..."
-    write_systemd "$svc" "$bin" "$("${proto}_service_args" "$port")"
+    write_systemd "$svc" "$bin" "$("${proto}_service_args" "$port")" "$dir"
     register_and_start "$svc"
 
     # 7. 防火墙 & 验证
@@ -754,6 +771,9 @@ install_protocol() {
 
     # 9. 输出配置
     "${proto}_output" "$port" "$pass"
+
+    # 清除回滚陷阱
+    trap - ERR
 }
 
 uninstall_protocol() {
@@ -864,7 +884,7 @@ enable_bbr() {
         info "BBR 已开启，跳过"
         return
     fi
-    if grep -q "net.core.default_qdisk=fq" /etc/sysctl.conf 2>/dev/null; then
+    if grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf 2>/dev/null; then
         info "BBR 已配置，跳过"
         return
     fi
@@ -1061,10 +1081,10 @@ case "${1:-}" in
         esac
         exit 0 ;;
     --status|-s)
-        check_root; detect_os; detect_arch; get_ip; get_mem; show_status
+        detect_os; detect_arch; get_ip; get_mem; show_status
         exit 0 ;;
     --show|--config)
-        check_root; detect_os; detect_arch; get_ip; get_mem; show_config
+        detect_os; detect_arch; get_ip; get_mem; show_config
         exit 0 ;;
     --bbr)
         check_root; enable_bbr
