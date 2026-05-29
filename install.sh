@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.3.0
+# PD-proxy — 多协议代理一键部署脚本 v2.4.0
 # 协议: Snell v5 | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -25,6 +25,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   pd --upgrade <协议>         升级协议二进制（保留配置）
   pd --restart <协议>         重启协议服务
   pd --stop <协议>             停止协议服务
+  pd --start <协议>             启动已停止的协议服务
   pd --log <协议>              查看协议日志（最近50行）
   pd --config <协议>          仅输出客户端配置（无日志）
   pd --config-all             输出所有已安装协议的配置
@@ -438,18 +439,21 @@ snell_get_version() {
     if [ -n "$v" ]; then
         echo "v${v}" | tee "$cache_file"; return 0
     fi
-    # 3. 级联探测 (v5.0.1 → v5.0.9, v5.1.0 → v5.1.5)
-    for ver_prefix in "5.0" "5.1"; do
-        local start=1 end=9
-        [ "$ver_prefix" = "5.1" ] && end=5
+    # 3. 级联探测（最多 5 次，按版本号从高到低）
+    local probe_count=0
+    for ver_prefix in "5.1" "5.0"; do
+        local start=5 end=0
+        [ "$ver_prefix" = "5.0" ] && start=9
         local minor=$start
-        while [ $minor -le $end ]; do
+        while [ $minor -ge $end ]; do
             local probe="v${ver_prefix}.${minor}"
             local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
             if curl -fsI --max-time 10 "$probe_url" >/dev/null 2>&1; then
                 echo "$probe" | tee "$cache_file"; return 0
             fi
-            minor=$((minor + 1))
+            minor=$((minor - 1))
+            probe_count=$((probe_count + 1))
+            [ $probe_count -ge 5 ] && break 2
         done
     done
     die "Snell 版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v5.0.x"
@@ -886,6 +890,19 @@ stop_service() {
     info "$(pname "$proto") 已停止"
 }
 
+start_service() {
+    local proto="$1"
+    local key=$(pkey "$proto")
+    local svc=$(psvc "$proto")
+
+    if ! state_installed "$key"; then
+        die "$(pname "$proto") 未安装"
+    fi
+    info "启动 $(pname "$proto") ..."
+    systemctl start "$svc" || die "启动失败: journalctl -u $svc -n 20"
+    info "$(pname "$proto") 已启动"
+}
+
 show_log() {
     local proto="$1"
     local key=$(pkey "$proto")
@@ -918,11 +935,7 @@ show_config_only() {
             echo "# Shadowrocket: hysteria2://${pass}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2" ;;
         vless)
             local uuid pubkey shortid
-            if command -v python3 >/dev/null 2>&1; then
-                uuid=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print(c['inbounds'][0]['settings']['clients'][0]['id'])" "$(pdir vless)/config.json" 2>/dev/null || echo "")
-            else
-                uuid=""
-            fi
+            uuid=$(grep -oP '"id":\s*"\K[^"]+' "$(pdir vless)/config.json" 2>/dev/null | head -1 || echo "")
             pubkey=$(cat "$(pdir vless)/.pubkey" 2>/dev/null || echo "")
             shortid=$(cat "$(pdir vless)/.shortid" 2>/dev/null || echo "")
             echo "# Surge 不支持 VLESS"
@@ -1002,11 +1015,7 @@ show_config() {
                 hy2_output "$port" "$pass" ;;
             vless)
                 local uuid
-                if command -v python3 >/dev/null 2>&1; then
-                    uuid=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print(c['inbounds'][0]['settings']['clients'][0]['id'])" "$(pdir vless)/config.json" 2>/dev/null || echo "未知")
-                else
-                    uuid="未知"
-                fi
+                uuid=$(grep -oP '"id":\s*"\K[^"]+' "$(pdir vless)/config.json" 2>/dev/null | head -1 || echo "未知")
                 vless_output "$port" "$uuid" ;;
             anytls)
                 local pass
@@ -1093,25 +1102,6 @@ press_enter() {
     read -r
 }
 
-remove_menu() {
-    echo ""
-    echo "卸载协议:"
-    echo "1) Snell v5"
-    echo "2) Hysteria2"
-    echo "3) VLESS Reality"
-    echo "4) AnyTLS"
-    echo "0) 返回"
-    echo -n "选择: "
-    read -r rc
-    case "$rc" in
-        1) uninstall_protocol snell ;;
-        2) uninstall_protocol hy2 ;;
-        3) uninstall_protocol vless ;;
-        4) uninstall_protocol anytls ;;
-        0) return ;;
-    esac
-}
-
 # ============================================================
 # 入口
 # ============================================================
@@ -1193,6 +1183,11 @@ cli_dispatch() {
             need_root
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
             stop_service "$proto" ;;
+        start)
+            [ -z "$proto" ] && die "用法: pd --start <snell|hy2|vless|anytls>"
+            need_root
+            proto=$(resolve_proto "$proto") || die "未知协议: $proto"
+            start_service "$proto" ;;
         log)
             [ -z "$proto" ] && die "用法: pd --log <snell|hy2|vless|anytls>"
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
@@ -1213,6 +1208,7 @@ case "${1:-}" in
     --upgrade|-u)  cli_dispatch upgrade  "${2:-}" ; exit 0 ;;
     --restart)     cli_dispatch restart  "${2:-}" ; exit 0 ;;
     --stop)        cli_dispatch stop     "${2:-}" ; exit 0 ;;
+    --start)       cli_dispatch start    "${2:-}" ; exit 0 ;;
     --log|-l)      cli_dispatch log      "${2:-}" ; exit 0 ;;
     --config|-c)   cli_dispatch config   "${2:-}" ; exit 0 ;;
     --config-all)
@@ -1250,7 +1246,7 @@ self_install || warn "pd 更新失败，使用缓存版本"
 show_status
 echo ""
 echo " 安装: 1)Snell 2)HY2 3)VLESS 4)AnyTLS"
-echo " 管理: u)升级 r)重启 s)停止 l)日志"
+echo " 管理: u)升级 r)重启 s)停止 S)启动 l)日志"
 echo " 查看: c)配置行 C)完整配置 e)导出"
 echo " 系统: b)BBR   d)卸载   R)全部卸载"
 echo "       q)退出"
@@ -1265,12 +1261,13 @@ case "$cc" in
     u) pick_proto "升级" upgrade_protocol; press_enter ;;
     r) pick_proto "重启" restart_service; press_enter ;;
     s) pick_proto "停止" stop_service; press_enter ;;
+    S) pick_proto "启动" start_service; press_enter ;;
     l) pick_proto "日志" show_log; exec "$0" ;;
     c) pick_proto "配置" show_config_only; exec "$0" ;;
     C) show_config; press_enter ;;
     e) run_export; press_enter ;;
     b) enable_bbr; press_enter ;;
-    d) remove_menu; press_enter ;;
+    d) pick_proto "卸载" uninstall_protocol; press_enter ;;
     R) remove_all ;;
     q) info "再见 👋"; exit 0 ;;
     *) ;;
