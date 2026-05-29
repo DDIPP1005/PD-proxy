@@ -28,6 +28,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   pd --log <协议>              查看协议日志（最近50行）
   pd --config <协议>          仅输出客户端配置（无日志）
   pd --config-all             输出所有已安装协议的配置
+  pd --export                 导出所有配置到 /opt/pd/export.conf
   pd --status                查看所有协议状态
   pd --show                  查看所有协议配置
   pd --bbr                   开启 BBR 优化
@@ -61,6 +62,11 @@ esac
 # ============================================================
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+
+# 管道或重定向时自动去色
+if [ ! -t 1 ]; then
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; RESET=''
+fi
 
 BASE_DIR="/opt/pd"
 STATE_FILE="$BASE_DIR/state"
@@ -935,13 +941,27 @@ show_status() {
             local port=$(state_get "$key" "port")
             local ver=$(state_get "$key" "version")
             local svc=$(psvc "$proto")
-            local st
+            local st uptime=""
             if systemctl is-active --quiet "$svc" 2>/dev/null; then
                 st="✅ 运行中"
+                local started
+                started=$(systemctl show "$svc" --property=ActiveEnterTimestamp 2>/dev/null | cut -d= -f2)
+                if [ -n "$started" ]; then
+                    local now=$(date +%s)
+                    local start_ts=$(date -d "$started" +%s 2>/dev/null || echo 0)
+                    local elapsed=$((now - start_ts))
+                    if [ $elapsed -gt 86400 ]; then
+                        uptime="$(($elapsed / 86400))天"
+                    elif [ $elapsed -gt 3600 ]; then
+                        uptime="$(($elapsed / 3600))小时"
+                    else
+                        uptime="$(($elapsed / 60))分钟"
+                    fi
+                fi
             else
                 st="❌ 已停止"
             fi
-            printf "  %-15s 端口 %-7s %s  %s  v%s\n" "$name" "$port" "$st" "$(pmem "$proto")" "$ver"
+            printf "  %-15s 端口 %-7s %s %s  %s  v%s\n" "$name" "$port" "$st" "${uptime}" "$(pmem "$proto")" "$ver"
         else
             printf "  %-15s ${YELLOW}未安装${RESET}\n" "$name"
         fi
@@ -1216,6 +1236,20 @@ case "${1:-}" in
                 echo ""
             fi
         done
+        exit 0 ;;
+    --export)
+        detect_os; detect_arch; get_ip
+        {
+            echo "# PD-proxy 导出 — $(date)"
+            for p in $ALL_PROTOS; do
+                if state_installed "$(pkey "$p")"; then
+                    echo ""
+                    echo "# $(pname "$p")"
+                    show_config_only "$p"
+                fi
+            done
+        } > /opt/pd/export.conf
+        info "配置已导出到 /opt/pd/export.conf"
         exit 0 ;;
     --config|-c)
         [ -z "${2:-}" ] && die "用法: pd --config <snell|hy2|vless|anytls>"
