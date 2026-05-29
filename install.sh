@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.4.0
+# PD-proxy — 多协议代理一键部署脚本 v2.5.0
 # 协议: Snell v5 | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.4.0"
+VERSION="2.5.0"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -44,7 +44,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   snell       Snell v5 (Surge 主力)
   hy2         Hysteria2 (Surge + Shadowrocket)
   vless       VLESS Reality (仅 Shadowrocket)
-  anytls      AnyTLS (beta)
+  anytls      AnyTLS (Surge + Shadowrocket)
 
 环境变量:
   PD_SNELL_PORT=12345        手动指定端口
@@ -64,12 +64,13 @@ esac
 # ============================================================
 # 颜色 & 常量
 # ============================================================
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+RED='\033[0;31m'; GREEN='\033[1;32m'; YELLOW='\033[0;33m'
+CYAN='\033[1;36m'; MAGENTA='\033[1;35m'; BLUE='\033[1;34m'
+BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
 
 # 管道或重定向时自动去色
 if [ ! -t 1 ]; then
-    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; RESET=''
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; MAGENTA=''; BLUE=''; BOLD=''; DIM=''; RESET=''
 fi
 
 BASE_DIR="/opt/pd"
@@ -705,8 +706,7 @@ anytls_output() {
     output_header "AnyTLS" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
     echo ""
-    echo -e "${CYAN}[Surge]${RESET}"
-    echo -e "${YELLOW}⚠ Surge 对 AnyTLS 的支持未官方确认${RESET}"
+    echo -e "${CYAN}[Surge 配置]${RESET}"
     echo -e "${GREEN}anytls, ${IP}, ${port}, password=${pass}${RESET}"
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
@@ -961,45 +961,34 @@ show_config_only() {
 # ============================================================
 
 show_status() {
-    title "PD-proxy 状态"
-    echo -e "${CYAN}══════════════════════════════════════════${RESET}"
-    local has_any=false
+    echo ""
+    echo -e "${CYAN}╔══════════════════════════════════════╗${RESET}"
+    echo -e "${CYAN}║${RESET}     ${MAGENTA}◆  P D - P R O X Y${RESET}  ${DIM}v${VERSION}${RESET}    ${CYAN}║${RESET}"
+    echo -e "${CYAN}╠══════════════════════════════════════╣${RESET}"
     for proto in $ALL_PROTOS; do
         local key=$(pkey "$proto")
         local name=$(pname "$proto")
         if state_installed "$key"; then
-            has_any=true
             local port=$(state_get "$key" "port")
             local ver=$(state_get "$key" "version")
             local svc=$(psvc "$proto")
-            local st uptime=""
+            local st icon
             if systemctl is-active --quiet "$svc" 2>/dev/null; then
-                st="✅ 运行中"
-                local started
-                started=$(systemctl show "$svc" --property=ActiveEnterTimestamp 2>/dev/null | cut -d= -f2)
-                if [ -n "$started" ]; then
-                    local now=$(date +%s)
-                    local start_ts=$(date -d "$started" +%s 2>/dev/null || echo 0)
-                    local elapsed=$((now - start_ts))
-                    if [ $elapsed -gt 86400 ]; then
-                        uptime="$(($elapsed / 86400))天"
-                    elif [ $elapsed -gt 3600 ]; then
-                        uptime="$(($elapsed / 3600))小时"
-                    else
-                        uptime="$(($elapsed / 60))分钟"
-                    fi
-                fi
+                st="${GREEN}ONLINE ${RESET}"
+                icon="${GREEN}◆${RESET}"
             else
-                st="❌ 已停止"
+                st="${RED}OFFLINE${RESET}"
+                icon="${RED}◇${RESET}"
             fi
-            printf "  %-15s 端口 %-7s %s %s  %s  v%s\n" "$name" "$port" "$st" "${uptime}" "$(pmem "$proto")" "$ver"
+            printf "${CYAN}║${RESET} ${icon} %-12s ${st}  ${BLUE}:%-5s${RESET} ${DIM}v%s${RESET} ${CYAN}║${RESET}\n" "$name" "$port" "$ver"
         else
-            printf "  %-15s ${YELLOW}未安装${RESET}\n" "$name"
+            printf "${CYAN}║${RESET} ${DIM}◇ %-12s 未安装              ${RESET} ${CYAN}║${RESET}\n" "$name"
         fi
     done
-    echo -e "${CYAN}══════════════════════════════════════════${RESET}"
-    echo -e "系统: ${OS_PRETTY} | IP: ${IP} | 内存: ${MEM_AVAIL}MB 可用"
-    echo -e "${CYAN}══════════════════════════════════════════${RESET}"
+    echo -e "${CYAN}╠══════════════════════════════════════╣${RESET}"
+    printf "${CYAN}║${RESET} ${DIM}%-10s │ ${BLUE}%-15s${RESET}${DIM} │ %sMB${RESET}  ${CYAN}║${RESET}\n" "$OS_PRETTY" "$IP" "$MEM_AVAIL"
+    echo -e "${CYAN}╚══════════════════════════════════════╝${RESET}"
+    echo ""
 }
 
 show_config() {
@@ -1101,12 +1090,6 @@ remove_all() {
     rm -rf "$BASE_DIR"
     info "全部已卸载。再见 👋"
     exit 0
-}
-
-press_enter() {
-    echo ""
-    echo -n "回车返回菜单..."
-    read -r
 }
 
 # ============================================================
@@ -1242,40 +1225,122 @@ case "${1:-}" in
 esac
 
 # ============================================================
-# 交互主面板（统一入口 — 安装/非安装同面板）
+# 交互菜单系统（二级菜单）
+# ============================================================
+
+menu_install() {
+    echo -e "  ${MAGENTA}▸ 安装协议${RESET}"
+    echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+    echo -e "  ${CYAN}│${RESET} [1] ${GREEN}Snell v5${RESET}        ${DIM}Surge 主力${RESET}        ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [2] ${GREEN}Hysteria2${RESET}       ${DIM}Surge + SR${RESET}        ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [3] ${GREEN}VLESS Reality${RESET}   ${DIM}Shadowrocket${RESET}      ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [4] ${GREEN}AnyTLS${RESET}          ${DIM}Surge + SR${RESET}        ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回主菜单${RESET}                    ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+    echo ""
+    echo -ne "  ${MAGENTA}▸${RESET} 选择: "
+    read -r cc
+    case "$cc" in
+        1) install_protocol snell ;;
+        2) install_protocol hy2 ;;
+        3) install_protocol vless ;;
+        4) install_protocol anytls ;;
+        [Bb]) return 1 ;;
+        [Qq]) info "再见 👋"; exit 0 ;;
+        *) warn "无效选择" ;;
+    esac
+    return 0
+}
+
+menu_manage() {
+    echo -e "  ${MAGENTA}▸ 管理协议${RESET}"
+    echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+    echo -e "  ${CYAN}│${RESET} [1] 升级       [4] 启动              ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [2] 重启       [5] 日志              ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [3] 停止       [6] 卸载              ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回主菜单${RESET}                      ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+    echo ""
+    echo -ne "  ${MAGENTA}▸${RESET} 选择: "
+    read -r cc
+    case "$cc" in
+        1) pick_proto "升级" upgrade_protocol ;;
+        2) pick_proto "重启" restart_service ;;
+        3) pick_proto "停止" stop_service ;;
+        4) pick_proto "启动" start_service ;;
+        5) pick_proto "日志" show_log ;;
+        6) pick_proto "卸载" uninstall_protocol ;;
+        [Bb]) return 1 ;;
+        [Qq]) info "再见 👋"; exit 0 ;;
+        *) warn "无效选择" ;;
+    esac
+    return 0
+}
+
+menu_view() {
+    echo -e "  ${MAGENTA}▸ 查看配置${RESET}"
+    echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+    echo -e "  ${CYAN}│${RESET} [1] 单协议配置行                     ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [2] 全部协议配置                     ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [3] 导出配置文件                     ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回主菜单${RESET}                      ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+    echo ""
+    echo -ne "  ${MAGENTA}▸${RESET} 选择: "
+    read -r cc
+    case "$cc" in
+        1) pick_proto "配置" show_config_only ;;
+        2) show_config ;;
+        3) run_export ;;
+        [Bb]) return 1 ;;
+        [Qq]) info "再见 👋"; exit 0 ;;
+        *) warn "无效选择" ;;
+    esac
+    return 0
+}
+
+menu_system() {
+    echo -e "  ${MAGENTA}▸ 系统工具${RESET}"
+    echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+    echo -e "  ${CYAN}│${RESET} [1] BBR 优化                          ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [2] 卸载全部协议                       ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回主菜单${RESET}                      ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+    echo ""
+    echo -ne "  ${MAGENTA}▸${RESET} 选择: "
+    read -r cc
+    case "$cc" in
+        1) enable_bbr ;;
+        2) remove_all ;;
+        [Bb]) return 1 ;;
+        [Qq]) info "再见 👋"; exit 0 ;;
+        *) warn "无效选择" ;;
+    esac
+    return 0
+}
+
+# ============================================================
+# 主菜单循环
 # ============================================================
 
 check_root
 detect_os; detect_arch; get_ip; get_mem
 self_install || warn "pd 更新失败，使用缓存版本"
 
-show_status
-echo ""
-echo " 安装: 1)Snell 2)HY2 3)VLESS 4)AnyTLS"
-echo " 管理: u)升级 r)重启 s)停止 S)启动 l)日志"
-echo " 查看: c)配置行 C)完整配置 e)导出"
-echo " 系统: b)BBR   d)卸载   R)全部卸载"
-echo "       q)退出"
-echo ""
-echo -n "选择: "
-read -r cc
-case "$cc" in
-    1) install_protocol snell; press_enter ;;
-    2) install_protocol hy2; press_enter ;;
-    3) install_protocol vless; press_enter ;;
-    4) install_protocol anytls; press_enter ;;
-    u) pick_proto "升级" upgrade_protocol; press_enter ;;
-    r) pick_proto "重启" restart_service; press_enter ;;
-    s) pick_proto "停止" stop_service; press_enter ;;
-    S) pick_proto "启动" start_service; press_enter ;;
-    l) pick_proto "日志" show_log; exec "$0" ;;
-    c) pick_proto "配置" show_config_only; exec "$0" ;;
-    C) show_config; press_enter ;;
-    e) run_export; press_enter ;;
-    b) enable_bbr; press_enter ;;
-    d) pick_proto "卸载" uninstall_protocol; press_enter ;;
-    R) remove_all ;;
-    q) info "再见 👋"; exit 0 ;;
-    *) ;;
-esac
-exec "$0"
+while true; do
+    show_status
+    echo -e "  ${CYAN}[1]${RESET} 安装协议    ${CYAN}[2]${RESET} 管理协议"
+    echo -e "  ${CYAN}[3]${RESET} 查看配置    ${CYAN}[4]${RESET} 系统工具"
+    echo -e "  ${CYAN}[Q]${RESET} 退出"
+    echo ""
+    echo -ne "  ${MAGENTA}▸${RESET} 选择: "
+    read -r cc
+    case "$cc" in
+        1) while menu_install; do :; done ;;
+        2) while menu_manage; do :; done ;;
+        3) while menu_view; do :; done ;;
+        4) while menu_system; do :; done ;;
+        [Qq]) info "再见 👋"; exit 0 ;;
+        *) ;;
+    esac
+done
