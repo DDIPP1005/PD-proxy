@@ -9,7 +9,7 @@
 # ============================================================
 set -euo pipefail
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -355,6 +355,16 @@ pmem()   { echo "${PROTO[${1}_mem]}"; }
 pdisk()  { echo "${PROTO[${1}_disk]}"; }
 
 ALL_PROTOS="snell hy2 vless anytls"
+
+# 协议名归一化（别名 → 标准名）
+resolve_proto() {
+    case "${1}" in
+        hy2|hysteria2) echo "hy2" ;;
+        vless|xray)     echo "vless" ;;
+        snell|anytls)   echo "${1}" ;;
+        *)              return 1 ;;
+    esac
+}
 
 # ============================================================
 # systemd 辅助
@@ -707,7 +717,8 @@ install_protocol() {
 
     title "安装 $name"
 
-    # 0. 预检
+    # 0. 依赖
+    install_deps; install_qrencode
     check_disk "$(pdisk "$proto")"
     if state_installed "$key"; then
         warn "$name 已安装，跳过"
@@ -1076,56 +1087,6 @@ remove_all() {
     exit 0
 }
 
-# ============================================================
-# 主菜单
-# ============================================================
-
-main_menu() {
-    clear 2>/dev/null || true
-    echo -e "${BOLD}${CYAN}"
-    echo "╔══════════════════════════════════════════╗"
-    echo "║            PD-proxy  v${VERSION}              ║"
-    echo "╠══════════════════════════════════════════╣"
-    printf "║  ${RESET}${BOLD}系统:${RESET} %-26s${BOLD}${CYAN}║\n" "$(echo "$OS_PRETTY" | cut -c1-26)"
-    printf "║  ${RESET}${BOLD}架构:${RESET} %-5s | ${BOLD}内存:${RESET} %-6s MB${BOLD}${CYAN}       ║\n" "$ARCH" "$MEM_AVAIL"
-    printf "║  ${RESET}${BOLD}IP:${RESET}   %-28s${BOLD}${CYAN}║\n" "$IP"
-    echo "╠══════════════════════════════════════════╣"
-    printf "║  ${RESET}${BOLD}Snell v5${RESET}   [%s]  Surge 主力              ${BOLD}${CYAN}║\n" "$(pmem snell)"
-    printf "║  ${RESET}${BOLD}Hysteria2${RESET}  [%s] Surge + Shadowrocket     ${BOLD}${CYAN}║\n" "$(pmem hy2)"
-    printf "║  ${RESET}${BOLD}VLESS${RESET}      [%s] 仅 Shadowrocket           ${BOLD}${CYAN}║\n" "$(pmem vless)"
-    printf "║  ${RESET}${BOLD}AnyTLS${RESET}     [%s] 新兴协议 (beta)           ${BOLD}${CYAN}║\n" "$(pmem anytls)"
-    echo "╚══════════════════════════════════════════╝"
-    echo -e "${RESET}"
-
-    echo " 1) 安装 Snell v5     (Surge)"
-    echo " 2) 安装 Hysteria2    (Surge + Shadowrocket)"
-    echo " 3) 安装 VLESS Reality (仅 Shadowrocket)"
-    echo " 4) 安装 AnyTLS       (Surge + Shadowrocket, beta)"
-    echo " 5) 查看状态"
-    echo " 6) 查看配置"
-    echo " 7) 卸载协议"
-    echo " 8) 开启 BBR"
-    echo " 9) 全部卸载"
-    echo " 0) 退出"
-    echo ""
-    echo -n "选择 [0-9]: "
-    read -r choice
-
-    case "$choice" in
-        1) install_protocol snell; press_enter; main_menu ;;
-        2) install_protocol hy2; press_enter; main_menu ;;
-        3) install_protocol vless; press_enter; main_menu ;;
-        4) install_protocol anytls; press_enter; main_menu ;;
-        5) show_status; press_enter; main_menu ;;
-        6) show_config; press_enter; main_menu ;;
-        7) remove_menu; press_enter; main_menu ;;
-        8) enable_bbr; press_enter; main_menu ;;
-        9) remove_all ;;
-        0) info "再见 👋"; exit 0 ;;
-        *) main_menu ;;
-    esac
-}
-
 press_enter() {
     echo ""
     echo -n "回车返回菜单..."
@@ -1195,153 +1156,123 @@ run_export() {
 # 注册协议表
 register_protocols
 
-# 解析命令行
+# ============================================================
+# CLI 派发（统一入口 — 协议名归一化一处完成）
+# ============================================================
+
+# 写操作需要 root，读操作不需要
+need_root() { check_root; }
+
+# 一行式协议派发：resolve_proto 归一化 → 调用目标函数
+cli_dispatch() {
+    local action="$1" proto="${2:-}"
+    case "$action" in
+        install)
+            [ -z "$proto" ] && die "用法: pd --install <snell|hy2|vless|anytls>"
+            need_root; detect_os; detect_arch; get_ip; get_mem
+            install_deps; install_qrencode; self_install || warn "pd 更新失败，使用缓存版本"
+            proto=$(resolve_proto "$proto") || die "未知协议: $proto，可选: snell hy2 vless anytls"
+            install_protocol "$proto" ;;
+        uninstall)
+            [ -z "$proto" ] && die "用法: pd --uninstall <snell|hy2|vless|anytls>"
+            need_root; detect_os
+            proto=$(resolve_proto "$proto") || die "未知协议: $proto"
+            uninstall_protocol "$proto" ;;
+        upgrade)
+            [ -z "$proto" ] && die "用法: pd --upgrade <snell|hy2|vless|anytls>"
+            need_root; detect_os; detect_arch; get_ip
+            proto=$(resolve_proto "$proto") || die "未知协议: $proto"
+            upgrade_protocol "$proto" ;;
+        restart)
+            [ -z "$proto" ] && die "用法: pd --restart <snell|hy2|vless|anytls>"
+            need_root
+            proto=$(resolve_proto "$proto") || die "未知协议: $proto"
+            restart_service "$proto" ;;
+        stop)
+            [ -z "$proto" ] && die "用法: pd --stop <snell|hy2|vless|anytls>"
+            need_root
+            proto=$(resolve_proto "$proto") || die "未知协议: $proto"
+            stop_service "$proto" ;;
+        log)
+            [ -z "$proto" ] && die "用法: pd --log <snell|hy2|vless|anytls>"
+            proto=$(resolve_proto "$proto") || die "未知协议: $proto"
+            show_log "$proto" ;;
+        config)
+            [ -z "$proto" ] && die "用法: pd --config <snell|hy2|vless|anytls>"
+            detect_os; detect_arch; get_ip
+            proto=$(resolve_proto "$proto") || die "未知协议: $proto"
+            show_config_only "$proto" ;;
+    esac
+}
+
 case "${1:-}" in
-    --install|-i)
-        [ -z "${2:-}" ] && die "用法: pd --install <snell|hy2|vless|anytls>"
-        check_root; detect_os; detect_arch; get_ip; get_mem
-        install_deps; install_qrencode; self_install || warn "pd 更新失败，使用缓存版本"
-        case "${2}" in
-            snell) install_protocol snell ;;
-            hy2|hysteria2) install_protocol hy2 ;;
-            vless|xray) install_protocol vless ;;
-            anytls) install_protocol anytls ;;
-            *) die "未知协议: $2，可选: snell hy2 vless anytls" ;;
-        esac
-        exit 0 ;;
+    --install|-i)  cli_dispatch install  "${2:-}" ; exit 0 ;;
     --uninstall|-r)
-        [ -z "${2:-}" ] && die "用法: pd --uninstall <snell|hy2|vless|anytls>"
-        check_root; detect_os
-        case "${2}" in
-            snell) uninstall_protocol snell ;;
-            hy2|hysteria2) uninstall_protocol hy2 ;;
-            vless|xray) uninstall_protocol vless ;;
-            anytls) uninstall_protocol anytls ;;
-            all|--all) remove_all ;;
-            *) die "未知协议: $2" ;;
-        esac
-        exit 0 ;;
-    --upgrade|-u)
-        [ -z "${2:-}" ] && die "用法: pd --upgrade <snell|hy2|vless|anytls>"
-        check_root; detect_os; detect_arch; get_ip
-        case "${2}" in
-            snell) upgrade_protocol snell ;;
-            hy2|hysteria2) upgrade_protocol hy2 ;;
-            vless|xray) upgrade_protocol vless ;;
-            anytls) upgrade_protocol anytls ;;
-            *) die "未知协议: $2" ;;
-        esac
-        exit 0 ;;
-    --restart)
-        [ -z "${2:-}" ] && die "用法: pd --restart <snell|hy2|vless|anytls>"
-        check_root
-        case "${2}" in
-            snell) restart_service snell ;;
-            hy2|hysteria2) restart_service hy2 ;;
-            vless|xray) restart_service vless ;;
-            anytls) restart_service anytls ;;
-            *) die "未知协议: $2" ;;
-        esac
-        exit 0 ;;
-    --stop)
-        [ -z "${2:-}" ] && die "用法: pd --stop <snell|hy2|vless|anytls>"
-        check_root
-        case "${2}" in
-            snell) stop_service snell ;;
-            hy2|hysteria2) stop_service hy2 ;;
-            vless|xray) stop_service vless ;;
-            anytls) stop_service anytls ;;
-            *) die "未知协议: $2" ;;
-        esac
-        exit 0 ;;
-    --log|-l)
-        [ -z "${2:-}" ] && die "用法: pd --log <snell|hy2|vless|anytls>"
-        case "${2}" in
-            snell) show_log snell ;;
-            hy2|hysteria2) show_log hy2 ;;
-            vless|xray) show_log vless ;;
-            anytls) show_log anytls ;;
-            *) die "未知协议: $2" ;;
-        esac
-        exit 0 ;;
+        [ "${2:-}" = "all" ] || [ "${2:-}" = "--all" ] && { check_root; remove_all; exit 0; }
+        cli_dispatch uninstall "${2:-}" ; exit 0 ;;
+    --upgrade|-u)  cli_dispatch upgrade  "${2:-}" ; exit 0 ;;
+    --restart)     cli_dispatch restart  "${2:-}" ; exit 0 ;;
+    --stop)        cli_dispatch stop     "${2:-}" ; exit 0 ;;
+    --log|-l)      cli_dispatch log      "${2:-}" ; exit 0 ;;
+    --config|-c)   cli_dispatch config   "${2:-}" ; exit 0 ;;
     --config-all)
         detect_os; detect_arch; get_ip
         for p in $ALL_PROTOS; do
-            if state_installed "$(pkey "$p")"; then
-                echo "=== $(pname "$p") ==="
-                show_config_only "$p"
-                echo ""
-            fi
+            state_installed "$(pkey "$p")" || continue
+            echo "=== $(pname "$p") ==="
+            show_config_only "$p"
+            echo ""
         done
         exit 0 ;;
-    --export)
-        check_root; run_export
-        exit 0 ;;
-    --config|-c)
-        [ -z "${2:-}" ] && die "用法: pd --config <snell|hy2|vless|anytls>"
-        detect_os; detect_arch; get_ip; show_config_only "${2}"
-        exit 0 ;;
+    --show)
+        detect_os; detect_arch; get_ip; get_mem; show_config; exit 0 ;;
     --status|-s)
-        detect_os; detect_arch; get_ip; get_mem; show_status
-        exit 0 ;;
-    --show|--config)
-        detect_os; detect_arch; get_ip; get_mem; show_config
-        exit 0 ;;
+        detect_os; detect_arch; get_ip; get_mem; show_status; exit 0 ;;
+    --export)
+        check_root; run_export; exit 0 ;;
     --bbr)
-        check_root; enable_bbr
-        exit 0 ;;
+        check_root; enable_bbr; exit 0 ;;
     --update)
         check_root; PD_UPDATE=1 self_install
-        info "PD-proxy 已更新到最新版"
-        exit 0 ;;
+        info "PD-proxy 已更新到最新版"; exit 0 ;;
     --remove-all)
-        check_root
-        [ "${2:-}" = "--yes" ] && PD_YES=1
-        remove_all
-        exit 0 ;;
+        check_root; [ "${2:-}" = "--yes" ] && PD_YES=1; remove_all; exit 0 ;;
 esac
 
-# 交互模式
+# ============================================================
+# 交互主面板（统一入口 — 安装/非安装同面板）
+# ============================================================
+
 check_root
-detect_os
-detect_arch
-get_ip
-get_mem
-install_deps
-install_qrencode
+detect_os; detect_arch; get_ip; get_mem
 self_install || warn "pd 更新失败，使用缓存版本"
 
-# 已有安装 → 完整管理面板
-if state_installed snell || state_installed hy2 || state_installed vless || state_installed anytls; then
-    show_status
-    echo ""
-    echo " 安装: 1)Snell 2)HY2 3)VLESS 4)AnyTLS"
-    echo " 管理: u)升级 r)重启 s)停止 l)日志"
-    echo " 查看: c)配置行 C)完整配置 e)导出"
-    echo " 系统: b)BBR   d)卸载   R)全部卸载"
-    echo "       q)退出"
-    echo ""
-    echo -n "选择: "
-    read -r cc
-    case "$cc" in
-        1) install_protocol snell; press_enter ;;
-        2) install_protocol hy2; press_enter ;;
-        3) install_protocol vless; press_enter ;;
-        4) install_protocol anytls; press_enter ;;
-        u) pick_proto "升级" upgrade_protocol; press_enter ;;
-        r) pick_proto "重启" restart_service; press_enter ;;
-        s) pick_proto "停止" stop_service; press_enter ;;
-        l) pick_proto "日志" show_log ;;
-        c) pick_proto "配置" show_config_only ;;
-        C) show_config; press_enter ;;
-        e) run_export; press_enter ;;
-        b) enable_bbr; press_enter ;;
-        d) remove_menu; press_enter ;;
-        R) remove_all ;;
-        q) info "再见 👋"; exit 0 ;;
-        *) ;;
-    esac
-    exec "$0"  # 重新进入菜单（刷新状态）
-else
-    main_menu
-fi
+show_status
+echo ""
+echo " 安装: 1)Snell 2)HY2 3)VLESS 4)AnyTLS"
+echo " 管理: u)升级 r)重启 s)停止 l)日志"
+echo " 查看: c)配置行 C)完整配置 e)导出"
+echo " 系统: b)BBR   d)卸载   R)全部卸载"
+echo "       q)退出"
+echo ""
+echo -n "选择: "
+read -r cc
+case "$cc" in
+    1) install_protocol snell; press_enter ;;
+    2) install_protocol hy2; press_enter ;;
+    3) install_protocol vless; press_enter ;;
+    4) install_protocol anytls; press_enter ;;
+    u) pick_proto "升级" upgrade_protocol; press_enter ;;
+    r) pick_proto "重启" restart_service; press_enter ;;
+    s) pick_proto "停止" stop_service; press_enter ;;
+    l) pick_proto "日志" show_log; exec "$0" ;;
+    c) pick_proto "配置" show_config_only; exec "$0" ;;
+    C) show_config; press_enter ;;
+    e) run_export; press_enter ;;
+    b) enable_bbr; press_enter ;;
+    d) remove_menu; press_enter ;;
+    R) remove_all ;;
+    q) info "再见 👋"; exit 0 ;;
+    *) ;;
+esac
+exec "$0"
