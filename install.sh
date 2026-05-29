@@ -601,9 +601,9 @@ vless_configure() {
     local keys
     keys=$("$(pbin vless)" x25519 2>/dev/null) || die "Xray x25519 密钥生成失败"
     local privkey
-    privkey=$(echo "$keys" | grep "Private" | awk '{print $3}')
+    privkey=$(echo "$keys" | grep "Private" | awk '{print $NF}')
     local pubkey
-    pubkey=$(echo "$keys" | grep "Public" | awk '{print $3}')
+    pubkey=$(echo "$keys" | grep "Public" | awk '{print $NF}')
     local shortid
     shortid=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | xxd -p)
     [ -n "$privkey" ] || die "Reality 私钥生成失败"
@@ -980,7 +980,7 @@ show_status() {
                 st="${RED}OFFLINE${RESET}"
                 icon="${RED}◇${RESET}"
             fi
-            printf "${CYAN}║${RESET} ${icon} %-12s ${st}  ${BLUE}:%-5s${RESET} ${DIM}v%s${RESET} ${CYAN}║${RESET}\n" "$name" "$port" "$ver"
+            printf "${CYAN}║${RESET} ${icon} %-12s ${st}  ${BLUE}:%-5s${RESET} ${DIM}%s${RESET} ${CYAN}║${RESET}\n" "$name" "$port" "$ver"
         else
             printf "${CYAN}║${RESET} ${DIM}◇ %-12s 未安装              ${RESET} ${CYAN}║${RESET}\n" "$name"
         fi
