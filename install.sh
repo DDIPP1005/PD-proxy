@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.7.1"
+VERSION="2.7.2"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -185,6 +185,15 @@ rand_pass() {
         raw=$(head -c 32 /dev/urandom | base64 2>/dev/null | tr -d '=\n') 
         [ -n "$raw" ] || raw=$(date +%s%N | sha256sum | cut -d' ' -f1)
         echo "$raw"
+    }
+}
+
+gen_uuid() {
+    cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen 2>/dev/null || {
+        printf '%08x-%04x-%04x-%04x-%04x%08x\n' \
+            $((RANDOM<<16|RANDOM)) $RANDOM $((RANDOM%0x10000)) \
+            $((RANDOM%0x4000+0x4000)) $((RANDOM%0x4000+0x8000)) \
+            $((RANDOM<<16|RANDOM))
     }
 }
 
@@ -937,6 +946,8 @@ install_protocol() {
     " ERR
 
     local pass=$(rand_pass)
+    # VLESS 需要标准 UUID 格式，不能是 base64
+    [ "$proto" = "vless" ] && pass=$(gen_uuid)
 
     local ver=""
     if declare -f "${proto}_get_version" >/dev/null 2>&1; then
