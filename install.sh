@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.7.2"
+VERSION="2.7.3"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -523,8 +523,8 @@ snell_output() {
     local port="$1" psk="$2"
     local tls_pass="" tls_sni=""
     if [ -f "/etc/systemd/system/shadowtls-snell.service" ]; then
-        tls_pass=$(grep -oP 'password \K\S+' /etc/systemd/system/shadowtls-snell.service 2>/dev/null || echo "")
-        tls_sni=$(grep -oP 'tls \K\S+' /etc/systemd/system/shadowtls-snell.service 2>/dev/null || echo "")
+        tls_pass=$(grep -oP 'password \\K\\S+' /etc/systemd/system/shadowtls-snell.service 2>/dev/null || echo "")
+        tls_sni=$(grep -oP -- '--tls \\K\\S+' /etc/systemd/system/shadowtls-snell.service 2>/dev/null || echo "")
     fi
     if [ -n "$tls_pass" ]; then
         output_header "Snell v5 + ShadowTLS" "$port"
@@ -1176,8 +1176,8 @@ show_config_only() {
             local psk tls_pass tls_sni
             psk=$(grep -oP 'psk\s*=\s*\K.+' "$(pdir snell)/snell.conf" 2>/dev/null || echo "")
             if [ -f "/etc/systemd/system/shadowtls-snell.service" ]; then
-                tls_pass=$(grep -oP 'password \K\S+' /etc/systemd/system/shadowtls-snell.service 2>/dev/null || echo "")
-                tls_sni=$(grep -oP 'tls \K\S+' /etc/systemd/system/shadowtls-snell.service 2>/dev/null || echo "")
+                tls_pass=$(grep -oP 'password \\K\\S+' /etc/systemd/system/shadowtls-snell.service 2>/dev/null || echo "")
+                tls_sni=$(grep -oP -- '--tls \\K\\S+' /etc/systemd/system/shadowtls-snell.service 2>/dev/null || echo "")
                 echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni}"
             else
                 echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true"
