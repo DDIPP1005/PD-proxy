@@ -9,6 +9,9 @@
 # ============================================================
 set -euo pipefail
 
+# bash 4.0+ 必需（关联数组）
+[ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
+
 VERSION="2.4.0"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
@@ -78,9 +81,13 @@ LOCK_FILE="/tmp/pd-proxy.lock"
 exec 200>"$LOCK_FILE"
 flock -n 200 || die "已有 PD-proxy 进程在运行，请稍后再试"
 
-# 临时文件
-mktemp_pd() { mktemp /tmp/pd-XXXXXX; }
-trap 'rm -f /tmp/pd-* 2>/dev/null' EXIT
+# 临时文件追踪（只清理自己创建的，不误删其他进程的文件）
+declare -a _PD_TMPFILES=()
+mktemp_pd() {
+    local f; f=$(mktemp /tmp/pd-XXXXXX)
+    _PD_TMPFILES+=("$f"); echo "$f"
+}
+trap 'rm -f "${_PD_TMPFILES[@]}" 2>/dev/null' EXIT
 
 # ============================================================
 # 日志（永不静默）
@@ -209,6 +216,7 @@ add_firewall() {
         if command -v netfilter-persistent >/dev/null 2>&1; then
             netfilter-persistent save >/dev/null 2>&1 || true
         elif [ -d /etc/iptables ]; then
+            cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak 2>/dev/null || true
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         fi
     fi
@@ -225,6 +233,7 @@ del_firewall() {
         if command -v netfilter-persistent >/dev/null 2>&1; then
             netfilter-persistent save >/dev/null 2>&1 || true
         elif [ -d /etc/iptables ]; then
+            cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak 2>/dev/null || true
             iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         fi
     fi
@@ -248,7 +257,7 @@ install_qrencode() {
 
 gen_qr() {
     command -v qrencode >/dev/null 2>&1 || return
-    qrencode -t ANSIUTF8 -m 1 -s 1 "$1" 2>/dev/null || true
+    echo "$1" | qrencode -t ANSIUTF8 -m 1 -s 1 -r /dev/stdin 2>/dev/null || true
 }
 
 # ============================================================
@@ -1134,6 +1143,7 @@ run_export() {
             fi
         done
     } > /opt/pd/export.conf
+    chmod 600 /opt/pd/export.conf
     info "配置已导出到 /opt/pd/export.conf"
 }
 
