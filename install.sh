@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.0.0
+# PD-proxy — 多协议代理一键部署脚本 v2.2.0
 # 协议: Snell v5 | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -400,7 +400,7 @@ output_header() {
 output_footer() { echo -e "${BOLD}══════════════════════════════${RESET}"; }
 
 # ============================================================
-# 协议注册表
+# 协议实现
 # ============================================================
 
 # ---- Snell v5 ----
@@ -901,7 +901,11 @@ show_config_only() {
             echo "# Shadowrocket: hysteria2://${pass}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2" ;;
         vless)
             local uuid pubkey shortid
-            uuid=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print(c['inbounds'][0]['settings']['clients'][0]['id'])" "$(pdir vless)/config.json" 2>/dev/null || echo "")
+            if command -v python3 >/dev/null 2>&1; then
+                uuid=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print(c['inbounds'][0]['settings']['clients'][0]['id'])" "$(pdir vless)/config.json" 2>/dev/null || echo "")
+            else
+                uuid=""
+            fi
             pubkey=$(cat "$(pdir vless)/.pubkey" 2>/dev/null || echo "")
             shortid=$(cat "$(pdir vless)/.shortid" 2>/dev/null || echo "")
             echo "# Surge 不支持 VLESS"
@@ -967,7 +971,11 @@ show_config() {
                 hy2_output "$port" "$pass" ;;
             vless)
                 local uuid
-                uuid=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print(c['inbounds'][0]['settings']['clients'][0]['id'])" "$(pdir vless)/config.json" 2>/dev/null || echo "未知")
+                if command -v python3 >/dev/null 2>&1; then
+                    uuid=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print(c['inbounds'][0]['settings']['clients'][0]['id'])" "$(pdir vless)/config.json" 2>/dev/null || echo "未知")
+                else
+                    uuid="未知"
+                fi
                 vless_output "$port" "$uuid" ;;
             anytls)
                 local pass
