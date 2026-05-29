@@ -447,21 +447,18 @@ snell_get_version() {
     if [ -n "$v" ]; then
         echo "v${v}" | tee "$cache_file"; return 0
     fi
-    # 3. 级联探测（最多 5 次，按版本号从高到低）
-    local probe_count=0
+    # 3. 级联探测（每前缀 5 次，从高到低，共 10 次）
     for ver_prefix in "5.1" "5.0"; do
-        local start=5 end=0
-        [ "$ver_prefix" = "5.0" ] && start=9
-        local minor=$start
-        while [ $minor -ge $end ]; do
+        local minor=10
+        local group_count=0
+        while [ $minor -ge 0 ] && [ $group_count -lt 5 ]; do
             local probe="v${ver_prefix}.${minor}"
             local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
             if curl -fsI --max-time 10 "$probe_url" >/dev/null 2>&1; then
                 echo "$probe" | tee "$cache_file"; return 0
             fi
             minor=$((minor - 1))
-            probe_count=$((probe_count + 1))
-            [ $probe_count -ge 5 ] && break 2
+            group_count=$((group_count + 1))
         done
     done
     die "Snell 版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v5.0.x"
