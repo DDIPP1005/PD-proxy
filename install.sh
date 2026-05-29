@@ -9,7 +9,7 @@
 # ============================================================
 set -euo pipefail
 
-VERSION="2.0.4"
+VERSION="2.2.0"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -24,7 +24,10 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   pd --uninstall <协议>       卸载协议
   pd --upgrade <协议>         升级协议二进制（保留配置）
   pd --restart <协议>         重启协议服务
+  pd --stop <协议>             停止协议服务
+  pd --log <协议>              查看协议日志（最近50行）
   pd --config <协议>          仅输出客户端配置（无日志）
+  pd --config-all             输出所有已安装协议的配置
   pd --status                查看所有协议状态
   pd --show                  查看所有协议配置
   pd --bbr                   开启 BBR 优化
@@ -60,7 +63,7 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
 BASE_DIR="/opt/pd"
-STATE_FILE="$BASE_DIR/state.json"
+STATE_FILE="$BASE_DIR/state"
 INSTALLED_BIN="/usr/local/bin/pd"
 LOCK_FILE="/tmp/pd-proxy.lock"
 
@@ -224,7 +227,6 @@ install_deps() {
     local missing=""
     command -v curl >/dev/null 2>&1 || missing="$missing curl"
     command -v unzip >/dev/null 2>&1 || missing="$missing unzip"
-    command -v python3 >/dev/null 2>&1 || missing="$missing python3"
     [ -z "$missing" ] && return 0
     info "安装依赖: $missing"
     apt-get update -qq || die "apt-get update 失败，请检查网络"
@@ -296,8 +298,7 @@ get_all_ports() {
 # 协议注册表（数据驱动核心 — 新增协议只需加一块定义）
 # ============================================================
 
-# 协议元数据: key, name, dir, bin, service, mem_mb, disk_mb, clients
-# clients: s=Surge, q=Shadowrocket二维码, l=通用链接
+# 协议元数据: key, name, dir, bin, service, mem_mb, disk_mb
 declare -A PROTO=()
 
 register_protocols() {
@@ -744,6 +745,10 @@ install_protocol() {
     fi
 
     # 4. 下载
+    if [ "$proto" = "vless" ] && ! command -v python3 >/dev/null 2>&1; then
+        info "安装 python3（VLESS 需要）..."
+        apt-get install -y -qq python3 >/dev/null || die "python3 安装失败"
+    fi
     "${proto}_download" "$ver"
 
     # 5. 配置
@@ -849,6 +854,30 @@ restart_service() {
     info "重启 $(pname "$proto") ..."
     systemctl restart "$svc" || die "重启失败: journalctl -u $svc -n 20"
     info "$(pname "$proto") 已重启"
+}
+
+stop_service() {
+    local proto="$1"
+    local key=$(pkey "$proto")
+    local svc=$(psvc "$proto")
+
+    if ! state_installed "$key"; then
+        die "$(pname "$proto") 未安装"
+    fi
+    info "停止 $(pname "$proto") ..."
+    systemctl stop "$svc" || warn "停止失败"
+    info "$(pname "$proto") 已停止"
+}
+
+show_log() {
+    local proto="$1"
+    local key=$(pkey "$proto")
+    local svc=$(psvc "$proto")
+
+    if ! state_installed "$key"; then
+        die "$(pname "$proto") 未安装"
+    fi
+    journalctl -u "$svc" -n 50 --no-pager 2>/dev/null || warn "无法读取日志"
 }
 
 show_config_only() {
@@ -1148,6 +1177,37 @@ case "${1:-}" in
             anytls) restart_service anytls ;;
             *) die "未知协议: $2" ;;
         esac
+        exit 0 ;;
+    --stop)
+        [ -z "${2:-}" ] && die "用法: pd --stop <snell|hy2|vless|anytls>"
+        check_root
+        case "${2}" in
+            snell) stop_service snell ;;
+            hy2|hysteria2) stop_service hy2 ;;
+            vless|xray) stop_service vless ;;
+            anytls) stop_service anytls ;;
+            *) die "未知协议: $2" ;;
+        esac
+        exit 0 ;;
+    --log|-l)
+        [ -z "${2:-}" ] && die "用法: pd --log <snell|hy2|vless|anytls>"
+        case "${2}" in
+            snell) show_log snell ;;
+            hy2|hysteria2) show_log hy2 ;;
+            vless|xray) show_log vless ;;
+            anytls) show_log anytls ;;
+            *) die "未知协议: $2" ;;
+        esac
+        exit 0 ;;
+    --config-all)
+        detect_os; detect_arch; get_ip
+        for p in $ALL_PROTOS; do
+            if state_installed "$(pkey "$p")"; then
+                echo "=== $(pname "$p") ==="
+                show_config_only "$p"
+                echo ""
+            fi
+        done
         exit 0 ;;
     --config|-c)
         [ -z "${2:-}" ] && die "用法: pd --config <snell|hy2|vless|anytls>"
