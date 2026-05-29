@@ -61,7 +61,6 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   PD_VLESS_FP=ios             VLESS 浏览器指纹
   PD_ANYTLS_PADDING=deep      AnyTLS 填充 (standard|deep|fixed|none)
   PD_ANYTLS_SNI=microsoft.com AnyTLS SNI 伪装
-  PD_ANYTLS_HOP=3             AnyTLS 端口跳跃
   
 示例:
   curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh | bash -s -- --install snell
@@ -110,7 +109,6 @@ PD_OPT_VLESS_FP="${PD_VLESS_FP:-chrome}"                # chrome | firefox | saf
 # AnyTLS 选项
 PD_OPT_ANYTLS_PADDING="${PD_ANYTLS_PADDING:-standard}"  # standard | deep | fixed | none
 PD_OPT_ANYTLS_SNI="${PD_ANYTLS_SNI:-}"                  # 空=不伪装
-PD_OPT_ANYTLS_HOP="${PD_ANYTLS_HOP:-0}"                 # 0=单端口
 
 # 并发锁
 exec 200>"$LOCK_FILE"
@@ -535,13 +533,7 @@ EOF
 }
 
 snell_service_args() {
-    local port="$1"
-    if [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
-        # ShadowTLS 模式：Snell 监听本地，外部端口给 shadow-tls
-        echo "-c $(pdir snell)/snell.conf"
-    else
-        echo "-c $(pdir snell)/snell.conf"
-    fi
+    echo "-c $(pdir snell)/snell.conf"
 }
 
 snell_output() {
@@ -579,7 +571,11 @@ install_shadowtls() {
         | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
     [ -n "$ver" ] || die "ShadowTLS 版本检测失败"
 
-    local url="https://github.com/ihciah/shadow-tls/releases/download/${ver}/shadow-tls-${ARCH}-unknown-linux-musl"
+    # shadow-tls release 用 x86_64 / aarch64 而非 amd64 / arm64
+    local stls_arch="$ARCH"
+    [ "$stls_arch" = "amd64" ] && stls_arch="x86_64"
+    [ "$stls_arch" = "arm64" ] && stls_arch="aarch64"
+    local url="https://github.com/ihciah/shadow-tls/releases/download/${ver}/shadow-tls-${stls_arch}-unknown-linux-musl"
     mkdir -p "$dir"
     curl -fSL# --retry 3 --connect-timeout 15 --max-time 120 -o "$bin" "$url" \
         || die "ShadowTLS 下载失败"
@@ -856,22 +852,19 @@ anytls_configure() {
     local port="$1" pass="$2"
     local padding="${PD_OPT_ANYTLS_PADDING}"
     local sni="${PD_OPT_ANYTLS_SNI}"
-    local hop="${PD_OPT_ANYTLS_HOP}"
 
     echo "$pass" > "$(pdir anytls)/.password"
     echo "$padding" > "$(pdir anytls)/.padding"
     echo "$sni" > "$(pdir anytls)/.sni"
-    echo "$hop" > "$(pdir anytls)/.hop"
     chmod 600 "$(pdir anytls)/.password"
 }
 
 anytls_service_args() {
     local port="$1"
-    local pass padding sni hop
-    pass=$(cat "$(pdir anytls)/.password")
+    local pass padding sni
+    pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "")
     padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
     sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
-    hop=$(cat "$(pdir anytls)/.hop" 2>/dev/null || echo "0")
 
     local args="-l 0.0.0.0:${port} -p ${pass}"
     case "$padding" in
@@ -881,23 +874,20 @@ anytls_service_args() {
         *)     ;;  # standard: 默认
     esac
     [ -n "$sni" ] && args="$args --sni $sni"
-    [ "$hop" -ge 3 ] 2>/dev/null && args="$args --hop $hop"
     echo "$args"
 }
 
 anytls_output() {
     local port="$1" pass="$2"
-    local padding sni hop
+    local padding sni
     padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
     sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
-    hop=$(cat "$(pdir anytls)/.hop" 2>/dev/null || echo "0")
 
     local link="anytls://${pass}@${IP}:${port}#PD-AnyTLS"
     output_header "AnyTLS" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
     echo -e "填充:   ${DIM}${padding}${RESET}"
     [ -n "$sni" ] && echo -e "SNI:    ${DIM}${sni}${RESET}"
-    [ "$hop" -ge 3 ] 2>/dev/null && echo -e "跳跃:   ${DIM}${hop} 端口${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
     echo -e "${GREEN}anytls, ${IP}, ${port}, password=${pass}${RESET}"
@@ -975,8 +965,8 @@ install_protocol() {
     # 5. 配置
     step "写入配置..."
     if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
-        # ShadowTLS 模式：Snell 监听内部端口，ShadowTLS 监听外部端口
-        local snell_int=$((port + 50000))
+        # ShadowTLS 模式：Snell 监听内部端口（50000+），ShadowTLS 监听外部端口
+        local snell_int=$(( (RANDOM % 15000) + 50000 ))
         snell_configure "$snell_int" "$pass" "127.0.0.1"
         snell_shadowtls_configure "$port" "$snell_int"
     else
@@ -994,12 +984,6 @@ install_protocol() {
     if [ "$proto" = "hy2" ] && [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
         local i
         for i in $(seq 1 $((PD_OPT_HY2_HOP - 1))); do
-            add_firewall $((port + i))
-        done
-    fi
-    if [ "$proto" = "anytls" ] && [ "$PD_OPT_ANYTLS_HOP" -ge 3 ] 2>/dev/null; then
-        local i
-        for i in $(seq 1 $((PD_OPT_ANYTLS_HOP - 1))); do
             add_firewall $((port + i))
         done
     fi
@@ -1048,6 +1032,19 @@ uninstall_protocol() {
     systemctl reset-failed "${svc}.service" 2>/dev/null || true
 
     [ -n "$port" ] && del_firewall "$port"
+    # HY2 端口跳跃防火墙清理
+    if [ "$proto" = "hy2" ]; then
+        local listen_line
+        listen_line=$(grep 'listen:' "$(pdir hy2)/config.yaml" 2>/dev/null || echo "")
+        local hop_count
+        hop_count=$(echo "$listen_line" | tr ',' '\n' | wc -l | tr -d ' ')
+        if [ "$hop_count" -ge 2 ] 2>/dev/null; then
+            local i
+            for i in $(seq 1 $((hop_count - 1))); do
+                del_firewall $((port + i)) 2>/dev/null || true
+            done
+        fi
+    fi
     rm -rf "$(pdir "$proto")"
     state_del "$key"
     info "$(pname "$proto") 已卸载"
@@ -1393,6 +1390,15 @@ cli_dispatch() {
             need_root; detect_os; detect_arch; get_ip; get_mem
             self_install || warn "pd 更新失败，使用缓存版本"
             proto=$(resolve_proto "$proto") || die "未知协议: $proto，可选: snell hy2 vless anytls"
+            # CLI 路径：无环境变量时重置为默认值，防止交互菜单污染
+            [ -z "${PD_SNELL_MODE:-}" ] && PD_OPT_SNELL_MODE="standard"
+            [ -z "${PD_HY2_HOP:-}" ] && PD_OPT_HY2_HOP=0
+            [ -z "${PD_VLESS_DEST:-}" ] && PD_OPT_VLESS_DEST="addons.mozilla.org:443"
+            [ -z "${PD_VLESS_SNI:-}" ] && PD_OPT_VLESS_SNI="addons.mozilla.org"
+            [ -z "${PD_VLESS_TRANSPORT:-}" ] && PD_OPT_VLESS_TRANSPORT="tcp"
+            [ -z "${PD_VLESS_FP:-}" ] && PD_OPT_VLESS_FP="chrome"
+            [ -z "${PD_ANYTLS_PADDING:-}" ] && PD_OPT_ANYTLS_PADDING="standard"
+            [ -z "${PD_ANYTLS_SNI:-}" ] && PD_OPT_ANYTLS_SNI=""
             install_protocol "$proto" ;;
         uninstall)
             [ -z "$proto" ] && die "用法: pd --uninstall <snell|hy2|vless|anytls>"
@@ -1623,17 +1629,6 @@ menu_anytls_config() {
             3) PD_OPT_ANYTLS_SNI="www.apple.com" ;;
             4) PD_OPT_ANYTLS_SNI="cloudflare.com" ;;
             *) PD_OPT_ANYTLS_SNI="" ;;
-        esac
-
-        echo ""
-        echo -e "  ${MAGENTA}▸ 端口跳跃${RESET}"
-        echo -e "  [1] 单端口  [2] 3 端口  [3] 5 端口"
-        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
-        read -r hop_c
-        case "$hop_c" in
-            2) PD_OPT_ANYTLS_HOP=3 ;;
-            3) PD_OPT_ANYTLS_HOP=5 ;;
-            *) PD_OPT_ANYTLS_HOP=0 ;;
         esac
         break
     done
