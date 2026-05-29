@@ -21,6 +21,15 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 BASE_DIR="/opt/pd"
 STATE_FILE="$BASE_DIR/state.json"
 INSTALLED_BIN="/usr/local/bin/pd"
+LOCK_FILE="/tmp/pd-proxy.lock"
+
+# 并发锁
+exec 200>"$LOCK_FILE"
+flock -n 200 || die "已有 PD-proxy 进程在运行，请稍后再试"
+
+# 临时文件
+mktemp_pd() { mktemp /tmp/pd-XXXXXX; }
+trap 'rm -f /tmp/pd-* 2>/dev/null' EXIT
 
 # ============================================================
 # 日志（永不静默）
@@ -217,14 +226,17 @@ state_set() {
     mkdir -p "$BASE_DIR"
     python3 -c "
 import json
+val = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$value")
+key = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$key")
+field = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$field")
 try:
     with open('$STATE_FILE') as f:
         data = json.load(f)
 except:
     data = {}
-if '$key' not in data:
-    data['$key'] = {}
-data['$key']['$field'] = '$value'
+if key not in data:
+    data[key] = {}
+data[key][field] = val
 with open('$STATE_FILE', 'w') as f:
     json.dump(data, f, indent=2)
 "
@@ -416,10 +428,12 @@ snell_download() {
     local url="https://dl.nssurge.com/snell/snell-server-${ver}-linux-${ARCH}.zip"
     step "下载 Snell $ver ..."
     mkdir -p "$(pdir snell)"
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o /tmp/pd-snell.zip "$url" \
+    local tmpzip=$(mktemp_pd)
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
         || die "Snell 下载失败: $url"
-    unzip -o /tmp/pd-snell.zip -d "$(pdir snell)" >/dev/null \
+    unzip -o "$tmpzip" -d "$(pdir snell)" >/dev/null \
         || die "Snell 解压失败"
+    rm -f "$tmpzip"
     chmod +x "$(pbin snell)"
     verify_download "$(pbin snell)" "Snell" 50000
     info "Snell 下载完成"
@@ -464,7 +478,7 @@ snell_cleanup() {
 # ---- Hysteria2 ----
 hy2_get_version() {
     local v
-    v=$(curl -fs --max-time 15 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+    v=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
         | grep -oP '"tag_name":\s*"app/\K[^"]+' | head -1)
     [ -n "$v" ] && echo "$v" || die "Hysteria2 版本检测失败，请检查 GitHub 是否可达"
 }
@@ -474,7 +488,7 @@ hy2_download() {
     local url="https://github.com/apernet/hysteria/releases/download/app/${ver}/hysteria-linux-${ARCH}"
     step "下载 Hysteria2 $ver ..."
     mkdir -p "$(pdir hy2)"
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o "$(pbin hy2)" "$url" \
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o "$(pbin hy2)" "$url" \
         || die "Hysteria2 下载失败: $url"
     chmod +x "$(pbin hy2)"
     verify_download "$(pbin hy2)" "Hysteria2" 5000000
@@ -540,10 +554,12 @@ vless_download() {
     local url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch_suffix}.zip"
     step "下载 Xray-core ..."
     mkdir -p "$(pdir vless)"
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o /tmp/pd-xray.zip "$url" \
+    local tmpzip=$(mktemp_pd)
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
         || die "Xray 下载失败: $url"
-    unzip -o /tmp/pd-xray.zip -d "$(pdir vless)" >/dev/null \
+    unzip -o "$tmpzip" -d "$(pdir vless)" >/dev/null \
         || die "Xray 解压失败"
+    rm -f "$tmpzip"
     chmod +x "$(pbin vless)"
     verify_download "$(pbin vless)" "Xray" 5000000
     info "Xray-core 下载完成"
@@ -629,7 +645,7 @@ vless_cleanup() {
 # ---- AnyTLS ----
 anytls_get_version() {
     local v
-    v=$(curl -fs --max-time 15 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null \
+    v=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null \
         | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
     [ -n "$v" ] && echo "$v" || die "AnyTLS 版本检测失败，请检查 GitHub 是否可达"
 }
@@ -640,10 +656,12 @@ anytls_download() {
     local url="https://github.com/anytls/anytls-go/releases/download/${ver}/anytls_${ver_num}_linux_${ARCH}.zip"
     step "下载 AnyTLS $ver ..."
     mkdir -p "$(pdir anytls)"
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 -o /tmp/pd-anytls.zip "$url" \
+    local tmpzip=$(mktemp_pd)
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
         || die "AnyTLS 下载失败: $url"
-    unzip -o /tmp/pd-anytls.zip -d "$(pdir anytls)" >/dev/null \
+    unzip -o "$tmpzip" -d "$(pdir anytls)" >/dev/null \
         || die "AnyTLS 解压失败"
+    rm -f "$tmpzip"
     chmod +x "$(pbin anytls)"
     verify_download "$(pbin anytls)" "AnyTLS" 1000000
     info "AnyTLS 下载完成"
@@ -711,19 +729,6 @@ install_protocol() {
         return 0
     fi
 
-    # 回滚陷阱：任何未捕获的错误触发清理
-    local _rollback_port=""
-    trap "
-        err '安装失败，正在回滚...'
-        systemctl stop '$svc' 2>/dev/null || true
-        rm -f '/etc/systemd/system/${svc}.service'
-        systemctl daemon-reload
-        [ -n '$_rollback_port' ] && del_firewall '$_rollback_port'
-        rm -rf '$dir'
-        state_del '$key'
-        die '安装失败，已回滚，检查上述错误信息'
-    " ERR
-
     # 1. 端口
     local port
     local port_var="PD_$(echo "$key" | tr '[:lower:]' '[:upper:]')_PORT"
@@ -734,7 +739,19 @@ install_protocol() {
         port=$(rand_port)
         info "端口(自动): $port"
     fi
-    _rollback_port="$port"
+
+    # 回滚陷阱（端口已确定后才设置，确保 _rollback_port 被正确展开）
+    local _rollback_port="$port"
+    trap "
+        err '安装失败，正在回滚...'
+        systemctl stop '$svc' 2>/dev/null || true
+        rm -f '/etc/systemd/system/${svc}.service'
+        systemctl daemon-reload
+        del_firewall '$_rollback_port'
+        rm -rf '$dir'
+        state_del '$key'
+        die '安装失败，已回滚，检查上述错误信息'
+    " ERR
 
     # 2. 密码
     local pass
@@ -854,7 +871,7 @@ show_config() {
                 hy2_output "$port" "$pass" ;;
             vless)
                 local uuid
-                uuid=$(python3 -c "import json; c=json.load(open('$(pdir vless)/config.json')); print(c['inbounds'][0]['settings']['clients'][0]['id'])" 2>/dev/null || echo "未知")
+                uuid=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print(c['inbounds'][0]['settings']['clients'][0]['id'])" "$(pdir vless)/config.json" 2>/dev/null || echo "未知")
                 vless_output "$port" "$uuid" ;;
             anytls)
                 local pass
@@ -1059,7 +1076,7 @@ case "${1:-}" in
     --install|-i)
         [ -z "${2:-}" ] && die "用法: pd --install <snell|hy2|vless|anytls>"
         check_root; detect_os; detect_arch; get_ip; get_mem
-        install_deps; self_install
+        install_deps; self_install || warn "pd 更新失败，使用缓存版本"
         case "${2}" in
             snell) install_protocol snell ;;
             hy2|hysteria2) install_protocol hy2 ;;
@@ -1105,7 +1122,7 @@ detect_arch
 get_ip
 get_mem
 install_deps
-self_install
+self_install || warn "pd 更新失败，使用缓存版本"
 
 # 已有安装 → 精简入口
 if state_installed snell || state_installed hy2 || state_installed vless || state_installed anytls; then
