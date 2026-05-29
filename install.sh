@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.7.0"
+VERSION="2.7.1"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -542,9 +542,9 @@ snell_output() {
 
 install_shadowtls() {
     local dir="/opt/shadowtls" bin="$dir/shadow-tls"
-    [ -x "$bin" ] && { info "ShadowTLS 已安装"; echo "$bin"; return 0; }
+    [ -x "$bin" ] && { info "ShadowTLS 已安装" >&2; echo "$bin"; return 0; }
 
-    step "下载 ShadowTLS ..."
+    step "下载 ShadowTLS ..." >&2
     local ver
     ver=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" 2>/dev/null \
         | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
@@ -562,7 +562,7 @@ install_shadowtls() {
     mv "$tmpbin" "$bin"
     chmod +x "$bin"
     verify_download "$bin" "ShadowTLS" 1000000
-    info "ShadowTLS 下载完成"
+    info "ShadowTLS 下载完成" >&2
     echo "$bin"
 }
 
