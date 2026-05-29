@@ -12,6 +12,44 @@ set -euo pipefail
 VERSION="2.0.0"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
+# 纯查询命令，不需要锁和 root
+case "${1:-}" in
+    --help|-h)
+        cat <<EOF
+PD-proxy v${VERSION} — 多协议代理一键部署
+
+用法:
+  pd                         进入交互菜单
+  pd --install <协议>         非交互安装指定协议
+  pd --uninstall <协议>       卸载协议
+  pd --status                查看所有协议状态
+  pd --show                  查看所有协议配置
+  pd --bbr                   开启 BBR 优化
+  pd --update                更新 pd 自身
+  pd --remove-all            卸载全部
+  pd --help                  显示此帮助
+
+协议:
+  snell       Snell v5 (Surge 主力)
+  hy2         Hysteria2 (Surge + Shadowrocket)
+  vless       VLESS Reality (仅 Shadowrocket)
+  anytls      AnyTLS (beta)
+
+环境变量:
+  PD_SNELL_PORT=12345        手动指定端口
+  PD_HY2_PORT=12346
+  PD_VLESS_PORT=12347
+  PD_ANYTLS_PORT=12348
+  
+示例:
+  curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh | bash -s -- --install snell
+  PD_SNELL_PORT=12345 pd --install snell
+EOF
+        exit 0 ;;
+    --version|-v)
+        echo "PD-proxy v${VERSION}"; exit 0 ;;
+esac
+
 # ============================================================
 # 颜色 & 常量
 # ============================================================
@@ -208,16 +246,18 @@ state_get() {
     local key="$1" field="${2:-}"
     python3 -c "
 import json
+key = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$key")
+field = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$field")
 try:
     with open('$STATE_FILE') as f:
         data = json.load(f)
-    v = data.get('$key', {})
-    if '$field':
-        print(v.get('$field', ''))
+    v = data.get(key, {})
+    if field:
+        print(v.get(field, ''))
     else:
         print(json.dumps(v))
 except:
-    print('{}' if not '$field' else '')
+    print('{}' if not field else '')
 "
 }
 
@@ -246,10 +286,11 @@ state_del() {
     local key="$1"
     python3 -c "
 import json
+key = $(python3 -c "import sys; print(repr(sys.argv[1]))" "$key")
 try:
     with open('$STATE_FILE') as f:
         data = json.load(f)
-    data.pop('$key', None)
+    data.pop(key, None)
     with open('$STATE_FILE', 'w') as f:
         json.dump(data, f, indent=2)
 except:
@@ -346,7 +387,7 @@ ALL_PROTOS="snell hy2 vless anytls"
 # ============================================================
 
 write_systemd() {
-    local svc="$1" bin="$2" args="$3" dir="$4"
+    local svc="$1" bin="$2" args="$3"
     cat > "/etc/systemd/system/${svc}.service" <<EOF
 [Unit]
 Description=PD-proxy: ${svc}
@@ -774,7 +815,7 @@ install_protocol() {
 
     # 6. systemd
     step "注册服务..."
-    write_systemd "$svc" "$bin" "$("${proto}_service_args" "$port")" "$dir"
+    write_systemd "$svc" "$bin" "$("${proto}_service_args" "$port")"
     register_and_start "$svc"
 
     # 7. 防火墙 & 验证
@@ -949,43 +990,6 @@ remove_all() {
 }
 
 # ============================================================
-# 命令行参数
-# ============================================================
-
-show_help() {
-    cat <<EOF
-PD-proxy v${VERSION} — 多协议代理一键部署
-
-用法:
-  pd                         进入交互菜单
-  pd --install <协议>         非交互安装指定协议
-  pd --uninstall <协议>       卸载协议
-  pd --status                查看所有协议状态
-  pd --show                  查看所有协议配置
-  pd --bbr                   开启 BBR 优化
-  pd --update                更新 pd 自身
-  pd --remove-all            卸载全部
-  pd --help                  显示此帮助
-
-协议:
-  snell       Snell v5 (Surge 主力)
-  hy2         Hysteria2 (Surge + Shadowrocket)
-  vless       VLESS Reality (仅 Shadowrocket)
-  anytls      AnyTLS (beta)
-
-环境变量:
-  PD_SNELL_PORT=12345        手动指定端口
-  PD_HY2_PORT=12346
-  PD_VLESS_PORT=12347
-  PD_ANYTLS_PORT=12348
-  
-示例:
-  curl -fsSL $SCRIPT_URL | bash -s -- --install snell
-  PD_SNELL_PORT=12345 pd --install snell
-EOF
-}
-
-# ============================================================
 # 主菜单
 # ============================================================
 
@@ -1069,14 +1073,10 @@ register_protocols
 
 # 解析命令行
 case "${1:-}" in
-    --help|-h)
-        show_help; exit 0 ;;
-    --version|-v)
-        echo "PD-proxy v${VERSION}"; exit 0 ;;
     --install|-i)
         [ -z "${2:-}" ] && die "用法: pd --install <snell|hy2|vless|anytls>"
         check_root; detect_os; detect_arch; get_ip; get_mem
-        install_deps; self_install || warn "pd 更新失败，使用缓存版本"
+        install_deps; install_qrencode; self_install || warn "pd 更新失败，使用缓存版本"
         case "${2}" in
             snell) install_protocol snell ;;
             hy2|hysteria2) install_protocol hy2 ;;
@@ -1122,6 +1122,7 @@ detect_arch
 get_ip
 get_mem
 install_deps
+install_qrencode
 self_install || warn "pd 更新失败，使用缓存版本"
 
 # 已有安装 → 精简入口
