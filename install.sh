@@ -22,11 +22,14 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   pd                         进入交互菜单
   pd --install <协议>         非交互安装指定协议
   pd --uninstall <协议>       卸载协议
+  pd --upgrade <协议>         升级协议二进制（保留配置）
+  pd --restart <协议>         重启协议服务
+  pd --config <协议>          仅输出客户端配置（无日志）
   pd --status                查看所有协议状态
   pd --show                  查看所有协议配置
   pd --bbr                   开启 BBR 优化
   pd --update                更新 pd 自身
-  pd --remove-all            卸载全部
+  pd --remove-all            卸载全部（加 --yes 跳过确认）
   pd --help                  显示此帮助
 
 协议:
@@ -483,7 +486,7 @@ snell_download() {
     step "下载 Snell $ver ..."
     mkdir -p "$(pdir snell)"
     local tmpzip=$(mktemp_pd)
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
+    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
         || die "Snell 下载失败: $url"
     unzip -o "$tmpzip" -d "$(pdir snell)" >/dev/null \
         || die "Snell 解压失败"
@@ -542,7 +545,7 @@ hy2_download() {
     local url="https://github.com/apernet/hysteria/releases/download/app/${ver}/hysteria-linux-${ARCH}"
     step "下载 Hysteria2 $ver ..."
     mkdir -p "$(pdir hy2)"
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o "$(pbin hy2)" "$url" \
+    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$(pbin hy2)" "$url" \
         || die "Hysteria2 下载失败: $url"
     chmod +x "$(pbin hy2)"
     verify_download "$(pbin hy2)" "Hysteria2" 5000000
@@ -609,7 +612,7 @@ vless_download() {
     step "下载 Xray-core ..."
     mkdir -p "$(pdir vless)"
     local tmpzip=$(mktemp_pd)
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
+    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
         || die "Xray 下载失败: $url"
     unzip -o "$tmpzip" -d "$(pdir vless)" >/dev/null \
         || die "Xray 解压失败"
@@ -711,7 +714,7 @@ anytls_download() {
     step "下载 AnyTLS $ver ..."
     mkdir -p "$(pdir anytls)"
     local tmpzip=$(mktemp_pd)
-    curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
+    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
         || die "AnyTLS 下载失败: $url"
     unzip -o "$tmpzip" -d "$(pdir anytls)" >/dev/null \
         || die "AnyTLS 解压失败"
@@ -874,6 +877,95 @@ uninstall_protocol() {
 }
 
 # ============================================================
+# 协议升级 / 重启 / 纯配置
+# ============================================================
+
+upgrade_protocol() {
+    local proto="$1"
+    local key=$(pkey "$proto")
+    local name=$(pname "$proto")
+    local svc=$(psvc "$proto")
+
+    if ! state_installed "$key"; then
+        die "$name 未安装，无法升级"
+    fi
+
+    title "升级 $name"
+
+    local ver=""
+    if declare -f "${proto}_get_version" >/dev/null 2>&1; then
+        step "获取最新版本..."
+        ver=$("${proto}_get_version")
+        local old_ver=$(state_get "$key" "version")
+        if [ "$ver" = "$old_ver" ] && [ -n "$ver" ]; then
+            info "$name 已是最新版 ($ver)，跳过"
+            return 0
+        fi
+        info "版本: $old_ver → $ver"
+    fi
+
+    step "停止服务..."
+    systemctl stop "$svc" 2>/dev/null || true
+
+    step "下载新版本..."
+    "${proto}_download" "$ver"
+
+    step "启动服务..."
+    systemctl start "$svc" || die "启动 $svc 失败: journalctl -u $svc -n 20"
+
+    state_set "$key" "version" "$ver"
+    info "$name 升级完成"
+}
+
+restart_service() {
+    local proto="$1"
+    local key=$(pkey "$proto")
+    local svc=$(psvc "$proto")
+
+    if ! state_installed "$key"; then
+        die "$(pname "$proto") 未安装"
+    fi
+    info "重启 $(pname "$proto") ..."
+    systemctl restart "$svc" || die "重启失败: journalctl -u $svc -n 20"
+    info "$(pname "$proto") 已重启"
+}
+
+show_config_only() {
+    local proto="$1"
+    local key=$(pkey "$proto")
+    if ! state_installed "$key"; then
+        die "$(pname "$proto") 未安装"
+    fi
+
+    local port=$(state_get "$key" "port")
+    case $proto in
+        snell)
+            local psk
+            psk=$(grep -oP 'psk\s*=\s*\K.+' "$(pdir snell)/snell.conf" 2>/dev/null || echo "")
+            echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true" ;;
+        hy2)
+            local pass
+            pass=$(grep -oP 'password:\s*\K.+' "$(pdir hy2)/config.yaml" 2>/dev/null || echo "")
+            echo "Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
+            echo ""
+            echo "# Shadowrocket: hysteria2://${pass}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2" ;;
+        vless)
+            local uuid pubkey shortid
+            uuid=$(python3 -c "import json,sys; c=json.load(open(sys.argv[1])); print(c['inbounds'][0]['settings']['clients'][0]['id'])" "$(pdir vless)/config.json" 2>/dev/null || echo "")
+            pubkey=$(cat "$(pdir vless)/.pubkey" 2>/dev/null || echo "")
+            shortid=$(cat "$(pdir vless)/.shortid" 2>/dev/null || echo "")
+            echo "# Surge 不支持 VLESS"
+            echo "vless://${uuid}@${IP}:${port}?encryption=none&security=reality&sni=addons.mozilla.org&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp&flow=xtls-rprx-vision#PD-VLESS" ;;
+        anytls)
+            local pass
+            pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "")
+            echo "anytls, ${IP}, ${port}, password=${pass}"
+            echo ""
+            echo "# Shadowrocket: anytls://${pass}@${IP}:${port}#PD-AnyTLS" ;;
+    esac
+}
+
+# ============================================================
 # 状态 & 配置查看
 # ============================================================
 
@@ -895,7 +987,7 @@ show_status() {
             else
                 st="❌ 已停止"
             fi
-            printf "  %-15s 端口 %-7s %s  %s\n" "$name" "$port" "$st" "$(pmem "$proto")"
+            printf "  %-15s 端口 %-7s %s  %s  v%s\n" "$name" "$port" "$st" "$(pmem "$proto")" "$ver"
         else
             printf "  %-15s ${YELLOW}未安装${RESET}\n" "$name"
         fi
@@ -988,9 +1080,13 @@ self_install() {
 
 remove_all() {
     echo -e "${RED}⚠ 即将卸载所有代理协议和 PD-proxy${RESET}"
-    echo -n "确认？输入 yes: "
-    read -r confirm
-    [ "$confirm" = "yes" ] || { info "已取消"; return; }
+    if [ "${PD_YES:-}" = "1" ] || [ "${1:-}" = "--yes" ]; then
+        info "自动确认 (--yes)"
+    else
+        echo -n "确认？输入 yes: "
+        read -r confirm
+        [ "$confirm" = "yes" ] || { info "已取消"; return; }
+    fi
 
     for proto in $ALL_PROTOS; do
         uninstall_protocol "$proto" 2>/dev/null || true
@@ -1110,6 +1206,32 @@ case "${1:-}" in
             *) die "未知协议: $2" ;;
         esac
         exit 0 ;;
+    --upgrade|-u)
+        [ -z "${2:-}" ] && die "用法: pd --upgrade <snell|hy2|vless|anytls>"
+        check_root; detect_os; detect_arch; get_ip
+        case "${2}" in
+            snell) upgrade_protocol snell ;;
+            hy2|hysteria2) upgrade_protocol hy2 ;;
+            vless|xray) upgrade_protocol vless ;;
+            anytls) upgrade_protocol anytls ;;
+            *) die "未知协议: $2" ;;
+        esac
+        exit 0 ;;
+    --restart)
+        [ -z "${2:-}" ] && die "用法: pd --restart <snell|hy2|vless|anytls>"
+        check_root
+        case "${2}" in
+            snell) restart_service snell ;;
+            hy2|hysteria2) restart_service hy2 ;;
+            vless|xray) restart_service vless ;;
+            anytls) restart_service anytls ;;
+            *) die "未知协议: $2" ;;
+        esac
+        exit 0 ;;
+    --config|-c)
+        [ -z "${2:-}" ] && die "用法: pd --config <snell|hy2|vless|anytls>"
+        detect_os; detect_arch; get_ip; show_config_only "${2}"
+        exit 0 ;;
     --status|-s)
         detect_os; detect_arch; get_ip; get_mem; show_status
         exit 0 ;;
@@ -1124,7 +1246,9 @@ case "${1:-}" in
         info "PD-proxy 已更新到最新版"
         exit 0 ;;
     --remove-all)
-        check_root; remove_all
+        check_root
+        [ "${2:-}" = "--yes" ] && PD_YES=1
+        remove_all
         exit 0 ;;
 esac
 
