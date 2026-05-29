@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.6.2
+# PD-proxy — 多协议代理一键部署脚本 v2.6.3
 # 协议: Snell v5 | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.6.2"
+VERSION="2.6.3"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -625,7 +625,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable "$svc" >/dev/null 2>&1 || true
-    systemctl restart "$svc" || warn "ShadowTLS 启动失败，查看 journalctl -u $svc -n 20"
+    systemctl restart "$svc" || { err "ShadowTLS 启动失败，查看 journalctl -u $svc -n 20"; return 1; }
     info "ShadowTLS 已启动 (端口 $ext_port → Snell $int_port)"
 }
 
@@ -984,21 +984,25 @@ install_protocol() {
     # 5. 配置
     step "写入配置..."
     if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
-        # ShadowTLS 模式：Snell 监听内部端口（50000+），ShadowTLS 监听外部端口
+        # ShadowTLS 模式：Snell 监听内部端口（50000+），先配 Snell，ShadowTLS 稍后部署
         local snell_int=$(( (RANDOM % 15000) + 50000 ))
         while ss -tlnp 2>/dev/null | grep -q ":${snell_int} " 2>/dev/null; do
             snell_int=$(( (RANDOM % 15000) + 50000 ))
         done
         snell_configure "$snell_int" "$pass" "127.0.0.1"
-        snell_shadowtls_configure "$port" "$snell_int"
     else
         "${proto}_configure" "$port" "$pass"
     fi
 
-    # 6. systemd
+    # 6. systemd（必须先启动主服务，ShadowTLS 依赖 snell.service 存在）
     step "注册服务..."
     write_systemd "$svc" "$bin" "$("${proto}_service_args" "$port")"
     register_and_start "$svc"
+
+    # 6.5 Snell + ShadowTLS: snell.service 已运行，现在部署 ShadowTLS
+    if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
+        snell_shadowtls_configure "$port" "$snell_int"
+    fi
 
     # 7. 防火墙 & 验证
     add_firewall "$port"
@@ -1130,6 +1134,10 @@ restart_service() {
     fi
     info "重启 $(pname "$proto") ..."
     systemctl restart "$svc" || die "重启失败: journalctl -u $svc -n 20"
+    # Snell + ShadowTLS: Requires= 只传播 stop 不传播 start
+    if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+        systemctl start shadowtls-snell 2>/dev/null || true
+    fi
     info "$(pname "$proto") 已重启"
 }
 
@@ -1156,6 +1164,10 @@ start_service() {
     fi
     info "启动 $(pname "$proto") ..."
     systemctl start "$svc" || die "启动失败: journalctl -u $svc -n 20"
+    # Snell + ShadowTLS: Requires= 只传播 stop 不传播 start
+    if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+        systemctl start shadowtls-snell 2>/dev/null || true
+    fi
     info "$(pname "$proto") 已启动"
 }
 
@@ -1327,10 +1339,13 @@ self_install() {
     mkdir -p "$BASE_DIR"
     # 仅在首次安装或显式更新时下载
     if [ ! -f "$BASE_DIR/install.sh" ] || [ "${PD_UPDATE:-}" = "1" ]; then
-        curl -fsSL "$SCRIPT_URL" -o "$BASE_DIR/install.sh" || {
+        local tmp_pd=$(mktemp_pd)
+        curl -fsSL "$SCRIPT_URL" -o "$tmp_pd" || {
+            rm -f "$tmp_pd"
             warn "无法从 GitHub 同步最新脚本，使用当前版本"
             return 1
         }
+        mv "$tmp_pd" "$BASE_DIR/install.sh"
         chmod +x "$BASE_DIR/install.sh"
     fi
     ln -sf "$BASE_DIR/install.sh" "$INSTALLED_BIN" 2>/dev/null || true
@@ -1379,6 +1394,7 @@ pick_proto() {
     [ ${#_picks[@]} -eq 0 ] && { warn "没有已安装的协议"; return; }
     echo -n "选择: "
     read -r pick
+    [ "$pick" -ge 1 ] 2>/dev/null || { warn "无效选择"; return; }
     local target="${_picks[$((pick - 1))]:-}"
     [ -n "$target" ] || { warn "无效选择"; return; }
     "$func" "$target"
