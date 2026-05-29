@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.2.0
+# PD-proxy — 多协议代理一键部署脚本 v2.3.0
 # 协议: Snell v5 | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -9,7 +9,7 @@
 # ============================================================
 set -euo pipefail
 
-VERSION="2.2.0"
+VERSION="2.3.0"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -1155,6 +1155,43 @@ remove_menu() {
 # 入口
 # ============================================================
 
+# 交互式协议选择
+pick_proto() {
+    local action="$1" func="$2"
+    echo ""
+    echo "选择要${action}的协议:"
+    local i=1
+    for p in $ALL_PROTOS; do
+        if state_installed "$(pkey "$p")"; then
+            echo "  $i) $(pname "$p")"
+            eval "_pick_$i=$p"
+            i=$((i + 1))
+        fi
+    done
+    [ $i -eq 1 ] && { warn "没有已安装的协议"; return; }
+    echo -n "选择: "
+    read -r pick
+    local target
+    eval "target=\$_pick_$pick"
+    [ -n "${target:-}" ] || { warn "无效选择"; return; }
+    "$func" "$target"
+}
+
+run_export() {
+    detect_os; detect_arch; get_ip
+    {
+        echo "# PD-proxy 导出 — $(date)"
+        for p in $ALL_PROTOS; do
+            if state_installed "$(pkey "$p")"; then
+                echo ""
+                echo "# $(pname "$p")"
+                show_config_only "$p"
+            fi
+        done
+    } > /opt/pd/export.conf
+    info "配置已导出到 /opt/pd/export.conf"
+}
+
 # 注册协议表
 register_protocols
 
@@ -1238,18 +1275,7 @@ case "${1:-}" in
         done
         exit 0 ;;
     --export)
-        detect_os; detect_arch; get_ip
-        {
-            echo "# PD-proxy 导出 — $(date)"
-            for p in $ALL_PROTOS; do
-                if state_installed "$(pkey "$p")"; then
-                    echo ""
-                    echo "# $(pname "$p")"
-                    show_config_only "$p"
-                fi
-            done
-        } > /opt/pd/export.conf
-        info "配置已导出到 /opt/pd/export.conf"
+        check_root; run_export
         exit 0 ;;
     --config|-c)
         [ -z "${2:-}" ] && die "用法: pd --config <snell|hy2|vless|anytls>"
@@ -1285,22 +1311,37 @@ install_deps
 install_qrencode
 self_install || warn "pd 更新失败，使用缓存版本"
 
-# 已有安装 → 精简入口
+# 已有安装 → 完整管理面板
 if state_installed snell || state_installed hy2 || state_installed vless || state_installed anytls; then
     show_status
     echo ""
-    echo "1) 加装新协议     2) 查看配置     3) 卸载协议"
-    echo "4) 开启 BBR       5) 全部卸载     0) 退出"
+    echo " 安装: 1)Snell 2)HY2 3)VLESS 4)AnyTLS"
+    echo " 管理: u)升级 r)重启 s)停止 l)日志"
+    echo " 查看: c)配置行 C)完整配置 e)导出"
+    echo " 系统: b)BBR   d)卸载   R)全部卸载"
+    echo "       q)退出"
+    echo ""
     echo -n "选择: "
     read -r cc
     case "$cc" in
-        1) main_menu ;;
-        2) show_config; press_enter; main_menu ;;
-        3) remove_menu; press_enter; main_menu ;;
-        4) enable_bbr; press_enter; main_menu ;;
-        5) remove_all ;;
-        *) info "再见 👋"; exit 0 ;;
+        1) install_protocol snell; press_enter ;;
+        2) install_protocol hy2; press_enter ;;
+        3) install_protocol vless; press_enter ;;
+        4) install_protocol anytls; press_enter ;;
+        u) pick_proto "升级" upgrade_protocol; press_enter ;;
+        r) pick_proto "重启" restart_service; press_enter ;;
+        s) pick_proto "停止" stop_service; press_enter ;;
+        l) pick_proto "日志" show_log ;;
+        c) pick_proto "配置" show_config_only ;;
+        C) show_config; press_enter ;;
+        e) run_export; press_enter ;;
+        b) enable_bbr; press_enter ;;
+        d) remove_menu; press_enter ;;
+        R) remove_all ;;
+        q) info "再见 👋"; exit 0 ;;
+        *) ;;
     esac
+    exec "$0"  # 重新进入菜单（刷新状态）
 else
     main_menu
 fi
