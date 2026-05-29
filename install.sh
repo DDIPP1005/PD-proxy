@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.5.0
+# PD-proxy — 多协议代理一键部署脚本 v2.6.0
 # 协议: Snell v5 | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.5.0"
+VERSION="2.6.0"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -51,6 +51,17 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   PD_HY2_PORT=12346
   PD_VLESS_PORT=12347
   PD_ANYTLS_PORT=12348
+
+  # 协议增强选项
+  PD_SNELL_MODE=shadowtls     Snell + ShadowTLS 伪装
+  PD_SNELL_TLS_SNI=apple.com  ShadowTLS 伪装站点
+  PD_HY2_HOP=5                Hysteria2 端口跳跃数
+  PD_VLESS_DEST=swdist.apple.com:443  VLESS 伪装目标
+  PD_VLESS_TRANSPORT=grpc     VLESS 传输 (tcp|grpc|ws)
+  PD_VLESS_FP=ios             VLESS 浏览器指纹
+  PD_ANYTLS_PADDING=deep      AnyTLS 填充 (standard|deep|fixed|none)
+  PD_ANYTLS_SNI=microsoft.com AnyTLS SNI 伪装
+  PD_ANYTLS_HOP=3             AnyTLS 端口跳跃
   
 示例:
   curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh | bash -s -- --install snell
@@ -77,6 +88,29 @@ BASE_DIR="/opt/pd"
 STATE_FILE="$BASE_DIR/state"
 INSTALLED_BIN="/usr/local/bin/pd"
 LOCK_FILE="/tmp/pd-proxy.lock"
+
+# ============================================================
+# 协议安装选项（环境变量 → 全局变量，被 install_protocol 读取）
+# ============================================================
+
+# Snell 选项
+PD_OPT_SNELL_MODE="${PD_SNELL_MODE:-standard}"          # standard | shadowtls
+PD_OPT_SNELL_TLS_SNI="${PD_SNELL_TLS_SNI:-www.microsoft.com}"
+PD_OPT_SNELL_TLS_PASS="${PD_SNELL_TLS_PASS:-}"          # 空=自动生成
+
+# HY2 选项
+PD_OPT_HY2_HOP="${PD_HY2_HOP:-0}"                       # 0=单端口, 3, 5, 或自定义
+
+# VLESS 选项
+PD_OPT_VLESS_DEST="${PD_VLESS_DEST:-addons.mozilla.org:443}"
+PD_OPT_VLESS_SNI="${PD_VLESS_SNI:-addons.mozilla.org}"
+PD_OPT_VLESS_TRANSPORT="${PD_VLESS_TRANSPORT:-tcp}"     # tcp | grpc | ws
+PD_OPT_VLESS_FP="${PD_VLESS_FP:-chrome}"                # chrome | firefox | safari | ios | randomized
+
+# AnyTLS 选项
+PD_OPT_ANYTLS_PADDING="${PD_ANYTLS_PADDING:-standard}"  # standard | deep | fixed | none
+PD_OPT_ANYTLS_SNI="${PD_ANYTLS_SNI:-}"                  # 空=不伪装
+PD_OPT_ANYTLS_HOP="${PD_ANYTLS_HOP:-0}"                 # 0=单端口
 
 # 并发锁
 exec 200>"$LOCK_FILE"
@@ -488,12 +522,12 @@ snell_download() {
 }
 
 snell_configure() {
-    local port="$1" psk="$2"
+    local port="$1" psk="$2" listen_addr="${3:-0.0.0.0}"
     local ipv6_enabled="false"
     has_ipv6 && ipv6_enabled="true"
     cat > "$(pdir snell)/snell.conf" <<EOF
 [snell-server]
-listen = 0.0.0.0:${port}
+listen = ${listen_addr}:${port}
 psk = ${psk}
 ipv6 = ${ipv6_enabled}
 EOF
@@ -501,17 +535,90 @@ EOF
 }
 
 snell_service_args() {
-    echo "-c $(pdir snell)/snell.conf"
+    local port="$1"
+    if [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
+        # ShadowTLS 模式：Snell 监听本地，外部端口给 shadow-tls
+        echo "-c $(pdir snell)/snell.conf"
+    else
+        echo "-c $(pdir snell)/snell.conf"
+    fi
 }
 
 snell_output() {
     local port="$1" psk="$2"
-    output_header "Snell v5" "$port"
-    echo -e "PSK:    ${GREEN}${psk}${RESET}"
-    echo ""
-    echo -e "${CYAN}[Surge 配置]${RESET}"
-    echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true${RESET}"
-    output_footer
+    if [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
+        output_header "Snell v5 + ShadowTLS" "$port"
+        echo -e "PSK:     ${GREEN}${psk}${RESET}"
+        echo -e "TLS密码: ${GREEN}${PD_OPT_SNELL_TLS_PASS}${RESET}"
+        echo -e "TLS SNI: ${GREEN}${PD_OPT_SNELL_TLS_SNI}${RESET}"
+        echo ""
+        echo -e "${CYAN}[Surge 配置]${RESET}"
+        echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true, shadow-tls-password=${PD_OPT_SNELL_TLS_PASS}, shadow-tls-sni=${PD_OPT_SNELL_TLS_SNI}${RESET}"
+        output_footer
+    else
+        output_header "Snell v5" "$port"
+        echo -e "PSK:    ${GREEN}${psk}${RESET}"
+        echo ""
+        echo -e "${CYAN}[Surge 配置]${RESET}"
+        echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true${RESET}"
+        output_footer
+    fi
+}
+
+# ============================================================
+# ShadowTLS（Snell 增强模式）
+# ============================================================
+
+install_shadowtls() {
+    local dir="/opt/shadowtls" bin="$dir/shadow-tls"
+    [ -x "$bin" ] && { info "ShadowTLS 已安装"; echo "$bin"; return 0; }
+
+    step "下载 ShadowTLS ..."
+    local ver
+    ver=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" 2>/dev/null \
+        | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
+    [ -n "$ver" ] || die "ShadowTLS 版本检测失败"
+
+    local url="https://github.com/ihciah/shadow-tls/releases/download/${ver}/shadow-tls-${ARCH}-unknown-linux-musl"
+    mkdir -p "$dir"
+    curl -fSL# --retry 3 --connect-timeout 15 --max-time 120 -o "$bin" "$url" \
+        || die "ShadowTLS 下载失败"
+    chmod +x "$bin"
+    verify_download "$bin" "ShadowTLS" 1000000
+    info "ShadowTLS 下载完成"
+    echo "$bin"
+}
+
+snell_shadowtls_configure() {
+    local ext_port="$1" int_port="$2"
+    local sni="$PD_OPT_SNELL_TLS_SNI"
+    local tls_pass="$PD_OPT_SNELL_TLS_PASS"
+    [ -n "$tls_pass" ] || tls_pass=$(rand_pass)
+    PD_OPT_SNELL_TLS_PASS="$tls_pass"
+
+    step "配置 ShadowTLS (SNI: $sni) ..."
+    local svc="shadowtls-snell"
+    local bin=$(install_shadowtls)
+    cat > "/etc/systemd/system/${svc}.service" <<EOF
+[Unit]
+Description=PD-proxy: ShadowTLS for Snell
+After=network.target snell.service
+Requires=snell.service
+
+[Service]
+Type=simple
+ExecStart=${bin} server --listen 0.0.0.0:${ext_port} --server 127.0.0.1:${int_port} --tls ${sni} --password ${tls_pass}
+Restart=always
+RestartSec=5
+LimitNOFILE=32768
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable "$svc" >/dev/null 2>&1 || true
+    systemctl restart "$svc" || warn "ShadowTLS 启动失败，查看 journalctl -u $svc -n 20"
+    info "ShadowTLS 已启动 (端口 $ext_port → Snell $int_port)"
 }
 
 # ---- Hysteria2 ----
@@ -536,8 +643,18 @@ hy2_download() {
 
 hy2_configure() {
     local port="$1" pass="$2"
+    local listen=":${port}"
+    if [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
+        local hop_ports="$port"
+        local i
+        for i in $(seq 1 $((PD_OPT_HY2_HOP - 1))); do
+            hop_ports="$hop_ports,$((port + i))"
+        done
+        listen=":${hop_ports}"
+        info "端口跳跃: $hop_ports"
+    fi
     cat > "$(pdir hy2)/config.yaml" <<EOF
-listen: :${port}
+listen: ${listen}
 
 tls:
   cert: $(pdir hy2)/cert.crt
@@ -570,7 +687,17 @@ hy2_output() {
     echo -e "密码:   ${GREEN}${pass}${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
-    echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
+    if [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
+        local last_port=$((port + PD_OPT_HY2_HOP - 1))
+        local hop_list="$port"
+        local i
+        for i in $(seq 1 $((PD_OPT_HY2_HOP - 1))); do
+            hop_list="$hop_list,$((port + i))"
+        done
+        echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${hop_list}${RESET}"
+    else
+        echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
+    fi
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
     gen_qr "hysteria2://${pass}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
@@ -597,6 +724,12 @@ vless_download() {
 
 vless_configure() {
     local port="$1" uuid="$2"
+    local dest="${PD_OPT_VLESS_DEST}"
+    local dest_host="${dest%:*}"
+    local sni_list="${PD_OPT_VLESS_SNI}"
+    local transport="${PD_OPT_VLESS_TRANSPORT}"
+    local fp="${PD_OPT_VLESS_FP}"
+
     step "生成 Reality 密钥..."
     local keys
     keys=$("$(pbin vless)" x25519 2>/dev/null) || die "Xray x25519 密钥生成失败"
@@ -608,9 +741,34 @@ vless_configure() {
     shortid=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | xxd -p)
     [ -n "$privkey" ] || die "Reality 私钥生成失败"
 
-    # 保存公钥供输出使用
+    # 保存配置信息供输出使用
     echo "$pubkey" > "$(pdir vless)/.pubkey"
     echo "$shortid" > "$(pdir vless)/.shortid"
+    echo "$dest" > "$(pdir vless)/.dest"
+    echo "$transport" > "$(pdir vless)/.transport"
+    echo "$fp" > "$(pdir vless)/.fp"
+
+    # 构建 serverNames JSON 数组
+    local snames_json="[\"${dest_host}\""
+    for sn in $(echo "$sni_list" | tr ',' ' '); do
+        [ "$sn" = "$dest_host" ] && continue
+        snames_json="${snames_json}, \"${sn}\""
+    done
+    snames_json="${snames_json}]"
+
+    # 根据传输方式生成 streamSettings
+    local stream_settings network_settings
+    case "$transport" in
+        grpc)
+            network_settings="\"network\": \"grpc\", \"security\": \"reality\", \"grpcSettings\": {\"serviceName\": \"\"}"
+            ;;
+        ws)
+            network_settings="\"network\": \"ws\", \"security\": \"reality\", \"wsSettings\": {\"path\": \"/\"}"
+            ;;
+        *)  # tcp
+            network_settings="\"network\": \"tcp\", \"security\": \"reality\""
+            ;;
+    esac
 
     cat > "$(pdir vless)/config.json" <<EOF
 {
@@ -622,11 +780,10 @@ vless_configure() {
       "decryption": "none"
     },
     "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
+      ${network_settings},
       "realitySettings": {
-        "dest": "addons.mozilla.org:443",
-        "serverNames": ["addons.mozilla.org", "www.microsoft.com"],
+        "dest": "${dest}",
+        "serverNames": ${snames_json},
         "privateKey": "${privkey}",
         "shortIds": ["${shortid}"]
       }
@@ -645,13 +802,20 @@ vless_service_args() {
 
 vless_output() {
     local port="$1" uuid="$2"
-    local pubkey shortid
+    local pubkey shortid dest transport fp
     pubkey=$(cat "$(pdir vless)/.pubkey" 2>/dev/null || echo "未知")
     shortid=$(cat "$(pdir vless)/.shortid" 2>/dev/null || echo "未知")
-    local link="vless://${uuid}@${IP}:${port}?encryption=none&security=reality&sni=addons.mozilla.org&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp&flow=xtls-rprx-vision#PD-VLESS"
+    dest=$(cat "$(pdir vless)/.dest" 2>/dev/null || echo "addons.mozilla.org:443")
+    transport=$(cat "$(pdir vless)/.transport" 2>/dev/null || echo "tcp")
+    fp=$(cat "$(pdir vless)/.fp" 2>/dev/null || echo "chrome")
+    local dest_host="${dest%:*}"
+    local link="vless://${uuid}@${IP}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS"
 
     output_header "VLESS Reality" "$port"
     echo -e "UUID:   ${GREEN}${uuid}${RESET}"
+    echo -e "目标:   ${DIM}${dest}${RESET}"
+    echo -e "传输:   ${DIM}${transport}${RESET}"
+    echo -e "指纹:   ${DIM}${fp}${RESET}"
     echo ""
     echo -e "${YELLOW}⚠ Surge 不支持 VLESS Reality，请用 Shadowrocket${RESET}"
     echo ""
@@ -690,21 +854,50 @@ anytls_download() {
 
 anytls_configure() {
     local port="$1" pass="$2"
+    local padding="${PD_OPT_ANYTLS_PADDING}"
+    local sni="${PD_OPT_ANYTLS_SNI}"
+    local hop="${PD_OPT_ANYTLS_HOP}"
+
     echo "$pass" > "$(pdir anytls)/.password"
+    echo "$padding" > "$(pdir anytls)/.padding"
+    echo "$sni" > "$(pdir anytls)/.sni"
+    echo "$hop" > "$(pdir anytls)/.hop"
     chmod 600 "$(pdir anytls)/.password"
 }
 
 anytls_service_args() {
-    local pass
+    local port="$1"
+    local pass padding sni hop
     pass=$(cat "$(pdir anytls)/.password")
-    echo "-l 0.0.0.0:${1} -p ${pass}"
+    padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
+    sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
+    hop=$(cat "$(pdir anytls)/.hop" 2>/dev/null || echo "0")
+
+    local args="-l 0.0.0.0:${port} -p ${pass}"
+    case "$padding" in
+        deep)  args="$args --padding-scheme deep" ;;
+        fixed) args="$args --padding-scheme fixed" ;;
+        none)  args="$args --padding-scheme none" ;;
+        *)     ;;  # standard: 默认
+    esac
+    [ -n "$sni" ] && args="$args --sni $sni"
+    [ "$hop" -ge 3 ] 2>/dev/null && args="$args --hop $hop"
+    echo "$args"
 }
 
 anytls_output() {
     local port="$1" pass="$2"
+    local padding sni hop
+    padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
+    sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
+    hop=$(cat "$(pdir anytls)/.hop" 2>/dev/null || echo "0")
+
     local link="anytls://${pass}@${IP}:${port}#PD-AnyTLS"
     output_header "AnyTLS" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
+    echo -e "填充:   ${DIM}${padding}${RESET}"
+    [ -n "$sni" ] && echo -e "SNI:    ${DIM}${sni}${RESET}"
+    [ "$hop" -ge 3 ] 2>/dev/null && echo -e "跳跃:   ${DIM}${hop} 端口${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
     echo -e "${GREEN}anytls, ${IP}, ${port}, password=${pass}${RESET}"
@@ -781,7 +974,14 @@ install_protocol() {
 
     # 5. 配置
     step "写入配置..."
-    "${proto}_configure" "$port" "$pass"
+    if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
+        # ShadowTLS 模式：Snell 监听内部端口，ShadowTLS 监听外部端口
+        local snell_int=$((port + 50000))
+        snell_configure "$snell_int" "$pass" "127.0.0.1"
+        snell_shadowtls_configure "$port" "$snell_int"
+    else
+        "${proto}_configure" "$port" "$pass"
+    fi
 
     # 6. systemd
     step "注册服务..."
@@ -790,6 +990,19 @@ install_protocol() {
 
     # 7. 防火墙 & 验证
     add_firewall "$port"
+    # 端口跳跃：额外开放跳跃端口
+    if [ "$proto" = "hy2" ] && [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
+        local i
+        for i in $(seq 1 $((PD_OPT_HY2_HOP - 1))); do
+            add_firewall $((port + i))
+        done
+    fi
+    if [ "$proto" = "anytls" ] && [ "$PD_OPT_ANYTLS_HOP" -ge 3 ] 2>/dev/null; then
+        local i
+        for i in $(seq 1 $((PD_OPT_ANYTLS_HOP - 1))); do
+            add_firewall $((port + i))
+        done
+    fi
     verify_port "$port" "$svc" || warn "请检查服务状态"
 
     # 8. 保存状态
@@ -821,6 +1034,16 @@ uninstall_protocol() {
     systemctl stop "$svc" 2>/dev/null || true
     systemctl disable "$svc" 2>/dev/null || true
     rm -f "/etc/systemd/system/${svc}.service"
+
+    # Snell ShadowTLS 额外清理
+    if [ "$proto" = "snell" ]; then
+        local tls_svc="shadowtls-snell"
+        systemctl stop "$tls_svc" 2>/dev/null || true
+        systemctl disable "$tls_svc" 2>/dev/null || true
+        rm -f "/etc/systemd/system/${tls_svc}.service"
+        rm -rf /opt/shadowtls
+    fi
+
     systemctl daemon-reload
     systemctl reset-failed "${svc}.service" 2>/dev/null || true
 
@@ -931,25 +1154,44 @@ show_config_only() {
     local port=$(state_get "$key" "port")
     case $proto in
         snell)
-            local psk
+            local psk tls_pass tls_sni
             psk=$(grep -oP 'psk\s*=\s*\K.+' "$(pdir snell)/snell.conf" 2>/dev/null || echo "")
-            echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true" ;;
+            if [ -f "/etc/systemd/system/shadowtls-snell.service" ]; then
+                tls_pass=$(grep -oP 'password \K\S+' /etc/systemd/system/shadowtls-snell.service 2>/dev/null || echo "")
+                tls_sni=$(grep -oP 'tls \K\S+' /etc/systemd/system/shadowtls-snell.service 2>/dev/null || echo "")
+                echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni}"
+            else
+                echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true"
+            fi ;;
         hy2)
-            local pass
+            local pass hop
             pass=$(grep -oP 'password:\s*\K.+' "$(pdir hy2)/config.yaml" 2>/dev/null || echo "")
-            echo "Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
+            local listen_line=$(grep 'listen:' "$(pdir hy2)/config.yaml" 2>/dev/null || echo "")
+            hop=$(echo "$listen_line" | tr ',' '\n' | wc -l | tr -d ' ')
+            if [ "$hop" -ge 3 ] 2>/dev/null; then
+                local last_port=$((port + hop - 1))
+                echo "Proxy = hysteria2, ${IP}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=$(echo "$listen_line" | grep -oP ':(\K.*)')"
+            else
+                echo "Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
+            fi
             echo ""
             echo "# Shadowrocket: hysteria2://${pass}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2" ;;
         vless)
-            local uuid pubkey shortid
+            local uuid pubkey shortid dest transport fp dest_host
             uuid=$(grep -oP '"id":\s*"\K[^"]+' "$(pdir vless)/config.json" 2>/dev/null | head -1 || echo "")
             pubkey=$(cat "$(pdir vless)/.pubkey" 2>/dev/null || echo "")
             shortid=$(cat "$(pdir vless)/.shortid" 2>/dev/null || echo "")
+            dest=$(cat "$(pdir vless)/.dest" 2>/dev/null || echo "addons.mozilla.org:443")
+            transport=$(cat "$(pdir vless)/.transport" 2>/dev/null || echo "tcp")
+            fp=$(cat "$(pdir vless)/.fp" 2>/dev/null || echo "chrome")
+            dest_host="${dest%:*}"
             echo "# Surge 不支持 VLESS"
-            echo "vless://${uuid}@${IP}:${port}?encryption=none&security=reality&sni=addons.mozilla.org&fp=chrome&pbk=${pubkey}&sid=${shortid}&type=tcp&flow=xtls-rprx-vision#PD-VLESS" ;;
+            echo "vless://${uuid}@${IP}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS" ;;
         anytls)
-            local pass
+            local pass padding sni
             pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "")
+            padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
+            sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
             echo "anytls, ${IP}, ${port}, password=${pass}"
             echo ""
             echo "# Shadowrocket: anytls://${pass}@${IP}:${port}#PD-AnyTLS" ;;
@@ -1225,8 +1467,179 @@ case "${1:-}" in
 esac
 
 # ============================================================
-# 交互菜单系统（二级菜单）
+# 交互菜单系统（二级菜单 + 协议配置子菜单）
 # ============================================================
+
+# ---- Snell 配置子菜单 ----
+menu_snell_config() {
+    while true; do
+        echo ""
+        echo -e "  ${MAGENTA}▸ Snell v5 — 安装模式${RESET}"
+        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+        echo -e "  ${CYAN}│${RESET} [1] ${GREEN}标准模式${RESET}         直接 Snell 监听    ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [2] ${MAGENTA}+ ShadowTLS${RESET}      伪装 TLS (推荐)    ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回${RESET}                            ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+        echo -ne "  ${MAGENTA}▸${RESET} 选择: "
+        read -r cc
+        case "$cc" in
+            1) PD_OPT_SNELL_MODE="standard"; break ;;
+            2)
+                PD_OPT_SNELL_MODE="shadowtls"
+                echo ""
+                echo -e "  ${MAGENTA}▸ 伪装 SNI 站点${RESET}"
+                echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+                echo -e "  ${CYAN}│${RESET} [1] microsoft.com                  ${CYAN}│${RESET}"
+                echo -e "  ${CYAN}│${RESET} [2] apple.com                      ${CYAN}│${RESET}"
+                echo -e "  ${CYAN}│${RESET} [3] cloudflare.com                 ${CYAN}│${RESET}"
+                echo -e "  ${CYAN}│${RESET} [4] 自定义输入                      ${CYAN}│${RESET}"
+                echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+                echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
+                read -r sni_c
+                case "$sni_c" in
+                    2) PD_OPT_SNELL_TLS_SNI="www.apple.com" ;;
+                    3) PD_OPT_SNELL_TLS_SNI="cloudflare.com" ;;
+                    4) echo -ne "  SNI: "; read -r sni_custom; PD_OPT_SNELL_TLS_SNI="${sni_custom:-www.microsoft.com}" ;;
+                    *) PD_OPT_SNELL_TLS_SNI="www.microsoft.com" ;;
+                esac
+                break ;;
+            [Bb]) return 1 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) warn "无效选择" ;;
+        esac
+    done
+    install_protocol snell
+    return 0
+}
+
+# ---- HY2 配置子菜单 ----
+menu_hy2_config() {
+    while true; do
+        echo ""
+        echo -e "  ${MAGENTA}▸ Hysteria2 — 端口模式${RESET}"
+        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+        echo -e "  ${CYAN}│${RESET} [1] ${GREEN}单端口${RESET}           标准              ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [2] ${MAGENTA}3 端口跳跃${RESET}       轻量混淆          ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [3] ${MAGENTA}5 端口跳跃${RESET}       深度混淆 (推荐)   ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回${RESET}                            ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+        echo -ne "  ${MAGENTA}▸${RESET} 选择: "
+        read -r cc
+        case "$cc" in
+            1) PD_OPT_HY2_HOP=0; break ;;
+            2) PD_OPT_HY2_HOP=3; break ;;
+            3) PD_OPT_HY2_HOP=5; break ;;
+            [Bb]) return 1 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) warn "无效选择" ;;
+        esac
+    done
+    install_protocol hy2
+    return 0
+}
+
+# ---- VLESS 配置子菜单 ----
+menu_vless_config() {
+    while true; do
+        echo ""
+        echo -e "  ${MAGENTA}▸ VLESS Reality — 伪装目标${RESET}"
+        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+        echo -e "  ${CYAN}│${RESET} [1] addons.mozilla.org  Mozilla CDN   ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [2] www.microsoft.com   微软 CDN      ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [3] swdist.apple.com    Apple 分发    ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [4] dl.google.com       Google 下载   ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回${RESET}                            ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
+        read -r cc
+        case "$cc" in
+            2) PD_OPT_VLESS_DEST="www.microsoft.com:443"; PD_OPT_VLESS_SNI="www.microsoft.com" ;;
+            3) PD_OPT_VLESS_DEST="swdist.apple.com:443"; PD_OPT_VLESS_SNI="swdist.apple.com" ;;
+            4) PD_OPT_VLESS_DEST="dl.google.com:443"; PD_OPT_VLESS_SNI="dl.google.com" ;;
+            [Bb]) return 1 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) PD_OPT_VLESS_DEST="addons.mozilla.org:443"; PD_OPT_VLESS_SNI="addons.mozilla.org" ;;
+        esac
+
+        echo ""
+        echo -e "  ${MAGENTA}▸ 传输方式${RESET}"
+        echo -e "  [1] TCP (默认)  [2] gRPC  [3] WebSocket"
+        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
+        read -r trans
+        case "$trans" in
+            2) PD_OPT_VLESS_TRANSPORT="grpc" ;;
+            3) PD_OPT_VLESS_TRANSPORT="ws" ;;
+            *) PD_OPT_VLESS_TRANSPORT="tcp" ;;
+        esac
+
+        echo ""
+        echo -e "  ${MAGENTA}▸ 浏览器指纹${RESET}"
+        echo -e "  [1] chrome  [2] firefox  [3] safari  [4] ios  [5] 随机"
+        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
+        read -r fp_c
+        case "$fp_c" in
+            2) PD_OPT_VLESS_FP="firefox" ;;
+            3) PD_OPT_VLESS_FP="safari" ;;
+            4) PD_OPT_VLESS_FP="ios" ;;
+            5) PD_OPT_VLESS_FP="randomized" ;;
+            *) PD_OPT_VLESS_FP="chrome" ;;
+        esac
+        break
+    done
+    install_protocol vless
+    return 0
+}
+
+# ---- AnyTLS 配置子菜单 ----
+menu_anytls_config() {
+    while true; do
+        echo ""
+        echo -e "  ${MAGENTA}▸ AnyTLS — 填充模式${RESET}"
+        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+        echo -e "  ${CYAN}│${RESET} [1] ${GREEN}标准填充${RESET}         随机 64-512B     ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [2] ${MAGENTA}深度填充${RESET}         随机 64-1024B    ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [3] 固定填充           固定 512B        ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [4] 无填充             纯转发           ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回${RESET}                            ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
+        read -r cc
+        case "$cc" in
+            2) PD_OPT_ANYTLS_PADDING="deep" ;;
+            3) PD_OPT_ANYTLS_PADDING="fixed" ;;
+            4) PD_OPT_ANYTLS_PADDING="none" ;;
+            [Bb]) return 1 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) PD_OPT_ANYTLS_PADDING="standard" ;;
+        esac
+
+        echo ""
+        echo -e "  ${MAGENTA}▸ SNI 伪装${RESET}"
+        echo -e "  [1] 不伪装  [2] microsoft.com  [3] apple.com  [4] cloudflare.com"
+        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
+        read -r sni_c
+        case "$sni_c" in
+            2) PD_OPT_ANYTLS_SNI="www.microsoft.com" ;;
+            3) PD_OPT_ANYTLS_SNI="www.apple.com" ;;
+            4) PD_OPT_ANYTLS_SNI="cloudflare.com" ;;
+            *) PD_OPT_ANYTLS_SNI="" ;;
+        esac
+
+        echo ""
+        echo -e "  ${MAGENTA}▸ 端口跳跃${RESET}"
+        echo -e "  [1] 单端口  [2] 3 端口  [3] 5 端口"
+        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
+        read -r hop_c
+        case "$hop_c" in
+            2) PD_OPT_ANYTLS_HOP=3 ;;
+            3) PD_OPT_ANYTLS_HOP=5 ;;
+            *) PD_OPT_ANYTLS_HOP=0 ;;
+        esac
+        break
+    done
+    install_protocol anytls
+    return 0
+}
 
 menu_install() {
     echo -e "  ${MAGENTA}▸ 安装协议${RESET}"
@@ -1241,10 +1654,10 @@ menu_install() {
     echo -ne "  ${MAGENTA}▸${RESET} 选择: "
     read -r cc
     case "$cc" in
-        1) install_protocol snell ;;
-        2) install_protocol hy2 ;;
-        3) install_protocol vless ;;
-        4) install_protocol anytls ;;
+        1) menu_snell_config || return 1 ;;
+        2) menu_hy2_config || return 1 ;;
+        3) menu_vless_config || return 1 ;;
+        4) menu_anytls_config || return 1 ;;
         [Bb]) return 1 ;;
         [Qq]) info "再见 👋"; exit 0 ;;
         *) warn "无效选择" ;;
