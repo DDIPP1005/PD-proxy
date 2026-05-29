@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.6.3
+# PD-proxy — 多协议代理一键部署脚本 v2.6.4
 # 协议: Snell v5 | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.6.3"
+VERSION="2.6.4"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -289,6 +289,7 @@ install_deps() {
 install_qrencode() {
     command -v qrencode >/dev/null 2>&1 && return 0
     info "安装 qrencode..."
+    apt-get update -qq 2>/dev/null || true
     apt-get install -y -qq qrencode >/dev/null 2>&1 || warn "qrencode 安装失败，跳过二维码生成"
 }
 
@@ -459,7 +460,7 @@ register_and_start() {
 output_header() {
     echo ""
     echo -e "${BOLD}══════════════════════════════${RESET}"
-    echo -e "${BOLD}  $1 ✅ 安装完成${RESET}"
+    echo -e "${BOLD}  $1${RESET}"
     echo -e "${BOLD}══════════════════════════════${RESET}"
     echo -e "端口:   ${GREEN}$2${RESET}"
 }
@@ -658,7 +659,11 @@ hy2_configure() {
         local hop_ports="$port"
         local i
         for i in $(seq 1 $((PD_OPT_HY2_HOP - 1))); do
-            hop_ports="$hop_ports,$((port + i))"
+            local hp=$((port + i))
+            hop_ports="$hop_ports,$hp"
+            if ss -tlnp 2>/dev/null | grep -q ":${hp} "; then
+                warn "跳跃端口 $hp 已被占用，Hysteria2 可能无法监听该端口"
+            fi
         done
         listen=":${hop_ports}"
         info "端口跳跃: $hop_ports"
@@ -748,7 +753,7 @@ vless_configure() {
     local pubkey
     pubkey=$(echo "$keys" | grep "Public" | awk '{print $NF}')
     local shortid
-    shortid=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | xxd -p)
+    shortid=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
     [ -n "$privkey" ] || die "Reality 私钥生成失败"
 
     # 保存配置信息供输出使用
@@ -986,8 +991,11 @@ install_protocol() {
     if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
         # ShadowTLS 模式：Snell 监听内部端口（50000+），先配 Snell，ShadowTLS 稍后部署
         local snell_int=$(( (RANDOM % 15000) + 50000 ))
+        local _sni_attempts=0
         while ss -tlnp 2>/dev/null | grep -q ":${snell_int} " 2>/dev/null; do
             snell_int=$(( (RANDOM % 15000) + 50000 ))
+            _sni_attempts=$((_sni_attempts + 1))
+            [ $_sni_attempts -lt 100 ] || die "无法分配 Snell 内部端口（50000-65000）"
         done
         snell_configure "$snell_int" "$pass" "127.0.0.1"
     else
@@ -1014,6 +1022,12 @@ install_protocol() {
         done
     fi
     verify_port "$port" "$svc" || warn "请检查服务状态"
+    # Snell + ShadowTLS: 外部端口由 shadowtls-snell 监听
+    if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
+        if ! systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
+            warn "ShadowTLS 服务未运行，查看 journalctl -u shadowtls-snell -n 20"
+        fi
+    fi
 
     # 8. 保存状态
     state_set "$key" "port" "$port"
