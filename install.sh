@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.7.4
-# 协议: Snell v5 | Hysteria2 | VLESS Reality | AnyTLS
+# PD-proxy — 多协议代理一键部署脚本 v2.7.5
+# 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
 # 架构：数据驱动 — 所有协议定义为元数据表，安装引擎统一处理
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.7.4"
+VERSION="2.7.5"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -241,7 +241,7 @@ verify_download() {
 verify_port() {
     local port="$1" service="$2"
     sleep 2
-    if ss -tlnp 2>/dev/null | grep -q ":${port} "; then
+    if ss -tlnp 2>/dev/null | grep -q ":${port} " || ss -ulnp 2>/dev/null | grep -q ":${port} "; then
         info "端口 $port 监听确认 ✅"
         return 0
     fi
@@ -511,6 +511,52 @@ snell_get_version() {
     die "Snell 版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v5.0.x"
 }
 
+snell_v4_get_version() {
+    local v cache_file="$BASE_DIR/.snell-v4-version-${ARCH}"
+    # 1. 尝试缓存
+    if [ -f "$cache_file" ] && [ "$(($(date +%s) - $(stat -c%Y "$cache_file" 2>/dev/null || stat -f%m "$cache_file" 2>/dev/null || echo 0)))" -lt 86400 ]; then
+        v=$(cat "$cache_file")
+        local test_url="https://dl.nssurge.com/snell/snell-server-${v}-linux-${ARCH}.zip"
+        if curl -fsI --max-time 10 "$test_url" >/dev/null 2>&1; then
+            echo "$v"; return 0
+        fi
+    fi
+    # 2. 从 Surge 手册抓取
+    v=$(curl -fs --max-time 15 "https://manual.nssurge.com/others/snell.html" 2>/dev/null \
+        | grep -oP 'snell-server-v\K4\.[0-9]+\.[0-9]+[a-z0-9]*' \
+        | grep -v 'b' | head -1)
+    if [ -n "$v" ]; then
+        echo "v${v}" | tee "$cache_file"; return 0
+    fi
+    # 3. 级联探测 v4.0.x
+    local minor=10
+    while [ $minor -ge 0 ]; do
+        local probe="v4.0.${minor}"
+        local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
+        if curl -fsI --max-time 10 "$probe_url" >/dev/null 2>&1; then
+            echo "$probe" | tee "$cache_file"; return 0
+        fi
+        minor=$((minor - 1))
+    done
+    die "Snell v4 版本检测失败，请检查网络"
+}
+
+snell_v4_download() {
+    local ver="$1"
+    local url="https://dl.nssurge.com/snell/snell-server-${ver}-linux-${ARCH}.zip"
+    step "下载 Snell v4 $ver ..."
+    mkdir -p "$(pdir snell)"
+    local tmpzip=$(mktemp_pd)
+    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
+        || die "Snell v4 下载失败: $url"
+    unzip -o "$tmpzip" -d "$(pdir snell)" >/dev/null \
+        || die "Snell v4 解压失败"
+    rm -f "$tmpzip"
+    chmod +x "$(pbin snell)"
+    verify_download "$(pbin snell)" "Snell v4" 50000
+    info "Snell v4 下载完成"
+}
+
 snell_download() {
     local ver="$1"
     local url="https://dl.nssurge.com/snell/snell-server-${ver}-linux-${ARCH}.zip"
@@ -550,20 +596,20 @@ snell_output() {
     local svc_file="/etc/systemd/system/shadowtls-snell.service"
     if [ -f "$svc_file" ]; then
         # 主提取（脚本生成的标准单行 ExecStart）
-        tls_pass=$(grep -oP 'password \\K\\S+' "$svc_file" 2>/dev/null || echo "")
-        tls_sni=$(grep -oP -- '--tls \\K\\S+' "$svc_file" 2>/dev/null || echo "")
+        tls_pass=$(grep -oP 'password \K\S+' "$svc_file" 2>/dev/null || echo "")
+        tls_sni=$(grep -oP -- '--tls \K\S+' "$svc_file" 2>/dev/null || echo "")
         # 回退：手动编辑/多行 ExecStart 场景
         [ -z "$tls_pass" ] && tls_pass=$(grep -oP 'password\s+\K\S+' "$svc_file" 2>/dev/null | tr -d '\\\n' || echo "")
         [ -z "$tls_sni" ] && tls_sni=$(grep -oP -- '--tls\s+\K\S+' "$svc_file" 2>/dev/null | tr -d '\\\n' || echo "")
     fi
     if [ -n "$tls_pass" ]; then
-        output_header "Snell v5 + ShadowTLS" "$port"
+        output_header "Snell v4 + ShadowTLS" "$port"
         echo -e "PSK:     ${GREEN}${psk}${RESET}"
         echo -e "TLS密码: ${GREEN}${tls_pass}${RESET}"
         echo -e "TLS SNI: ${GREEN}${tls_sni}${RESET}"
         echo ""
         echo -e "${CYAN}[Surge 配置]${RESET}"
-        echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni}${RESET}"
+        echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni}${RESET}"
         output_footer
     else
         output_header "Snell v5" "$port"
@@ -728,6 +774,7 @@ hy2_output() {
         local last_port=$((port + hop_count - 1))
         local hop_list
         hop_list=$(echo "$listen_line" | grep -oP ':\s*\K.+')
+        hop_list="${hop_list#:}"
         echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${hop_list}${RESET}"
     else
         echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
@@ -1009,13 +1056,17 @@ install_protocol() {
     [ "$proto" = "vless" ] && pass=$(gen_uuid)
 
     local ver=""
-    if declare -f "${proto}_get_version" >/dev/null 2>&1; then
+    if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
+        step "获取 Snell v4 版本..."
+        ver=$(snell_v4_get_version)
+        info "版本: $ver"
+        snell_v4_download "$ver"
+    elif declare -f "${proto}_get_version" >/dev/null 2>&1; then
         step "获取版本..."
         ver=$("${proto}_get_version")
         info "版本: $ver"
+        "${proto}_download" "$ver"
     fi
-
-    "${proto}_download" "$ver"
 
     step "写入配置..."
     if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
@@ -1136,7 +1187,16 @@ upgrade_protocol() {
     check_disk "$(pdisk "$proto")"
 
     local ver=""
-    if declare -f "${proto}_get_version" >/dev/null 2>&1; then
+    if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+        step "获取 Snell v4 最新版本..."
+        ver=$(snell_v4_get_version)
+        local old_ver=$(state_get "$key" "version")
+        if [ "$ver" = "$old_ver" ] && [ -n "$ver" ]; then
+            info "Snell v4 已是最新版 ($ver)，跳过"
+            return 0
+        fi
+        info "版本: $old_ver → $ver"
+    elif declare -f "${proto}_get_version" >/dev/null 2>&1; then
         step "获取最新版本..."
         ver=$("${proto}_get_version")
         local old_ver=$(state_get "$key" "version")
@@ -1158,7 +1218,11 @@ upgrade_protocol() {
     fi
 
     step "下载新版本..."
-    "${proto}_download" "$ver"
+    if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+        snell_v4_download "$ver"
+    else
+        "${proto}_download" "$ver"
+    fi
 
     step "启动服务..."
     if systemctl start "$svc" 2>/dev/null; then
@@ -1254,11 +1318,11 @@ show_config_only() {
             psk=$(grep -oP 'psk\s*=\s*\K.+' "$(pdir snell)/snell.conf" 2>/dev/null || echo "")
             local svc_file="/etc/systemd/system/shadowtls-snell.service"
             if [ -f "$svc_file" ]; then
-                tls_pass=$(grep -oP 'password \\K\\S+' "$svc_file" 2>/dev/null || echo "")
-                tls_sni=$(grep -oP -- '--tls \\K\\S+' "$svc_file" 2>/dev/null || echo "")
+                tls_pass=$(grep -oP 'password \K\S+' "$svc_file" 2>/dev/null || echo "")
+                tls_sni=$(grep -oP -- '--tls \K\S+' "$svc_file" 2>/dev/null || echo "")
                 [ -z "$tls_pass" ] && tls_pass=$(grep -oP 'password\s+\K\S+' "$svc_file" 2>/dev/null | tr -d '\\\n' || echo "")
                 [ -z "$tls_sni" ] && tls_sni=$(grep -oP -- '--tls\s+\K\S+' "$svc_file" 2>/dev/null | tr -d '\\\n' || echo "")
-                echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni}"
+                echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni}"
             else
                 echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true"
             fi ;;
@@ -1269,7 +1333,9 @@ show_config_only() {
             hop=$(echo "$listen_line" | tr ',' '\n' | wc -l | tr -d ' \n')
             if [ "$hop" -ge 3 ] 2>/dev/null; then
                 local last_port=$((port + hop - 1))
-                echo "Proxy = hysteria2, ${IP}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=$(echo "$listen_line" | grep -oP ':\s*\K.+')"
+                local hop_list=$(echo "$listen_line" | grep -oP ':\s*\K.+')
+                hop_list="${hop_list#:}"
+                echo "Proxy = hysteria2, ${IP}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${hop_list}"
             else
                 echo "Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
             fi
