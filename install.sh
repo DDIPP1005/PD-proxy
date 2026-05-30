@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.7.7
+# PD-proxy — 多协议代理一键部署脚本 v2.7.8
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.7.7"
+VERSION="2.7.8"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -155,11 +155,17 @@ has_ipv6() {
 
 check_nftables() {
     # Hysteria2 端口跳跃需要 nftables (内核 4.18+, nf_tables 模块)
-    if command -v nft >/dev/null 2>&1 && nft list ruleset >/dev/null 2>&1; then
+    # 先做轻量检测
+    if ! command -v nft >/dev/null 2>&1; then
+        return 1
+    fi
+    # 功能验证：尝试创建/删除临时 table，确认 nftables 真实可用
+    local test_table="pd_nft_test_$$"
+    if nft add table ip "$test_table" 2>/dev/null && nft delete table ip "$test_table" 2>/dev/null; then
         return 0
     fi
-    # 部分系统 nft 命令存在但内核不支持
-    if [ -f /proc/modules ] && grep -q nf_tables /proc/modules 2>/dev/null; then
+    # 回退：部分旧内核 nft 列表可读但无法创建规则
+    if nft list ruleset >/dev/null 2>&1; then
         return 0
     fi
     return 1
@@ -594,7 +600,7 @@ snell_output() {
     local port="$1" psk="$2"
     local tls_pass="" tls_sni=""
     local svc_file="/etc/systemd/system/shadowtls-snell.service"
-    if [ -f "$svc_file" ]; then
+    if [ -f "$svc_file" ] && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
         # 主提取（脚本生成的标准单行 ExecStart）
         tls_pass=$(grep -oP 'password \K\S+' "$svc_file" 2>/dev/null || echo "")
         tls_sni=$(grep -oP -- '--tls \K\S+' "$svc_file" 2>/dev/null || echo "")
@@ -977,7 +983,7 @@ anytls_service_args() {
         none)  args="$args --padding-scheme none" ;;
         *)     ;;  # standard: 默认
     esac
-    [ -n "$sni" ] && args="$args --sni $sni"
+    # anytls-server v0.0.12 无 -sni 参数，SNI 由客户端侧处理
     echo "$args"
 }
 
@@ -1017,11 +1023,26 @@ install_protocol() {
     bin=$(pbin "$proto")
     svc=$(psvc "$proto")
 
-    title "安装 $name"
+    # ShadowTLS 模式适配显示名
+    local display_name="$name"
+    if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
+        display_name="Snell v4 + ShadowTLS"
+    fi
+    title "安装 $display_name"
 
     install_deps; install_qrencode
     check_disk "$(pdisk "$proto")"
     if state_installed "$key"; then
+        # 模式切换提示
+        if [ "$proto" = "snell" ]; then
+            local cur_sts=false want_sts=false
+            [ -f /etc/systemd/system/shadowtls-snell.service ] && cur_sts=true
+            [ "$PD_OPT_SNELL_MODE" = "shadowtls" ] && want_sts=true
+            if [ "$cur_sts" != "$want_sts" ]; then
+                warn "已安装模式与目标模式不同，请先 pd --uninstall snell 再重装"
+                return 1
+            fi
+        fi
         warn "$name 已安装，跳过"
         return 0
     fi
@@ -1319,7 +1340,7 @@ show_config_only() {
             local psk tls_pass tls_sni
             psk=$(grep -oP 'psk\s*=\s*\K.+' "$(pdir snell)/snell.conf" 2>/dev/null || echo "")
             local svc_file="/etc/systemd/system/shadowtls-snell.service"
-            if [ -f "$svc_file" ]; then
+            if [ -f "$svc_file" ] && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
                 tls_pass=$(grep -oP 'password \K\S+' "$svc_file" 2>/dev/null || echo "")
                 tls_sni=$(grep -oP -- '--tls \K\S+' "$svc_file" 2>/dev/null || echo "")
                 [ -z "$tls_pass" ] && tls_pass=$(grep -oP 'password\s+\K\S+' "$svc_file" 2>/dev/null | tr -d '\\\n' || echo "")
@@ -1378,7 +1399,7 @@ show_status() {
         local key=$(pkey "$proto")
         local name=$(pname "$proto")
         # ShadowTLS 模式适配显示名
-        if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+        if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ] && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
             name="Snell v4+STS"
         fi
         if state_installed "$key"; then
