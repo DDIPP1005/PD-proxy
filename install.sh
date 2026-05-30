@@ -354,6 +354,11 @@ snell_version_sort() {
     sed 's/^v//' | sort -t. -k1,1nr -k2,2nr -k3,3nr | sed 's/^/v/'
 }
 
+require_version() {
+    local ver="$1" label="$2"
+    [ -n "$ver" ] || die "$label 版本为空，已停止安装，避免下载错误 URL"
+}
+
 state_field_from_line() {
     local field="$1"
     tr ' ' '\n' | sed -n "s/^${field}=//p" | head -1
@@ -779,7 +784,8 @@ snell_get_version() {
     # 2. 权威源不可达时，默认进入可用性 fallback：HEAD 探测当前 release 目录中可下载的最高版本。
     # 这能保证可用和尽量新；如必须严格权威最新版，设置 PD_STRICT_LATEST=1。
     if [ "${PD_STRICT_LATEST:-0}" = "1" ]; then
-        die "$(snell_strict_latest_msg 5)"
+        err "$(snell_strict_latest_msg 5)"
+        return 1
     fi
     warn "无法快速读取 Surge 手册，改用下载源探测可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
     v=$(snell_probe_latest 5 || true)
@@ -795,7 +801,8 @@ snell_get_version() {
         return 0
     fi
 
-    die "Snell 可用版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v5.x.x"
+    err "Snell 可用版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v5.x.x"
+    return 1
 }
 
 snell_v4_get_version() {
@@ -813,7 +820,8 @@ snell_v4_get_version() {
     fi
 
     if [ "${PD_STRICT_LATEST:-0}" = "1" ]; then
-        die "$(snell_strict_latest_msg 4)"
+        err "$(snell_strict_latest_msg 4)"
+        return 1
     fi
     warn "无法快速读取 Surge 手册，改用下载源探测 Snell v4 可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
     v=$(snell_probe_latest 4 || true)
@@ -829,11 +837,13 @@ snell_v4_get_version() {
         return 0
     fi
 
-    die "Snell v4 可用版本检测失败，请检查网络"
+    err "Snell v4 可用版本检测失败，请检查网络"
+    return 1
 }
 
 snell_v4_download() {
     local ver="$1"
+    require_version "$ver" "Snell v4"
     local url="https://dl.nssurge.com/snell/snell-server-${ver}-linux-${ARCH}.zip"
     step "下载 Snell v4 $ver ..."
     mkdir -p "$(pdir snell)"
@@ -851,6 +861,7 @@ snell_v4_download() {
 
 snell_download() {
     local ver="$1"
+    require_version "$ver" "Snell"
     local url="https://dl.nssurge.com/snell/snell-server-${ver}-linux-${ARCH}.zip"
     step "下载 Snell $ver ..."
     mkdir -p "$(pdir snell)"
@@ -1401,12 +1412,14 @@ install_protocol() {
     local ver=""
     if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
         step "获取 Snell v4 版本..."
-        ver=$(snell_v4_get_version)
+        ver=$(snell_v4_get_version) || die "Snell v4 版本检测失败，已停止安装"
+        require_version "$ver" "Snell v4"
         info "版本: $ver"
         snell_v4_download "$ver"
     elif declare -f "${proto}_get_version" >/dev/null 2>&1; then
         step "获取版本..."
-        ver=$("${proto}_get_version")
+        ver=$("${proto}_get_version") || die "$(pname "$proto") 版本检测失败，已停止安装"
+        require_version "$ver" "$(pname "$proto")"
         info "版本: $ver"
         "${proto}_download" "$ver"
     fi
@@ -1544,7 +1557,8 @@ upgrade_protocol() {
     local ver=""
     if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
         step "获取 Snell v4 最新版本..."
-        ver=$(snell_v4_get_version)
+        ver=$(snell_v4_get_version) || die "Snell v4 版本检测失败，已停止升级"
+        require_version "$ver" "Snell v4"
         local old_ver=$(state_get "$key" "version")
         if [ "$ver" = "$old_ver" ] && [ -n "$ver" ]; then
             info "Snell v4 已是最新版 ($ver)"
@@ -1557,7 +1571,8 @@ upgrade_protocol() {
         info "版本: $old_ver → $ver"
     elif declare -f "${proto}_get_version" >/dev/null 2>&1; then
         step "获取最新版本..."
-        ver=$("${proto}_get_version")
+        ver=$("${proto}_get_version") || die "$name 版本检测失败，已停止升级"
+        require_version "$ver" "$name"
         local old_ver=$(state_get "$key" "version")
         if [ "$ver" = "$old_ver" ] && [ -n "$ver" ]; then
             info "$name 已是最新版 ($ver)，跳过"
