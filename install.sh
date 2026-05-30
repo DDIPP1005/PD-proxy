@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.7.8
+# PD-proxy — 多协议代理一键部署脚本 v2.7.9
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.7.8"
+VERSION="2.7.9"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -978,10 +978,9 @@ anytls_service_args() {
 
     local args="-l 0.0.0.0:${port} -p ${pass}"
     case "$padding" in
-        deep)  args="$args --padding-scheme deep" ;;
-        fixed) args="$args --padding-scheme fixed" ;;
-        none)  args="$args --padding-scheme none" ;;
-        *)     ;;  # standard: 默认
+        # anytls-server v0.0.12: --padding-scheme 接受文件路径非预设名
+        # 仅当用户指定了文件路径时才传递，预设名不兼容
+        *)     ;;  # 使用 anytls 默认，不传 --padding-scheme
     esac
     # anytls-server v0.0.12 无 -sni 参数，SNI 由客户端侧处理
     echo "$args"
