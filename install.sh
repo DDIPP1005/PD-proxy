@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.7.6
+# PD-proxy — 多协议代理一键部署脚本 v2.7.7
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.7.6"
+VERSION="2.7.7"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -959,7 +959,7 @@ anytls_configure() {
 
     echo "$pass" > "$(pdir anytls)/.password"
     echo "$padding" > "$(pdir anytls)/.padding"
-    echo "$sni" > "$(pdir anytls)/.sni"
+    [ -n "$sni" ] && echo "$sni" > "$(pdir anytls)/.sni" || rm -f "$(pdir anytls)/.sni"
     chmod 600 "$(pdir anytls)/.password"
 }
 
@@ -1377,6 +1377,10 @@ show_status() {
     for proto in $ALL_PROTOS; do
         local key=$(pkey "$proto")
         local name=$(pname "$proto")
+        # ShadowTLS 模式适配显示名
+        if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+            name="Snell v4+STS"
+        fi
         if state_installed "$key"; then
             local port=$(state_get "$key" "port")
             local ver=$(state_get "$key" "version")
@@ -1927,6 +1931,16 @@ menu_system() {
 check_root
 detect_os; detect_arch; get_ip; get_mem
 self_install || warn "pd 更新失败，使用缓存版本"
+
+# 非终端拒绝交互模式（防止管道输入死循环）
+if [ ! -t 0 ]; then
+    err "交互模式需要终端。命令行用法："
+    echo "  pd --install <协议>     安装"
+    echo "  pd --status             查看状态"
+    echo "  pd --config <协议>      查看配置"
+    echo "  pd --help               完整帮助"
+    exit 1
+fi
 
 while true; do
     show_status
