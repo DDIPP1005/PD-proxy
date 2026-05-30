@@ -35,7 +35,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
 协议: snell (Snell v5) | hy2 (Hysteria2) | vless (VLESS Reality) | anytls
 
 增强选项(环境变量):
-  PD_SNELL_MODE=shadowtls  PD_HY2_HOP=5  PD_VLESS_DEST=...:443  PD_ANYTLS_PADDING=deep
+  PD_SNELL_MODE=shadowtls  PD_SNELL_TLS_VERSION=v3  PD_HY2_HOP=5  PD_VLESS_DEST=...:443
 
 示例:
   bash -c "\$(curl -fsSL ${SCRIPT_URL})"
@@ -86,6 +86,7 @@ die()   { err "$@"; exit 1; }
 PD_OPT_SNELL_MODE="${PD_SNELL_MODE:-standard}"          # standard | shadowtls
 PD_OPT_SNELL_TLS_SNI="${PD_SNELL_TLS_SNI:-www.microsoft.com}"
 PD_OPT_SNELL_TLS_PASS="${PD_SNELL_TLS_PASS:-}"          # 空=自动生成
+PD_OPT_SNELL_TLS_VERSION="${PD_SNELL_TLS_VERSION:-v3}"  # v3 | v2
 
 # HY2 选项
 PD_OPT_HY2_HOP="${PD_HY2_HOP:-0}"                       # 0=单端口, 3 或 5
@@ -768,13 +769,20 @@ snell_output() {
         tls_sni=$(unit_arg_value "--tls" "$svc_file" || echo "")
     fi
     if [ -n "$tls_pass" ]; then
+        local tls_proto="2"
+        grep -q -- '--v3' "$svc_file" 2>/dev/null && tls_proto="3"
         output_header "Snell v4 + ShadowTLS" "$port"
         echo -e "PSK:     ${GREEN}${psk}${RESET}"
         echo -e "TLS密码: ${GREEN}${tls_pass}${RESET}"
         echo -e "TLS SNI: ${GREEN}${tls_sni}${RESET}"
+        if [ "$tls_proto" = "3" ]; then
+            echo -e "协议:    ${GREEN}ShadowTLS v3${RESET}"
+        else
+            echo -e "协议:    ${YELLOW}ShadowTLS v2${RESET}"
+        fi
         echo ""
         echo -e "${CYAN}[Surge 配置]${RESET}"
-        echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}${RESET}"
+        echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}${RESET}"
         output_footer
     else
         output_header "Snell v5" "$port"
@@ -834,12 +842,16 @@ snell_shadowtls_configure() {
     local ext_port="$1" int_port="$2"
     local sni="$PD_OPT_SNELL_TLS_SNI"
     local tls_pass="$PD_OPT_SNELL_TLS_PASS"
+    local tls_version="$PD_OPT_SNELL_TLS_VERSION"
     validate_hostname "$sni" "PD_SNELL_TLS_SNI"
+    case "$tls_version" in v3|3) tls_version="v3" ;; v2|2) tls_version="v2" ;; *) die "PD_SNELL_TLS_VERSION 仅支持 v3 或 v2，当前: $tls_version" ;; esac
     [ -n "$tls_pass" ] || tls_pass=$(rand_pass)
     tls_pass=$(systemd_escape_arg "$tls_pass")
     PD_OPT_SNELL_TLS_PASS="$tls_pass"
+    local v3_arg="--v3"
+    [ "$tls_version" = "v2" ] && v3_arg=""
 
-    step "配置 ShadowTLS (SNI: $sni) ..."
+    step "配置 ShadowTLS ${tls_version} (SNI: $sni) ..."
     local svc="shadowtls-snell"
     local bin
     bin=$(install_shadowtls)
@@ -851,7 +863,7 @@ Requires=snell.service
 
 [Service]
 Type=simple
-ExecStart=${bin} server --listen 0.0.0.0:${ext_port} --server 127.0.0.1:${int_port} --tls ${sni}:443 --password ${tls_pass} --wildcard-sni authed
+ExecStart=${bin} ${v3_arg} server --listen 0.0.0.0:${ext_port} --server 127.0.0.1:${int_port} --tls ${sni}:443 --password ${tls_pass} --wildcard-sni authed
 Restart=always
 RestartSec=5
 LimitNOFILE=32768
@@ -862,7 +874,7 @@ EOF
     systemctl daemon-reload
     systemctl enable "$svc" >/dev/null 2>&1 || true
     systemctl restart "$svc" || { err "ShadowTLS 启动失败，查看 journalctl -u $svc -n 20"; return 1; }
-    info "ShadowTLS 已启动 (端口 $ext_port → Snell $int_port)"
+    info "ShadowTLS ${tls_version} 已启动 (端口 $ext_port → Snell $int_port)"
 }
 
 # ---- Hysteria2 ----
@@ -1608,13 +1620,15 @@ show_config_only() {
     local port=$(state_get "$key" "port")
     case $proto in
         snell)
-            local psk tls_pass tls_sni
+            local psk tls_pass tls_sni tls_proto
             psk=$(conf_value "psk" "$(pdir snell)/snell.conf" || echo "")
             local svc_file="/etc/systemd/system/shadowtls-snell.service"
             if [ -f "$svc_file" ] && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
                 tls_pass=$(unit_password_value "$svc_file" || echo "")
                 tls_sni=$(unit_arg_value "--tls" "$svc_file" || echo "")
-                echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}"
+                tls_proto="2"
+                grep -q -- '--v3' "$svc_file" 2>/dev/null && tls_proto="3"
+                echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}"
             else
                 echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true"
             fi ;;
@@ -2061,6 +2075,18 @@ menu_snell_config() {
                     3) PD_OPT_SNELL_TLS_SNI="cloudflare.com" ;;
                     4) echo -ne "  SNI: "; read -r sni_custom; PD_OPT_SNELL_TLS_SNI="${sni_custom:-www.microsoft.com}" ;;
                     *) PD_OPT_SNELL_TLS_SNI="www.microsoft.com" ;;
+                esac
+                echo ""
+                echo -e "  ${MAGENTA}▸ ShadowTLS 协议版本${RESET}"
+                echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+                echo -e "  ${CYAN}│${RESET} [1] ${GREEN}V3${RESET} 推荐，抗劫持更强             ${CYAN}│${RESET}"
+                echo -e "  ${CYAN}│${RESET} [2] V2 兼容旧客户端                 ${CYAN}│${RESET}"
+                echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+                echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
+                read -r tls_v
+                case "$tls_v" in
+                    2) PD_OPT_SNELL_TLS_VERSION="v2" ;;
+                    *) PD_OPT_SNELL_TLS_VERSION="v3" ;;
                 esac
                 break ;;
             [Bb]) return 1 ;;

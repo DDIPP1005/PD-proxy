@@ -79,6 +79,7 @@ pd --help                 # 帮助
 |------|--------|------|
 | `PD_SNELL_MODE` | `standard` | `shadowtls` 启用 Snell v4 + TLS 伪装 |
 | `PD_SNELL_TLS_SNI` | `www.microsoft.com` | ShadowTLS 伪装域名 |
+| `PD_SNELL_TLS_VERSION` | `v3` | ShadowTLS 协议版本（v3 | v2） |
 | `PD_HY2_HOP` | `0` | Hysteria2 端口跳跃数（3/5） |
 | `PD_VLESS_DEST` | `addons.mozilla.org:443` | Reality 目标 |
 | `PD_ANYTLS_SNI` | 空 | AnyTLS SNI 伪装 |
