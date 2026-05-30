@@ -247,7 +247,17 @@ json_tag_name() {
 snell_manual_html() {
     local timeout
     timeout=$(snell_manual_timeout)
-    curl -fsSL --connect-timeout 2 --max-time "$timeout" "https://manual.nssurge.com/others/snell.html" 2>/dev/null || true
+    curl -fsSL --connect-timeout 2 --max-time "$timeout" "https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell" 2>/dev/null \
+        || curl -fsSL --connect-timeout 2 --max-time "$timeout" "https://manual.nssurge.com/others/snell.html" 2>/dev/null \
+        || true
+}
+
+snell_arch() {
+    case "$ARCH" in
+        amd64) echo "amd64" ;;
+        arm64) echo "aarch64" ;;
+        *) echo "$ARCH" ;;
+    esac
 }
 
 snell_manual_timeout() {
@@ -321,7 +331,7 @@ snell_probe_batch() {
     for probe in "$@"; do
         (
             trap - EXIT ERR
-            probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
+            probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-$(snell_arch).zip"
             curl -fsI --connect-timeout 1 --max-time 3 "$probe_url" >/dev/null 2>&1 && printf '%s\n' "$probe" > "$tmpdir/${probe}"
         ) &
         pids+=("$!")
@@ -342,7 +352,7 @@ snell_probe_batch() {
 
 snell_strict_latest_msg() {
     local major="$1"
-    echo "Snell ${major} 最新版检测失败：$(snell_manual_timeout) 秒内无法读取 Surge 手册。严格最新版模式下拒绝 fallback；可重试或设置 PD_SNELL_MANUAL_TIMEOUT=10"
+    echo "Snell ${major} 最新版检测失败：$(snell_manual_timeout) 秒内无法读取 Snell KB/手册。严格最新版模式下拒绝 fallback；可重试或设置 PD_SNELL_MANUAL_TIMEOUT=10"
 }
 
 snell_manual_fail_msg() {
@@ -770,10 +780,10 @@ snell_get_version() {
         echo "$PD_SNELL_VERSION"
         return 0
     fi
-    # 1. 从 Surge 手册抓取最新版。Snell 没有官方 API，手册是默认权威来源。
+    # 1. 从 Snell KB/手册抓取最新版。Snell 没有官方 API，文档页是默认权威来源。
     # 默认 6 秒内完成：成功则保证最新版；失败则进入可用性 fallback。
     v=$(snell_manual_html \
-        | sed -n 's/.*snell-server-v\(5\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
+        | sed -n 's/.*snell-server-v\(5\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\)-linux-.*/\1/p; s/^### v\(5\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
         | grep -v 'b' | head -1 || true)
     if [ -n "$v" ]; then
         echo "v${v}" > "$cache_file"
@@ -787,7 +797,7 @@ snell_get_version() {
         err "$(snell_strict_latest_msg 5)"
         return 1
     fi
-    warn "无法快速读取 Surge 手册，改用下载源探测可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
+    warn "无法快速读取 Snell KB/手册，改用下载源探测可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
     v=$(snell_probe_latest 5 || true)
     if [ -n "$v" ]; then
         echo "$v" > "$cache_file"
@@ -808,10 +818,10 @@ snell_get_version() {
 snell_v4_get_version() {
     local v cache_file="$BASE_DIR/.snell-v4-version-${ARCH}"
     mkdir -p "$BASE_DIR"
-    # 1. 从 Surge 手册抓取最新版。Snell 没有官方 API，手册是默认权威来源。
+    # 1. 从 Snell KB/手册抓取最新版。Snell 没有官方 API，文档页是默认权威来源。
     # 默认 6 秒内完成：成功则保证最新版；失败则进入可用性 fallback。
     v=$(snell_manual_html \
-        | sed -n 's/.*snell-server-v\(4\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
+        | sed -n 's/.*snell-server-v\(4\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\)-linux-.*/\1/p; s/^### v\(4\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
         | grep -v 'b' | head -1 || true)
     if [ -n "$v" ]; then
         echo "v${v}" > "$cache_file"
@@ -823,7 +833,7 @@ snell_v4_get_version() {
         err "$(snell_strict_latest_msg 4)"
         return 1
     fi
-    warn "无法快速读取 Surge 手册，改用下载源探测 Snell v4 可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
+    warn "无法快速读取 Snell KB/手册，改用下载源探测 Snell v4 可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
     v=$(snell_probe_latest 4 || true)
     if [ -n "$v" ]; then
         echo "$v" > "$cache_file"
@@ -844,7 +854,7 @@ snell_v4_get_version() {
 snell_v4_download() {
     local ver="$1"
     require_version "$ver" "Snell v4"
-    local url="https://dl.nssurge.com/snell/snell-server-${ver}-linux-${ARCH}.zip"
+    local url="https://dl.nssurge.com/snell/snell-server-${ver}-linux-$(snell_arch).zip"
     step "下载 Snell v4 $ver ..."
     mkdir -p "$(pdir snell)"
     local tmpzip
@@ -862,7 +872,7 @@ snell_v4_download() {
 snell_download() {
     local ver="$1"
     require_version "$ver" "Snell"
-    local url="https://dl.nssurge.com/snell/snell-server-${ver}-linux-${ARCH}.zip"
+    local url="https://dl.nssurge.com/snell/snell-server-${ver}-linux-$(snell_arch).zip"
     step "下载 Snell $ver ..."
     mkdir -p "$(pdir snell)"
     local tmpzip
