@@ -154,5 +154,22 @@ PD_ANYTLS_SNI=www.microsoft.com pd --install anytls
 ## 系统要求
 
 - Debian / Ubuntu（amd64 / arm64）
-- bash 4.0+
+- bash 4.0+（macOS 默认 /bin/bash 3.2 不支持，需 brew 安装）
 - root 权限
+
+## 环境变量参考
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PD_SCRIPT_URL` | GitHub raw URL | 脚本下载地址（自建镜像可覆盖） |
+| `PD_SNELL_MODE` | `standard` | `shadowtls` 启用 TLS 伪装 |
+| `PD_SNELL_TLS_SNI` | `www.microsoft.com` | ShadowTLS 伪装域名 |
+| `PD_HY2_HOP` | `0` | Hysteria2 端口跳跃数（3/5） |
+| `PD_VLESS_DEST` | `addons.mozilla.org:443` | Reality 目标地址 |
+| `PD_VLESS_TRANSPORT` | `tcp` | 传输方式（tcp/grpc） |
+| `PD_VLESS_FP` | `chrome` | 浏览器指纹（chrome/ios） |
+| `PD_ANYTLS_SNI` | 空 | AnyTLS SNI 伪装域名 |
+| `PD_ANYTLS_PADDING` | `standard` | 填充模式 |
+| `PD_INSTALL_QR` | `0` | 设为 `1` 安装 qrencode |
+| `PD_SNELL_PROBE_MAX` | `30` | Snell v5 版本探测上限 |
+| `PD_SNELL_V4_PROBE_MAX` | `30` | Snell v4 版本探测上限 |
