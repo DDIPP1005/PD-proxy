@@ -1412,13 +1412,17 @@ install_protocol() {
     local ver=""
     if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
         step "获取 Snell v4 版本..."
-        ver=$(snell_v4_get_version) || die "Snell v4 版本检测失败，已停止安装"
+        if ! ver=$(snell_v4_get_version); then
+            die "Snell v4 版本检测失败，已停止安装"
+        fi
         require_version "$ver" "Snell v4"
         info "版本: $ver"
         snell_v4_download "$ver"
     elif declare -f "${proto}_get_version" >/dev/null 2>&1; then
         step "获取版本..."
-        ver=$("${proto}_get_version") || die "$(pname "$proto") 版本检测失败，已停止安装"
+        if ! ver=$("${proto}_get_version"); then
+            die "$(pname "$proto") 版本检测失败，已停止安装"
+        fi
         require_version "$ver" "$(pname "$proto")"
         info "版本: $ver"
         "${proto}_download" "$ver"
@@ -1557,7 +1561,9 @@ upgrade_protocol() {
     local ver=""
     if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
         step "获取 Snell v4 最新版本..."
-        ver=$(snell_v4_get_version) || die "Snell v4 版本检测失败，已停止升级"
+        if ! ver=$(snell_v4_get_version); then
+            die "Snell v4 版本检测失败，已停止升级"
+        fi
         require_version "$ver" "Snell v4"
         local old_ver=$(state_get "$key" "version")
         if [ "$ver" = "$old_ver" ] && [ -n "$ver" ]; then
@@ -1571,7 +1577,9 @@ upgrade_protocol() {
         info "版本: $old_ver → $ver"
     elif declare -f "${proto}_get_version" >/dev/null 2>&1; then
         step "获取最新版本..."
-        ver=$("${proto}_get_version") || die "$name 版本检测失败，已停止升级"
+        if ! ver=$("${proto}_get_version"); then
+            die "$name 版本检测失败，已停止升级"
+        fi
         require_version "$ver" "$name"
         local old_ver=$(state_get "$key" "version")
         if [ "$ver" = "$old_ver" ] && [ -n "$ver" ]; then
