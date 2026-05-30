@@ -2,7 +2,7 @@
 
 多协议代理一键部署脚本，专为 Surge / Shadowrocket 用户设计。
 
-数据驱动架构，全独立二进制，零运行时依赖。支持 Snell v5、Hysteria2、VLESS Reality、AnyTLS 四种协议。
+数据驱动架构，全独立二进制，零运行时依赖。支持 Snell v5 / Snell v4 (ShadowTLS) / Hysteria2 / VLESS Reality / AnyTLS 四种协议。
 
 ## 一键安装
 
@@ -16,12 +16,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/inst
 
 | 协议 | 内存 | 磁盘 | Surge | Shadowrocket | 备注 |
 |------|------|------|:-----:|:------------:|------|
-| Snell v5 | 5MB | 20MB | ✅ | ✅ | Surge 主力，推荐首选 |
-| Hysteria2 | 18MB | 30MB | ✅ | ✅ | 支持端口跳跃，Surge+小火箭 |
+| Snell v5 | 5MB | 20MB | ✅ | ❌ | Surge 专用，推荐首选 |
+| + ShadowTLS | +3MB | +10MB | ✅ | ❌ | Snell v4 TCP + TLS 伪装 |
+| Hysteria2 | 18MB | 30MB | ✅ | ✅ | 支持端口跳跃 |
 | VLESS Reality | 30MB | 60MB | ❌ | ✅ | 仅 Shadowrocket，Reality 伪装 |
-| AnyTLS | 5MB | 20MB | ⚠️ | ✅ | 新兴协议 (beta) |
+| AnyTLS | 5MB | 20MB | ✅ | ✅ | Surge 官方已支持 |
 
-> ⚠️ Surge 对 AnyTLS 支持未官方确认。VLESS 仅 Shadowrocket 可用。
+> Snell v5 QUIC 仅 Surge 可用。VLESS 仅 Shadowrocket 可用。
 
 ## 管理命令
 
@@ -63,17 +64,19 @@ pd --help                 # 帮助
 
 ### 交互菜单
 
+二级菜单架构（v2.5.0+）：
+
 ```
-安装: 1)Snell 2)HY2 3)VLESS 4)AnyTLS
-管理: u)升级 r)重启 s)停止 S)启动 l)日志
-查看: c)配置行 C)完整配置 e)导出
-系统: b)BBR   d)卸载   R)全部卸载
-      q)退出
+主菜单: 1)安装 2)管理 3)查看 4)系统 Q)退出
+  安装: 1)Snell 2)HY2 3)VLESS 4)AnyTLS
+  管理: 1)升级 2)重启 3)停止 4)启动 5)日志 6)卸载
+  查看: 1)单协议 2)全部配置 3)导出
+  系统: 1)BBR 2)全部卸载
 ```
 
 ## 环境变量
 
-手动指定端口（跳过随机分配）：
+### 端口指定
 
 ```bash
 PD_SNELL_PORT=12345 pd --install snell
@@ -82,13 +85,39 @@ PD_VLESS_PORT=12347 pd --install vless
 PD_ANYTLS_PORT=12348 pd --install anytls
 ```
 
+### Snell + ShadowTLS
+
+```bash
+PD_SNELL_MODE=shadowtls PD_SNELL_TLS_SNI=www.microsoft.com pd --install snell
+```
+
+### Hysteria2 端口跳跃
+
+```bash
+PD_HY2_HOP=3 pd --install hy2   # 3 端口跳跃
+PD_HY2_HOP=5 pd --install hy2   # 5 端口跳跃
+```
+
+### VLESS Reality 自定义
+
+```bash
+PD_VLESS_DEST=swdist.apple.com:443 PD_VLESS_TRANSPORT=grpc PD_VLESS_FP=ios pd --install vless
+```
+
+### AnyTLS 伪装
+
+```bash
+PD_ANYTLS_SNI=www.microsoft.com pd --install anytls
+```
+
 ## 安装路径
 
 | 路径 | 说明 |
 |------|------|
 | `/opt/pd/` | 脚本和状态文件 |
-| `/opt/snell/` | Snell v5 二进制 + 配置 |
-| `/opt/hysteria2/` | Hysteria2 二进制 + 证书 + 配置 |
+| `/opt/snell/` | Snell 二进制 + 配置 |
+| `/opt/shadowtls/` | ShadowTLS 二进制 |
+| `/opt/hysteria/` | Hysteria2 二进制 + 证书 + 配置 |
 | `/opt/xray/` | Xray-core 二进制 + 配置 |
 | `/opt/anytls/` | AnyTLS 二进制 + 密码 |
 | `/usr/local/bin/pd` | pd 命令（→ /opt/pd/install.sh 软链） |
