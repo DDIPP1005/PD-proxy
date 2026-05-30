@@ -7,23 +7,10 @@
 ## 安装
 
 ```bash
-# 方式一：下载脚本文件后运行（推荐）
-curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh -o /tmp/pd.sh
-bash /tmp/pd.sh
-
-# 方式二：bash -c 子 shell（无需落盘）
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh)"
-
-# 方式三：进程替换
-bash <(curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh)
-
-# 直接安装指定协议
-bash /tmp/pd.sh --install snell
 ```
 
-> 不支持 `curl ... | bash` 管道方式，stdin 会被脚本占用导致交互菜单无法读取键盘。
-
-安装后通过 `pd` 命令管理。首次运行进入交互菜单，后续每次自动显示状态面板。
+安装后通过 `pd` 命令管理。
 
 ## 协议
 
@@ -52,7 +39,6 @@ pd --install hy2          # 安装 Hysteria2
 pd --install vless        # 安装 VLESS Reality
 pd --install anytls       # 安装 AnyTLS
 pd --uninstall snell      # 卸载指定协议
-pd --uninstall all        # 卸载全部（需确认）
 pd --remove-all --yes     # 静默卸载全部
 
 # 服务管理
@@ -87,41 +73,16 @@ pd --help                 # 帮助
   系统: 1)BBR 2)全部卸载
 ```
 
-## 环境变量
+## 环境变量参考
 
-### 端口指定
-
-```bash
-PD_SNELL_PORT=12345 pd --install snell
-PD_HY2_PORT=12346   pd --install hy2
-PD_VLESS_PORT=12347 pd --install vless
-PD_ANYTLS_PORT=12348 pd --install anytls
-```
-
-### Snell + ShadowTLS
-
-```bash
-PD_SNELL_MODE=shadowtls PD_SNELL_TLS_SNI=www.microsoft.com pd --install snell
-```
-
-### Hysteria2 端口跳跃
-
-```bash
-PD_HY2_HOP=3 pd --install hy2   # 3 端口跳跃
-PD_HY2_HOP=5 pd --install hy2   # 5 端口跳跃
-```
-
-### VLESS Reality 自定义
-
-```bash
-PD_VLESS_DEST=swdist.apple.com:443 PD_VLESS_TRANSPORT=grpc PD_VLESS_FP=ios pd --install vless
-```
-
-### AnyTLS 伪装
-
-```bash
-PD_ANYTLS_SNI=www.microsoft.com pd --install anytls
-```
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
+| `PD_SNELL_MODE` | `standard` | `shadowtls` 启用 Snell v4 + TLS 伪装 |
+| `PD_SNELL_TLS_SNI` | `www.microsoft.com` | ShadowTLS 伪装域名 |
+| `PD_HY2_HOP` | `0` | Hysteria2 端口跳跃数（3/5） |
+| `PD_VLESS_DEST` | `addons.mozilla.org:443` | Reality 目标 |
+| `PD_ANYTLS_SNI` | 空 | AnyTLS SNI 伪装 |
+| `PD_SCRIPT_URL` | GitHub raw URL | 脚本地址（自建镜像可覆盖） |
 
 ## 安装路径
 
@@ -156,20 +117,3 @@ PD_ANYTLS_SNI=www.microsoft.com pd --install anytls
 - Debian / Ubuntu（amd64 / arm64）
 - bash 4.0+（macOS 默认 /bin/bash 3.2 不支持，需 brew 安装）
 - root 权限
-
-## 环境变量参考
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `PD_SCRIPT_URL` | GitHub raw URL | 脚本下载地址（自建镜像可覆盖） |
-| `PD_SNELL_MODE` | `standard` | `shadowtls` 启用 TLS 伪装 |
-| `PD_SNELL_TLS_SNI` | `www.microsoft.com` | ShadowTLS 伪装域名 |
-| `PD_HY2_HOP` | `0` | Hysteria2 端口跳跃数（3/5） |
-| `PD_VLESS_DEST` | `addons.mozilla.org:443` | Reality 目标地址 |
-| `PD_VLESS_TRANSPORT` | `tcp` | 传输方式（tcp/grpc） |
-| `PD_VLESS_FP` | `chrome` | 浏览器指纹（chrome/ios） |
-| `PD_ANYTLS_SNI` | 空 | AnyTLS SNI 伪装域名 |
-| `PD_ANYTLS_PADDING` | `standard` | 填充模式 |
-| `PD_INSTALL_QR` | `0` | 设为 `1` 安装 qrencode |
-| `PD_SNELL_PROBE_MAX` | `30` | Snell v5 版本探测上限 |
-| `PD_SNELL_V4_PROBE_MAX` | `30` | Snell v4 版本探测上限 |
