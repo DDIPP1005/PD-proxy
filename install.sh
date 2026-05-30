@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.7.5
+# PD-proxy — 多协议代理一键部署脚本 v2.7.6
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.7.5"
+VERSION="2.7.6"
 SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
@@ -609,7 +609,7 @@ snell_output() {
         echo -e "TLS SNI: ${GREEN}${tls_sni}${RESET}"
         echo ""
         echo -e "${CYAN}[Surge 配置]${RESET}"
-        echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni}${RESET}"
+        echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}${RESET}"
         output_footer
     else
         output_header "Snell v5" "$port"
@@ -626,7 +626,9 @@ snell_output() {
 # ============================================================
 
 install_shadowtls() {
-    local dir="/opt/shadowtls" bin="$dir/shadow-tls"
+    local dir bin
+    dir="/opt/shadowtls"
+    bin="$dir/shadow-tls"
     [ -x "$bin" ] && { info "ShadowTLS 已安装" >&2; echo "$bin"; return 0; }
 
     step "下载 ShadowTLS ..." >&2
@@ -669,7 +671,7 @@ Requires=snell.service
 
 [Service]
 Type=simple
-ExecStart=${bin} server --listen 0.0.0.0:${ext_port} --server 127.0.0.1:${int_port} --tls ${sni} --password ${tls_pass}
+ExecStart=${bin} server --listen 0.0.0.0:${ext_port} --server 127.0.0.1:${int_port} --tls ${sni}:443 --password ${tls_pass} --wildcard-sni authed
 Restart=always
 RestartSec=5
 LimitNOFILE=32768
@@ -1322,7 +1324,7 @@ show_config_only() {
                 tls_sni=$(grep -oP -- '--tls \K\S+' "$svc_file" 2>/dev/null || echo "")
                 [ -z "$tls_pass" ] && tls_pass=$(grep -oP 'password\s+\K\S+' "$svc_file" 2>/dev/null | tr -d '\\\n' || echo "")
                 [ -z "$tls_sni" ] && tls_sni=$(grep -oP -- '--tls\s+\K\S+' "$svc_file" 2>/dev/null | tr -d '\\\n' || echo "")
-                echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni}"
+                echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}"
             else
                 echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true"
             fi ;;
