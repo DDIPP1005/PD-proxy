@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v2.7.9
+# PD-proxy — 多协议代理一键部署脚本 v3.0.0
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -10,9 +10,9 @@
 set -euo pipefail
 
 # bash 4.0+ 必需（关联数组）
-[ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
+[ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="2.7.9"
+VERSION="3.0.0"
 SCRIPT_URL="${PD_SCRIPT_URL:-https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh}"
 
 # 纯查询命令，不需要锁和 root
@@ -39,7 +39,8 @@ PD-proxy v${VERSION} — 多协议代理一键部署
 
 示例:
   bash install-fixed.sh --install snell
-  bash -c "$(curl -fsSL ${SCRIPT_URL})"
+  bash -c "\$(curl -fsSL ${SCRIPT_URL})"
+  bash -c "\$(curl -fsSL ${SCRIPT_URL})" pd --install snell
   PD_HY2_HOP=5 pd --install hy2
 EOF
         exit 0 ;;
@@ -47,14 +48,14 @@ EOF
         echo "PD-proxy v${VERSION}"; exit 0 ;;
 esac
 
-# 不支持 `curl ... | bash` 直接管道运行：stdin 会被脚本占用，交互菜单无法读取键盘。
-# 请使用 `bash -c "$(curl -fsSL URL)"` 或 `bash <(curl -fsSL URL)`。
-if [ ! -t 0 ]; then
+# 无参数交互菜单不能用 `curl ... | bash`：stdin 会被脚本内容占用，菜单无法读取键盘。
+# 带参数 CLI 允许非终端运行，便于自动化；持久化由 self_install 单独处理。
+if [ "$#" -eq 0 ] && [ ! -t 0 ]; then
     echo "不能使用管道方式运行交互菜单，请改用：" >&2
     echo "  bash -c \"\$(curl -fsSL ${SCRIPT_URL})\"" >&2
     echo "  bash <(curl -fsSL ${SCRIPT_URL})" >&2
     echo "非交互安装也建议：" >&2
-    echo "  bash -c \"\$(curl -fsSL ${SCRIPT_URL})\" -- --install snell" >&2
+    echo "  bash -c \"\$(curl -fsSL ${SCRIPT_URL})\" pd --install snell" >&2
     exit 1
 fi
 
@@ -105,6 +106,9 @@ PD_OPT_VLESS_FP="${PD_VLESS_FP:-chrome}"                # chrome | firefox | saf
 PD_OPT_ANYTLS_PADDING="${PD_ANYTLS_PADDING:-standard}"  # standard | deep | fixed | none
 PD_OPT_ANYTLS_SNI="${PD_ANYTLS_SNI:-}"                  # 空=不伪装
 
+# 轻量化选项
+PD_OPT_INSTALL_QR="${PD_INSTALL_QR:-0}"                  # 1=安装 qrencode 生成二维码
+
 # 并发锁
 exec 200>"$LOCK_FILE"
 flock -n 200 || die "已有 PD-proxy 进程在运行，请稍后再试"
@@ -127,8 +131,8 @@ check_root() {
 
 detect_os() {
     if [ -f /etc/os-release ]; then
-        OS_ID=$(grep -oP '^ID=\K.+' /etc/os-release 2>/dev/null | tr -d '"' || echo "unknown")
-        OS_PRETTY=$(grep -oP '^PRETTY_NAME=\K.+' /etc/os-release 2>/dev/null | tr -d '"' || echo "unknown")
+        OS_ID=$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '"' || echo "unknown")
+        OS_PRETTY=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release 2>/dev/null | tr -d '"' || echo "unknown")
     else
         OS_ID="unknown"
         OS_PRETTY="unknown"
@@ -205,7 +209,7 @@ rand_port() {
         local p=$(( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
         if ! echo "$used_ports" | grep -q " $p "; then
             # 额外检查：确保端口未被非 PD 服务占用
-            if ss -tlnp 2>/dev/null | grep -q ":${p} "; then
+            if ss -tlnp 2>/dev/null | grep -q ":${p} " || ss -ulnp 2>/dev/null | grep -q ":${p} "; then
                 attempts=$((attempts + 1))
                 continue
             fi
@@ -238,6 +242,39 @@ json_escape() {
     s=${s//$'\r'/\\r}
     s=${s//$'\t'/\\t}
     printf '%s' "$s"
+}
+
+json_tag_name() {
+    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+}
+
+state_field_from_line() {
+    local field="$1"
+    tr ' ' '\n' | sed -n "s/^${field}=//p" | head -1
+}
+
+conf_value() {
+    local key="$1" file="$2"
+    sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$file" 2>/dev/null | head -1
+}
+
+yaml_value() {
+    local key="$1" file="$2"
+    sed -n "s/^[[:space:]]*${key}:[[:space:]]*//p" "$file" 2>/dev/null | head -1
+}
+
+json_value() {
+    local key="$1" file="$2"
+    sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" "$file" 2>/dev/null | head -1
+}
+
+unit_arg_value() {
+    local arg="$1" file="$2"
+    tr ' ' '\n' < "$file" 2>/dev/null | awk -v arg="$arg" '$0 == arg { getline; print; exit }'
+}
+
+unit_password_value() {
+    unit_arg_value "--password" "$1"
 }
 
 systemd_escape_arg() {
@@ -390,6 +427,8 @@ add_firewall() {
         iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
         iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
         save_iptables
+    else
+        warn "未检测到 ufw/iptables，请确认云防火墙已放行端口 $port"
     fi
 }
 
@@ -406,13 +445,18 @@ del_firewall() {
 }
 
 install_deps() {
+    local proto="${1:-}"
     local missing=""
     command -v curl >/dev/null 2>&1 || missing="$missing curl"
-    command -v unzip >/dev/null 2>&1 || missing="$missing unzip"
+    [ -f /etc/ssl/certs/ca-certificates.crt ] || missing="$missing ca-certificates"
     command -v openssl >/dev/null 2>&1 || missing="$missing openssl"
     command -v ss >/dev/null 2>&1 || missing="$missing iproute2"
-    command -v iptables >/dev/null 2>&1 || missing="$missing iptables"
-    command -v nft >/dev/null 2>&1 || missing="$missing nftables"
+    case "$proto" in
+        snell|vless|anytls) command -v unzip >/dev/null 2>&1 || missing="$missing unzip" ;;
+    esac
+    if [ "$proto" = "hy2" ] && [ "${PD_OPT_HY2_HOP:-0}" -ge 3 ] 2>/dev/null; then
+        command -v nft >/dev/null 2>&1 || missing="$missing nftables"
+    fi
     [ -z "$missing" ] && return 0
     info "安装依赖: $missing"
     apt-get update -qq || die "apt-get update 失败，请检查网络"
@@ -420,15 +464,22 @@ install_deps() {
 }
 
 install_qrencode() {
-    command -v qrencode >/dev/null 2>&1 && return 0
+    if command -v qrencode >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ "$PD_OPT_INSTALL_QR" != "1" ]; then
+        return 0
+    fi
     info "安装 qrencode..."
     apt-get update -qq 2>/dev/null || true
     apt-get install -y -qq qrencode >/dev/null 2>&1 || warn "qrencode 安装失败，跳过二维码生成"
+    return 0
 }
 
 gen_qr() {
-    command -v qrencode >/dev/null 2>&1 || return
+    command -v qrencode >/dev/null 2>&1 || return 0
     echo "$1" | qrencode -t ANSIUTF8 -m 1 -s 1 -r /dev/stdin 2>/dev/null || true
+    return 0
 }
 
 # ============================================================
@@ -441,7 +492,7 @@ state_get() {
     [ -f "$STATE_FILE" ] || { echo ""; return; }
     local line
     line=$(grep "^${key} " "$STATE_FILE" 2>/dev/null) || { echo ""; return; }
-    echo "$line" | grep -oP "${field}=\\K\\S+" 2>/dev/null || echo ""
+    echo "$line" | state_field_from_line "$field" || echo ""
 }
 
 state_set() {
@@ -454,7 +505,7 @@ state_set() {
         mv "${STATE_FILE}.tmp" "$STATE_FILE"
     fi
     if echo "$line" | grep -q "${field}="; then
-        line=$(echo "$line" | sed "s/${field}=\\S*/${field}=${value}/")
+        line=$(echo "$line" | awk -v f="$field" -v v="$value" '{ for (i=1; i<=NF; i++) if ($i ~ "^" f "=") $i=f "=" v; print }')
     else
         if [ -n "$line" ]; then
             line="${line} ${field}=${value}"
@@ -468,7 +519,7 @@ state_set() {
 
 state_del() {
     local key="$1"
-    [ -f "$STATE_FILE" ] || return
+    [ -f "$STATE_FILE" ] || return 0
     grep -v "^${key} " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
     mv "${STATE_FILE}.tmp" "$STATE_FILE"
 }
@@ -481,8 +532,8 @@ state_installed() {
 }
 
 get_all_ports() {
-    [ -f "$STATE_FILE" ] || return
-    grep -oP 'port=\K\S+' "$STATE_FILE" 2>/dev/null
+    [ -f "$STATE_FILE" ] || return 0
+    tr ' ' '\n' < "$STATE_FILE" | sed -n 's/^port=//p'
 }
 
 # ============================================================
@@ -608,36 +659,26 @@ snell_get_version() {
         echo "$PD_SNELL_VERSION"
         return 0
     fi
-    # 1. 尝试缓存
-    if [ -f "$cache_file" ] && [ "$(($(date +%s) - $(stat -c%Y "$cache_file" 2>/dev/null || stat -f%m "$cache_file" 2>/dev/null || echo 0)))" -lt 86400 ]; then
-        v=$(cat "$cache_file")
-        # 验证版本是否仍可下载
-        local test_url="https://dl.nssurge.com/snell/snell-server-${v}-linux-${ARCH}.zip"
-        if curl -fsI --max-time 10 "$test_url" >/dev/null 2>&1; then
-            echo "$v"; return 0
-        fi
-    fi
-    # 2. 从 Surge 手册抓取
+    # 1. 从 Surge 手册抓取
     v=$(curl -fs --max-time 15 "https://manual.nssurge.com/others/snell.html" 2>/dev/null \
-        | grep -oP 'snell-server-v\K5\.[0-9]+\.[0-9]+[a-z0-9]*' \
-        | grep -v 'b' | head -1)
+        | sed -n 's/.*snell-server-v\(5\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
+        | grep -v 'b' | head -1 || true)
     if [ -n "$v" ]; then
         echo "v${v}" | tee "$cache_file"; return 0
     fi
-    # 3. 级联探测（5.1探3次，5.0全探到底 — v5.0.1是amd64唯一可用版本）
-    for ver_prefix in "5.1" "5.0"; do
-        local minor=10
-        local group_limit=3
-        [ "$ver_prefix" = "5.0" ] && group_limit=10
-        local group_count=0
-        while [ $minor -ge 1 ] && [ $group_count -lt $group_limit ]; do
+    # 2. 级联 HEAD 探测：Surge 手册临时不可用时仍尽量找到最新版。
+    local max_minor="${PD_SNELL_PROBE_MAX:-30}"
+    [[ "$max_minor" =~ ^[0-9]+$ ]] || max_minor=30
+    [ "$max_minor" -gt 100 ] && max_minor=100
+    for ver_prefix in "5.9" "5.8" "5.7" "5.6" "5.5" "5.4" "5.3" "5.2" "5.1" "5.0"; do
+        local minor=$max_minor
+        while [ $minor -ge 0 ]; do
             local probe="v${ver_prefix}.${minor}"
             local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
             if curl -fsI --max-time 10 "$probe_url" >/dev/null 2>&1; then
                 echo "$probe" | tee "$cache_file"; return 0
             fi
             minor=$((minor - 1))
-            group_count=$((group_count + 1))
         done
     done
     die "Snell 版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v5.0.x"
@@ -646,25 +687,20 @@ snell_get_version() {
 snell_v4_get_version() {
     local v cache_file="$BASE_DIR/.snell-v4-version-${ARCH}"
     mkdir -p "$BASE_DIR"
-    # 1. 尝试缓存
-    if [ -f "$cache_file" ] && [ "$(($(date +%s) - $(stat -c%Y "$cache_file" 2>/dev/null || stat -f%m "$cache_file" 2>/dev/null || echo 0)))" -lt 86400 ]; then
-        v=$(cat "$cache_file")
-        local test_url="https://dl.nssurge.com/snell/snell-server-${v}-linux-${ARCH}.zip"
-        if curl -fsI --max-time 10 "$test_url" >/dev/null 2>&1; then
-            echo "$v"; return 0
-        fi
-    fi
-    # 2. 从 Surge 手册抓取
+    # 1. 从 Surge 手册抓取
     v=$(curl -fs --max-time 15 "https://manual.nssurge.com/others/snell.html" 2>/dev/null \
-        | grep -oP 'snell-server-v\K4\.[0-9]+\.[0-9]+[a-z0-9]*' \
-        | grep -v 'b' | head -1)
+        | sed -n 's/.*snell-server-v\(4\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
+        | grep -v 'b' | head -1 || true)
     if [ -n "$v" ]; then
         echo "v${v}" | tee "$cache_file"; return 0
     fi
-    # 3. 级联探测 v4.1.x → v4.0.x（Surge 手册可能临时不可用）
+    # 2. 级联 HEAD 探测 v4.x（Surge 手册可能临时不可用）
     local ver_prefix minor
-    for ver_prefix in "4.1" "4.0"; do
-        minor=10
+    local max_minor="${PD_SNELL_V4_PROBE_MAX:-30}"
+    [[ "$max_minor" =~ ^[0-9]+$ ]] || max_minor=30
+    [ "$max_minor" -gt 100 ] && max_minor=100
+    for ver_prefix in "4.9" "4.8" "4.7" "4.6" "4.5" "4.4" "4.3" "4.2" "4.1" "4.0"; do
+        minor=$max_minor
         while [ $minor -ge 0 ]; do
             local probe="v${ver_prefix}.${minor}"
             local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
@@ -734,11 +770,8 @@ snell_output() {
     local svc_file="/etc/systemd/system/shadowtls-snell.service"
     if [ -f "$svc_file" ] && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
         # 主提取（脚本生成的标准单行 ExecStart）
-        tls_pass=$(grep -oP 'password \K\S+' "$svc_file" 2>/dev/null || echo "")
-        tls_sni=$(grep -oP -- '--tls \K\S+' "$svc_file" 2>/dev/null || echo "")
-        # 回退：手动编辑/多行 ExecStart 场景
-        [ -z "$tls_pass" ] && tls_pass=$(grep -oP 'password\s+\K\S+' "$svc_file" 2>/dev/null | tr -d '\\\n' || echo "")
-        [ -z "$tls_sni" ] && tls_sni=$(grep -oP -- '--tls\s+\K\S+' "$svc_file" 2>/dev/null | tr -d '\\\n' || echo "")
+        tls_pass=$(unit_password_value "$svc_file" || echo "")
+        tls_sni=$(unit_arg_value "--tls" "$svc_file" || echo "")
     fi
     if [ -n "$tls_pass" ]; then
         output_header "Snell v4 + ShadowTLS" "$port"
@@ -770,12 +803,12 @@ install_shadowtls() {
 
     local ver
     ver=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" 2>/dev/null \
-        | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
+        | json_tag_name || true)
     [ -n "$ver" ] || die "ShadowTLS 版本检测失败"
 
     if [ -x "$bin" ]; then
         local current_ver
-        current_ver=$("$bin" --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "")
+        current_ver=$("$bin" --version 2>/dev/null | sed -n 's/.*\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | head -1 || echo "")
         if [ "v${current_ver}" = "$ver" ]; then
             info "ShadowTLS 已是最新版 $ver" >&2
             echo "$bin"
@@ -842,7 +875,7 @@ EOF
 hy2_get_version() {
     local v
     v=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
-        | grep -oP '"tag_name":\s*"app/\K[^"]+' | head -1)
+        | json_tag_name | sed 's#^app/##' || true)
     [ -n "$v" ] && echo "$v" || die "Hysteria2 版本检测失败，请检查 GitHub 是否可达"
 }
 
@@ -948,7 +981,7 @@ hy2_output() {
 vless_get_version() {
     local v
     v=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-        | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
+        | json_tag_name || true)
     [ -n "$v" ] && echo "$v" || die "Xray 版本检测失败，请检查 GitHub 是否可达"
 }
 
@@ -1079,7 +1112,7 @@ vless_output() {
 anytls_get_version() {
     local v
     v=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null \
-        | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
+        | json_tag_name || true)
     [ -n "$v" ] && echo "$v" || die "AnyTLS 版本检测失败，请检查 GitHub 是否可达"
 }
 
@@ -1175,7 +1208,7 @@ install_protocol() {
     fi
     title "安装 $display_name"
 
-    install_deps; install_qrencode
+    install_deps "$proto"; install_qrencode
     check_disk "$(pdisk "$proto")"
     if state_installed "$key"; then
         # 模式切换提示
@@ -1184,8 +1217,10 @@ install_protocol() {
             [ -f /etc/systemd/system/shadowtls-snell.service ] && cur_sts=true
             [ "$PD_OPT_SNELL_MODE" = "shadowtls" ] && want_sts=true
             if [ "$cur_sts" != "$want_sts" ]; then
-                warn "已安装模式与目标模式不同，请先 pd --uninstall snell 再重装"
-                return 1
+                warn "检测到 Snell 模式不同，自动切换到目标模式..."
+                uninstall_protocol snell
+                install_protocol snell
+                return 0
             fi
         fi
         warn "$name 已安装，执行最新版检查..."
@@ -1372,6 +1407,8 @@ upgrade_protocol() {
 
     # 检查磁盘空间
     check_disk "$(pdisk "$proto")"
+    local was_active=false
+    systemctl is-active --quiet "$svc" 2>/dev/null && was_active=true
 
     local ver=""
     if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
@@ -1381,7 +1418,9 @@ upgrade_protocol() {
         if [ "$ver" = "$old_ver" ] && [ -n "$ver" ]; then
             info "Snell v4 已是最新版 ($ver)"
             install_shadowtls >/dev/null
-            systemctl restart shadowtls-snell 2>/dev/null || warn "ShadowTLS 启动失败"
+            if $was_active; then
+                systemctl restart shadowtls-snell 2>/dev/null || warn "ShadowTLS 启动失败"
+            fi
             return 0
         fi
         info "版本: $old_ver → $ver"
@@ -1412,15 +1451,24 @@ upgrade_protocol() {
             mv '$bin_bak' '$bin' 2>/dev/null || true
             chmod +x '$bin' 2>/dev/null || true
         fi
-        systemctl start '$svc' 2>/dev/null || true
-        if [ '$proto' = 'snell' ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
-            systemctl start shadowtls-snell 2>/dev/null || true
+        if $was_active; then
+            systemctl start '$svc' 2>/dev/null || true
+            if [ '$proto' = 'snell' ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+                systemctl start shadowtls-snell 2>/dev/null || true
+            fi
+        else
+            systemctl stop '$svc' 2>/dev/null || true
+            if [ '$proto' = 'snell' ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+                systemctl stop shadowtls-snell 2>/dev/null || true
+            fi
         fi
         if [ '$proto' = 'hy2' ]; then
             _pd_hop=\$(state_get '$key' 'hop')
             _pd_port=\$(state_get '$key' 'port')
-            if [ "\${_pd_hop:-0}" -ge 3 ] 2>/dev/null; then
+            if $was_active && [ "\${_pd_hop:-0}" -ge 3 ] 2>/dev/null; then
                 setup_hy2_hop_rules "\$_pd_port" "\$_pd_hop" 2>/dev/null || true
+            elif [ "\${_pd_hop:-0}" -ge 3 ] 2>/dev/null; then
+                clear_hy2_hop_rules 2>/dev/null || true
             fi
         fi
         die '升级失败，已尝试恢复旧服务'
@@ -1433,7 +1481,7 @@ upgrade_protocol() {
         "${proto}_download" "$ver"
     fi
 
-    step "启动服务..."
+    step "验证新版本..."
     if systemctl start "$svc" 2>/dev/null; then
         rm -f "$bin_bak"
     else
@@ -1449,7 +1497,9 @@ upgrade_protocol() {
     # Snell + ShadowTLS: Requires= 只传播 stop 不传播 start，需手动拉起
     if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
         install_shadowtls >/dev/null
-        systemctl restart shadowtls-snell 2>/dev/null || warn "ShadowTLS 启动失败"
+        if $was_active; then
+            systemctl restart shadowtls-snell 2>/dev/null || warn "ShadowTLS 启动失败"
+        fi
     fi
     if [ "$proto" = "hy2" ]; then
         local port hop
@@ -1461,6 +1511,15 @@ upgrade_protocol() {
     fi
 
     state_set "$key" "version" "$ver"
+    if ! $was_active; then
+        systemctl stop "$svc" 2>/dev/null || true
+        if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+            systemctl stop shadowtls-snell 2>/dev/null || true
+        fi
+        if [ "$proto" = "hy2" ]; then
+            clear_hy2_hop_rules
+        fi
+    fi
     trap - ERR
     info "$name 升级完成"
 }
@@ -1556,20 +1615,18 @@ show_config_only() {
     case $proto in
         snell)
             local psk tls_pass tls_sni
-            psk=$(grep -oP 'psk\s*=\s*\K.+' "$(pdir snell)/snell.conf" 2>/dev/null || echo "")
+            psk=$(conf_value "psk" "$(pdir snell)/snell.conf" || echo "")
             local svc_file="/etc/systemd/system/shadowtls-snell.service"
             if [ -f "$svc_file" ] && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
-                tls_pass=$(grep -oP 'password \K\S+' "$svc_file" 2>/dev/null || echo "")
-                tls_sni=$(grep -oP -- '--tls \K\S+' "$svc_file" 2>/dev/null || echo "")
-                [ -z "$tls_pass" ] && tls_pass=$(grep -oP 'password\s+\K\S+' "$svc_file" 2>/dev/null | tr -d '\\\n' || echo "")
-                [ -z "$tls_sni" ] && tls_sni=$(grep -oP -- '--tls\s+\K\S+' "$svc_file" 2>/dev/null | tr -d '\\\n' || echo "")
+                tls_pass=$(unit_password_value "$svc_file" || echo "")
+                tls_sni=$(unit_arg_value "--tls" "$svc_file" || echo "")
                 echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}"
             else
                 echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true"
             fi ;;
         hy2)
             local pass hop
-            pass=$(grep -oP 'password:\s*\K.+' "$(pdir hy2)/config.yaml" 2>/dev/null || echo "")
+            pass=$(yaml_value "password" "$(pdir hy2)/config.yaml" || echo "")
             hop=$(state_get "$key" "hop")
             if [ "$hop" -ge 3 ] 2>/dev/null; then
                 local last_port=$((port + hop - 1))
@@ -1586,7 +1643,7 @@ show_config_only() {
             echo "# Shadowrocket: hysteria2://${pass}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2" ;;
         vless)
             local uuid pubkey shortid dest transport fp dest_host
-            uuid=$(grep -oP '"id":\s*"\K[^"]+' "$(pdir vless)/config.json" 2>/dev/null | head -1 || echo "")
+            uuid=$(json_value "id" "$(pdir vless)/config.json" || echo "")
             pubkey=$(cat "$(pdir vless)/.pubkey" 2>/dev/null || echo "")
             shortid=$(cat "$(pdir vless)/.shortid" 2>/dev/null || echo "")
             dest=$(cat "$(pdir vless)/.dest" 2>/dev/null || echo "addons.mozilla.org:443")
@@ -1673,15 +1730,15 @@ show_config() {
         case $proto in
             snell)
                 local psk
-                psk=$(grep -oP 'psk\s*=\s*\K.+' "$(pdir snell)/snell.conf" 2>/dev/null || echo "未知")
+                psk=$(conf_value "psk" "$(pdir snell)/snell.conf" || echo "未知")
                 snell_output "$port" "$psk" ;;
             hy2)
                 local pass
-                pass=$(grep -oP 'password:\s*\K.+' "$(pdir hy2)/config.yaml" 2>/dev/null || echo "未知")
+                pass=$(yaml_value "password" "$(pdir hy2)/config.yaml" || echo "未知")
                 hy2_output "$port" "$pass" ;;
             vless)
                 local uuid
-                uuid=$(grep -oP '"id":\s*"\K[^"]+' "$(pdir vless)/config.json" 2>/dev/null | head -1 || echo "未知")
+                uuid=$(json_value "id" "$(pdir vless)/config.json" || echo "未知")
                 vless_output "$port" "$uuid" ;;
             anytls)
                 local pass
@@ -1750,7 +1807,11 @@ self_install() {
     # 直接运行修复版时，优先安装当前脚本，避免后续 pd 命令回退到 GitHub 原版。
     local source_path="${BASH_SOURCE[0]}"
     local source_is_file=false
-    [ -n "$source_path" ] && [ "$source_path" != "bash" ] && [ "$source_path" != "-" ] && [ -r "$source_path" ] && source_is_file=true
+    case "$source_path" in
+        ""|bash|-|pd) ;;
+        /dev/fd/*|/proc/*/fd/*) ;;
+        *) [ -r "$source_path" ] && source_is_file=true ;;
+    esac
     local install_from_url=false
     [ -n "${SCRIPT_URL:-}" ] && install_from_url=true
     if [ "${PD_UPDATE:-}" = "1" ]; then

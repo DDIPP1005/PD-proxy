@@ -2,7 +2,7 @@
 
 多协议代理一键部署脚本，专为 Surge / Shadowrocket 用户设计。
 
-数据驱动架构，全独立二进制，零运行时依赖。支持 Snell v5 / Snell v4 (ShadowTLS) / Hysteria2 / VLESS Reality / AnyTLS 四种协议。
+数据驱动架构，全独立二进制，零运行时依赖。支持 Snell v5 / Snell v4 (ShadowTLS) / Hysteria2 / VLESS Reality / AnyTLS 五种模式。
 
 ## 安装
 
