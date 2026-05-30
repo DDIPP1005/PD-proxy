@@ -1983,26 +1983,24 @@ self_install() {
             cp "$source_path" "$BASE_DIR/install.sh"
             chmod +x "$BASE_DIR/install.sh"
         fi
+    elif $install_from_url; then
+        local tmp_pd
+        tmp_pd=$(mktemp_pd)
+        curl -fsSL "$SCRIPT_URL" -o "$tmp_pd" || {
+            rm -f "$tmp_pd"
+            warn "无法从 SCRIPT_URL 同步脚本: $SCRIPT_URL"
+            return 1
+        }
+        bash -n "$tmp_pd" 2>/dev/null || {
+            rm -f "$tmp_pd"
+            warn "下载到的脚本语法校验失败，无法持久化 pd 命令"
+            return 1
+        }
+        mv "$tmp_pd" "$BASE_DIR/install.sh"
+        chmod +x "$BASE_DIR/install.sh"
     elif [ ! -f "$BASE_DIR/install.sh" ]; then
-        if $install_from_url; then
-            local tmp_pd
-            tmp_pd=$(mktemp_pd)
-            curl -fsSL "$SCRIPT_URL" -o "$tmp_pd" || {
-                rm -f "$tmp_pd"
-                warn "无法从 SCRIPT_URL 同步脚本: $SCRIPT_URL"
-                return 1
-            }
-            bash -n "$tmp_pd" 2>/dev/null || {
-                rm -f "$tmp_pd"
-                warn "下载到的脚本语法校验失败，无法持久化 pd 命令"
-                return 1
-            }
-            mv "$tmp_pd" "$BASE_DIR/install.sh"
-            chmod +x "$BASE_DIR/install.sh"
-        else
             warn "当前脚本不是文件，无法持久化 pd 命令；请设置 PD_SCRIPT_URL 或下载后运行"
             return 1
-        fi
     fi
     ln -sf "$BASE_DIR/install.sh" "$INSTALLED_BIN" 2>/dev/null || true
 }
