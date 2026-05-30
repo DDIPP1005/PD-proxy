@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v3.6.8
+# PD-proxy — 多协议代理一键部署脚本 v3.7.1
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="3.6.8"
+VERSION="3.7.1"
 SCRIPT_URL="${PD_SCRIPT_URL:-https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh}"
 
 # 纯查询命令，不需要锁和 root
@@ -2471,7 +2471,7 @@ xanmod_supported_codename() {
 }
 
 check_xanmod_disk_space() {
-    local root_avail boot_avail
+    local root_avail boot_avail var_avail
     root_avail=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
     [[ "$root_avail" =~ ^[0-9]+$ ]] || root_avail=0
     if [ "$root_avail" -lt 1200 ]; then
@@ -2488,7 +2488,92 @@ check_xanmod_disk_space() {
             return 1
         fi
     fi
+    if mountpoint -q /var 2>/dev/null; then
+        var_avail=$(df -Pm /var 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
+        [[ "$var_avail" =~ ^[0-9]+$ ]] || var_avail=0
+        if [ "$var_avail" -lt 600 ]; then
+            warn "/var 可用空间不足：${var_avail}MB，APT 下载内核包建议至少 600MB"
+            warn "请先清理 /var/cache/apt 或扩大 /var 分区"
+            return 1
+        fi
+    fi
     return 0
+}
+
+ensure_xanmod_swap() {
+    PD_XANMOD_SWAP_CREATED=0
+    PD_XANMOD_SWAP_FSTAB_BAK=""
+    local mem_total swap_total root_avail swap_mb=0 need_mb ans fstab_bak
+    mem_total=$(free -m 2>/dev/null | awk '/^Mem:/{print $2}' || echo 0)
+    swap_total=$(free -m 2>/dev/null | awk '/^Swap:/{print $2}' || echo 0)
+    [[ "$mem_total" =~ ^[0-9]+$ ]] || mem_total=0
+    [[ "$swap_total" =~ ^[0-9]+$ ]] || swap_total=0
+    [ "$mem_total" -gt 0 ] || return 0
+    [ "$mem_total" -ge 1024 ] || swap_mb=1024
+    [ "$mem_total" -lt 512 ] && swap_mb=1536
+    [ "$swap_total" -ge 512 ] && return 0
+    [ "$swap_mb" -gt 0 ] || return 0
+    if [ -e /swapfile ] || [ -L /swapfile ]; then
+        warn "检测到 /swapfile 已存在，避免覆盖现有路径，已停止 BBRv3 安装"
+        return 1
+    fi
+    root_avail=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
+    [[ "$root_avail" =~ ^[0-9]+$ ]] || root_avail=0
+    need_mb=$((swap_mb + 1500))
+    if [ "$root_avail" -lt "$need_mb" ]; then
+        warn "内存 ${mem_total}MB 且 swap 不足，但根分区可用 ${root_avail}MB，不足以安全创建 ${swap_mb}MB swap 并安装内核"
+        warn "请扩容磁盘或手动清理后重试；已停止 BBRv3 安装"
+        return 1
+    fi
+    warn "检测到内存较小：${mem_total}MB，当前 swap：${swap_total}MB"
+    warn "建议创建 ${swap_mb}MB swap，降低内核安装时内存不足风险"
+    echo -ne "  是否创建 swap？(y/N): "
+    read -r ans || ans=""
+    [ "$ans" = "y" ] || [ "$ans" = "Y" ] || { info "已跳过 swap 创建"; return 0; }
+    step "创建 ${swap_mb}MB swap..."
+    fstab_bak="/etc/fstab.pdproxy.$(date +%Y%m%d%H%M%S).bak"
+    cp /etc/fstab "$fstab_bak" 2>/dev/null || true
+    if command -v fallocate >/dev/null 2>&1 && fallocate -l "${swap_mb}M" /swapfile 2>/dev/null; then
+        :
+    elif ! dd if=/dev/zero of=/swapfile bs=1M count="$swap_mb" status=none 2>/dev/null; then
+        rm -f /swapfile
+        [ -f "$fstab_bak" ] && cp "$fstab_bak" /etc/fstab 2>/dev/null || true
+        warn "swap 文件创建失败，已停止 BBRv3 安装"
+        return 1
+    fi
+    chmod 600 /swapfile
+    if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile >/dev/null 2>&1; then
+        swapoff /swapfile >/dev/null 2>&1 || true
+        rm -f /swapfile
+        [ -f "$fstab_bak" ] && cp "$fstab_bak" /etc/fstab 2>/dev/null || true
+        warn "swap 创建失败，已回滚，已停止 BBRv3 安装"
+        return 1
+    fi
+    if ! grep -q '^/swapfile ' /etc/fstab 2>/dev/null; then
+        if ! echo '/swapfile none swap sw 0 0' >> /etc/fstab; then
+            swapoff /swapfile >/dev/null 2>&1 || true
+            rm -f /swapfile
+            [ -f "$fstab_bak" ] && cp "$fstab_bak" /etc/fstab 2>/dev/null || true
+            warn "写入 /etc/fstab 失败，swap 已回滚，已停止 BBRv3 安装"
+            return 1
+        fi
+    fi
+    PD_XANMOD_SWAP_CREATED=1
+    PD_XANMOD_SWAP_FSTAB_BAK="$fstab_bak"
+    info "swap 已创建并启用：${swap_mb}MB"
+}
+
+rollback_xanmod_swap_if_created() {
+    [ "${PD_XANMOD_SWAP_CREATED:-0}" = "1" ] || return 0
+    swapoff /swapfile >/dev/null 2>&1 || true
+    rm -f /swapfile
+    if [ -n "${PD_XANMOD_SWAP_FSTAB_BAK:-}" ] && [ -f "$PD_XANMOD_SWAP_FSTAB_BAK" ]; then
+        cp "$PD_XANMOD_SWAP_FSTAB_BAK" /etc/fstab 2>/dev/null || true
+    else
+        sed -i '\#^/swapfile #d' /etc/fstab 2>/dev/null || true
+    fi
+    PD_XANMOD_SWAP_CREATED=0
+    warn "已回滚本次为 BBRv3 创建的 swap"
 }
 
 recover_xanmod_apt_failure() {
@@ -2660,28 +2745,30 @@ enable_bbrv3_kernel() {
     # ⑤ 安装依赖
     step "安装 XanMod BBRv3 内核..."
     check_xanmod_disk_space || return
-    apt-get update -qq || { warn "apt-get update 失败，无法安装 XanMod"; return; }
-    apt-get install -y -qq gnupg lsb-release curl ca-certificates >/dev/null || { warn "安装 XanMod 依赖失败"; return; }
+    ensure_xanmod_swap || return
+    apt-get update -qq || { rollback_xanmod_swap_if_created; warn "apt-get update 失败，无法安装 XanMod"; return; }
+    apt-get install -y -qq gnupg lsb-release curl ca-certificates >/dev/null || { rollback_xanmod_swap_if_created; warn "安装 XanMod 依赖失败"; return; }
     mkdir -p /etc/apt/keyrings
 
     local key_tmp
     key_tmp=$(mktemp_pd)
-    curl -fsSL https://dl.xanmod.org/archive.key -o "$key_tmp" || { warn "下载 XanMod GPG key 失败"; return; }
+    curl -fsSL https://dl.xanmod.org/archive.key -o "$key_tmp" || { rollback_xanmod_swap_if_created; warn "下载 XanMod GPG key 失败"; return; }
     rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg
-    gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg "$key_tmp" 2>/dev/null || { warn "导入 XanMod GPG key 失败"; return; }
+    gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg "$key_tmp" 2>/dev/null || { rollback_xanmod_swap_if_created; warn "导入 XanMod GPG key 失败"; return; }
     local codename
     codename=$(lsb_release -sc 2>/dev/null || sed -n 's/^VERSION_CODENAME=//p' /etc/os-release 2>/dev/null | head -1 || true)
-    [ -n "$codename" ] || { warn "无法识别系统代号，无法添加 XanMod 源"; return; }
+    [ -n "$codename" ] || { rollback_xanmod_swap_if_created; warn "无法识别系统代号，无法添加 XanMod 源"; return; }
     if ! xanmod_supported_codename "$codename"; then
         warn "XanMod 官方源暂不支持当前系统代号: $codename"
         warn "支持: bookworm/trixie/forky/sid/noble/plucky/questing/resolute 以及 Linux Mint faye/gigi/wilma/xia/zara/zena"
         warn "已取消 BBRv3 内核安装；可继续使用 pd --bbr 开启普通 BBR"
+        rollback_xanmod_swap_if_created
         return
     fi
     echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${codename} main" \
         > /etc/apt/sources.list.d/xanmod-release.list
 
-    apt-get update -qq || { rm -f /etc/apt/sources.list.d/xanmod-release.list; warn "刷新 XanMod APT 源失败，已移除 XanMod 源"; return; }
+    apt-get update -qq || { rm -f /etc/apt/sources.list.d/xanmod-release.list; rollback_xanmod_swap_if_created; warn "刷新 XanMod APT 源失败，已移除 XanMod 源"; return; }
     local xanmod_pkg="" candidate
     while IFS= read -r candidate; do
         [ -n "$candidate" ] || continue
@@ -2694,11 +2781,13 @@ enable_bbrv3_kernel() {
     if [ -z "$xanmod_pkg" ]; then
         rm -f /etc/apt/sources.list.d/xanmod-release.list
         warn "当前 XanMod 源没有适合此 CPU/系统的内核包，已移除 XanMod 源"
+        rollback_xanmod_swap_if_created
         return
     fi
     info "选择内核包: $xanmod_pkg"
     if ! apt-get install -y -qq "$xanmod_pkg" 2>/dev/null; then
         recover_xanmod_apt_failure
+        rollback_xanmod_swap_if_created
         warn "XanMod 内核安装失败，已移除 XanMod 源并尝试修复 APT 状态"
         warn "如果日志出现 No space left on device，请清理磁盘后重试：apt-get clean && apt-get autoremove --purge"
         return
