@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v3.0.0
+# PD-proxy — 多协议代理一键部署脚本 v3.5.0
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="3.0.0"
+VERSION="3.5.0"
 SCRIPT_URL="${PD_SCRIPT_URL:-https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh}"
 
 # 纯查询命令，不需要锁和 root
@@ -36,7 +36,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
 
 增强选项(环境变量):
   PD_SNELL_MODE=shadowtls  PD_SNELL_TLS_VERSION=v3  PD_HY2_HOP=5  PD_VLESS_DEST=...:443
-  PD_SNELL_MANUAL_TIMEOUT=4  PD_SNELL_VERSION=v5.x.x  PD_STRICT_LATEST=1
+  PD_SNELL_MANUAL_TIMEOUT=6  PD_SNELL_PROBE_PARALLEL=12  PD_SNELL_VERSION=v5.x.x
 
 示例:
   bash -c "\$(curl -fsSL ${SCRIPT_URL})"
@@ -245,11 +245,17 @@ json_tag_name() {
 }
 
 snell_manual_html() {
-    local timeout="${PD_SNELL_MANUAL_TIMEOUT:-4}"
-    [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=4
+    local timeout
+    timeout=$(snell_manual_timeout)
+    curl -fsSL --connect-timeout 2 --max-time "$timeout" "https://manual.nssurge.com/others/snell.html" 2>/dev/null || true
+}
+
+snell_manual_timeout() {
+    local timeout="${PD_SNELL_MANUAL_TIMEOUT:-6}"
+    [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=6
     [ "$timeout" -lt 2 ] && timeout=2
     [ "$timeout" -gt 15 ] && timeout=15
-    curl -fsSL --connect-timeout 2 --max-time "$timeout" "https://manual.nssurge.com/others/snell.html" 2>/dev/null || true
+    echo "$timeout"
 }
 
 snell_probe_candidates() {
@@ -296,25 +302,52 @@ snell_probe_latest() {
     return 1
 }
 
+snell_cache_get() {
+    local major="$1" cache_file="$2" cached=""
+    [ -s "$cache_file" ] || return 1
+    cached=$(sed -n '1p' "$cache_file" 2>/dev/null || true)
+    if [[ "$cached" =~ ^v${major}\.[0-9]+\.[0-9]+[a-z0-9]*$ ]]; then
+        echo "$cached"
+        return 0
+    fi
+    warn "忽略无效 Snell 缓存版本: $cached" >&2
+    return 1
+}
+
 snell_probe_batch() {
-    local tmp probe probe_url pid
+    local tmpdir probe probe_url pid result=""
     local -a pids=()
-    tmp=$(mktemp_pd)
+    tmpdir=$(mktemp -d /tmp/pd-snell-probe-XXXXXX)
     for probe in "$@"; do
         (
+            trap - EXIT ERR
             probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
-            curl -fsI --connect-timeout 1 --max-time 3 "$probe_url" >/dev/null 2>&1 && printf '%s\n' "$probe" >> "$tmp"
+            curl -fsI --connect-timeout 1 --max-time 3 "$probe_url" >/dev/null 2>&1 && printf '%s\n' "$probe" > "$tmpdir/${probe}"
         ) &
         pids+=("$!")
     done
     for pid in "${pids[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
-    if [ -s "$tmp" ]; then
-        snell_version_sort < "$tmp" | head -1
-        return 0
+    local -a result_files=("$tmpdir"/*)
+    if [ -e "${result_files[0]}" ]; then
+        result=$(snell_version_sort < <(printf '%s\n' "${result_files[@]}" | while IFS= read -r f; do sed -n '1p' "$f"; done) | head -1 || true)
+        rm -rf "$tmpdir"
+        [ -n "$result" ] && echo "$result" && return 0
+        return 1
     fi
+    rm -rf "$tmpdir"
     return 1
+}
+
+snell_strict_latest_msg() {
+    local major="$1"
+    echo "Snell ${major} 最新版检测失败：$(snell_manual_timeout) 秒内无法读取 Surge 手册。严格最新版模式下拒绝 fallback；可重试或设置 PD_SNELL_MANUAL_TIMEOUT=10"
+}
+
+snell_manual_fail_msg() {
+    local major="$1"
+    echo "Snell ${major} 可用版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v${major}.x.x"
 }
 
 snell_version_sort() {
@@ -733,7 +766,7 @@ snell_get_version() {
         return 0
     fi
     # 1. 从 Surge 手册抓取最新版。Snell 没有官方 API，手册是默认权威来源。
-    # 默认 4 秒内完成：成功则保证最新版；失败则明确报错，不静默装旧版。
+    # 默认 6 秒内完成：成功则保证最新版；失败则进入可用性 fallback。
     v=$(snell_manual_html \
         | sed -n 's/.*snell-server-v\(5\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
         | grep -v 'b' | head -1 || true)
@@ -746,7 +779,7 @@ snell_get_version() {
     # 2. 权威源不可达时，默认进入可用性 fallback：HEAD 探测当前 release 目录中可下载的最高版本。
     # 这能保证可用和尽量新；如必须严格权威最新版，设置 PD_STRICT_LATEST=1。
     if [ "${PD_STRICT_LATEST:-0}" = "1" ]; then
-        die "Snell 最新版检测失败：4 秒内无法读取 Surge 手册。严格最新版模式下拒绝 fallback；可重试或设置 PD_SNELL_MANUAL_TIMEOUT=10"
+        die "$(snell_strict_latest_msg 5)"
     fi
     warn "无法快速读取 Surge 手册，改用下载源探测可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
     v=$(snell_probe_latest 5 || true)
@@ -756,9 +789,9 @@ snell_get_version() {
         return 0
     fi
 
-    if [ -s "$cache_file" ]; then
+    if snell_cache_get 5 "$cache_file" >/dev/null 2>&1; then
         warn "下载源探测失败，使用上次成功缓存版本" >&2
-        cat "$cache_file"
+        snell_cache_get 5 "$cache_file"
         return 0
     fi
 
@@ -769,7 +802,7 @@ snell_v4_get_version() {
     local v cache_file="$BASE_DIR/.snell-v4-version-${ARCH}"
     mkdir -p "$BASE_DIR"
     # 1. 从 Surge 手册抓取最新版。Snell 没有官方 API，手册是默认权威来源。
-    # 默认 4 秒内完成：成功则保证最新版；失败则明确报错，不静默装旧版。
+    # 默认 6 秒内完成：成功则保证最新版；失败则进入可用性 fallback。
     v=$(snell_manual_html \
         | sed -n 's/.*snell-server-v\(4\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
         | grep -v 'b' | head -1 || true)
@@ -780,7 +813,7 @@ snell_v4_get_version() {
     fi
 
     if [ "${PD_STRICT_LATEST:-0}" = "1" ]; then
-        die "Snell v4 最新版检测失败：4 秒内无法读取 Surge 手册。严格最新版模式下拒绝 fallback；可重试或设置 PD_SNELL_MANUAL_TIMEOUT=10"
+        die "$(snell_strict_latest_msg 4)"
     fi
     warn "无法快速读取 Surge 手册，改用下载源探测 Snell v4 可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
     v=$(snell_probe_latest 4 || true)
@@ -790,9 +823,9 @@ snell_v4_get_version() {
         return 0
     fi
 
-    if [ -s "$cache_file" ]; then
+    if snell_cache_get 4 "$cache_file" >/dev/null 2>&1; then
         warn "下载源探测失败，使用上次成功缓存版本" >&2
-        cat "$cache_file"
+        snell_cache_get 4 "$cache_file"
         return 0
     fi
 
@@ -1121,12 +1154,13 @@ vless_configure() {
     local keys
     keys=$("$(pbin vless)" x25519 2>/dev/null) || die "Xray x25519 密钥生成失败"
     local privkey
-    privkey=$(echo "$keys" | grep "Private" | awk '{print $NF}')
+    privkey=$(echo "$keys" | awk '/Private/{print $NF; exit}')
     local pubkey
-    pubkey=$(echo "$keys" | grep "Public" | awk '{print $NF}')
+    pubkey=$(echo "$keys" | awk '/Public/{print $NF; exit}')
     local shortid
     shortid=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
     [ -n "$privkey" ] || die "Reality 私钥生成失败"
+    [ -n "$pubkey" ] || die "Reality 公钥生成失败"
 
     # 保存配置信息供输出使用
     echo "$pubkey" > "$(pdir vless)/.pubkey"
@@ -1914,15 +1948,7 @@ self_install() {
     local install_from_url=false
     [ -n "${SCRIPT_URL:-}" ] && install_from_url=true
     if [ "${PD_UPDATE:-}" = "1" ]; then
-        if $source_is_file; then
-            local src_path dst_path
-            src_path=$(readlink -f "$source_path" 2>/dev/null || echo "$source_path")
-            dst_path=$(readlink -f "$BASE_DIR/install.sh" 2>/dev/null || echo "")
-            if [ "$src_path" != "$dst_path" ]; then
-                cp "$source_path" "$BASE_DIR/install.sh"
-                chmod +x "$BASE_DIR/install.sh"
-            fi
-        elif $install_from_url; then
+        if $install_from_url; then
             local tmp_pd
             tmp_pd=$(mktemp_pd)
             curl -fsSL "$SCRIPT_URL" -o "$tmp_pd" || {
@@ -1930,8 +1956,21 @@ self_install() {
                 warn "无法从 SCRIPT_URL 同步脚本: $SCRIPT_URL"
                 return 1
             }
+            bash -n "$tmp_pd" 2>/dev/null || {
+                rm -f "$tmp_pd"
+                warn "下载到的脚本语法校验失败，已保留当前版本"
+                return 1
+            }
             mv "$tmp_pd" "$BASE_DIR/install.sh"
             chmod +x "$BASE_DIR/install.sh"
+        elif $source_is_file; then
+            local src_path dst_path
+            src_path=$(readlink -f "$source_path" 2>/dev/null || echo "$source_path")
+            dst_path=$(readlink -f "$BASE_DIR/install.sh" 2>/dev/null || echo "")
+            if [ "$src_path" != "$dst_path" ]; then
+                cp "$source_path" "$BASE_DIR/install.sh"
+                chmod +x "$BASE_DIR/install.sh"
+            fi
         elif [ ! -f "$BASE_DIR/install.sh" ]; then
             warn "找不到当前脚本文件，无法刷新 /opt/pd/install.sh"
             return 1
@@ -1951,6 +1990,11 @@ self_install() {
             curl -fsSL "$SCRIPT_URL" -o "$tmp_pd" || {
                 rm -f "$tmp_pd"
                 warn "无法从 SCRIPT_URL 同步脚本: $SCRIPT_URL"
+                return 1
+            }
+            bash -n "$tmp_pd" 2>/dev/null || {
+                rm -f "$tmp_pd"
+                warn "下载到的脚本语法校验失败，无法持久化 pd 命令"
                 return 1
             }
             mv "$tmp_pd" "$BASE_DIR/install.sh"
