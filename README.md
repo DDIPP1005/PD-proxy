@@ -88,24 +88,26 @@ pd --remove-all --yes              # 卸载一切
 
 ## BBR 优化
 
-PD-proxy 内置 TCP 优化引擎，一键开启 22 项内核参数调优。
+PD-proxy 内置 TCP 优化引擎，一键开启 22+ 项内核参数调优。
 
 ```bash
-pd --bbr                           # 秒开 BBR，即时生效
+pd --bbr                           # 进入交互引导，或秒开 BBR
 ```
 
-**调优参数覆盖**：拥塞控制（BBR + fq）、TCP 缓冲区（按带宽动态计算）、连接复用（`tcp_tw_reuse`）、TCP Fast Open、UDP 缓冲（Hysteria2/QUIC）、Keepalive、TIME_WAIT 回收等。
+**交互引导流程**：自动/手动测速 → 选择服务地区（亚太/欧美）→ 自动计算最优 TCP 缓冲区 → 写入 sysctl.d → 即时生效。
 
-支持环境变量控制缓冲策略：
+**调优参数覆盖**：拥塞控制（BBR + fq）、TCP 缓冲区（按带宽+地区动态计算）、连接复用（`tcp_tw_reuse`）、TCP Fast Open、UDP 缓冲（Hysteria2/QUIC）、Keepalive、TIME_WAIT 回收、虚拟内存调度、MSS 防分片、tc fq + iptables 开机持久化等。
+
+支持环境变量跳过交互，直接指定带宽策略：
 
 ```bash
-PD_BBR_BANDWIDTH=2000 PD_BBR_REGION=overseas pd --bbr   # 2Gbps 欧美节点
+PD_BBR_BANDWIDTH=2000 PD_BBR_REGION=overseas pd --bbr   # 2Gbps 欧美节点，不弹交互
 ```
 
 另可独立安装 XanMod BBRv3 内核（需重启）：
 
 ```bash
-pd --bbrv3
+pd --bbrv3                         # 自动检测 CPU flags，选最优包
 ```
 
 ---

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v3.6.3
+# PD-proxy — 多协议代理一键部署脚本 v3.6.7
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="3.6.3"
+VERSION="3.6.7"
 SCRIPT_URL="${PD_SCRIPT_URL:-https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh}"
 
 # 纯查询命令，不需要锁和 root
@@ -32,7 +32,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   pd --bbr                 开启BBR  pd --bbrv3     BBRv3内核
   pd --update              更新    pd --remove-all [--yes]  卸载全部
 
-协议: snell (Snell v5) | hy2 (Hysteria2) | vless (VLESS Reality) | anytls
+协议: snell (Snell v5；PD_SNELL_MODE=shadowtls 可安装 Snell v4+ShadowTLS) | hy2 | vless | anytls
 
 增强选项(环境变量):
   PD_SNELL_MODE=shadowtls  PD_SNELL_TLS_VERSION=v3  PD_HY2_HOP=5  PD_HY2_HOP_RANGE=30000-30100
@@ -272,6 +272,18 @@ json_escape() {
     printf '%s' "$s"
 }
 
+url_escape() {
+    local s="$1" i c out=""
+    for ((i=0; i<${#s}; i++)); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) printf -v out '%s%%%02X' "$out" "'$c" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
 json_tag_name() {
     sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
 }
@@ -399,6 +411,27 @@ snell_version_sort() {
 require_version() {
     local ver="$1" label="$2"
     [ -n "$ver" ] || die "$label 版本为空，已停止安装，避免下载错误 URL"
+}
+
+version_to_num() {
+    local v="${1#v}" a=0 b=0 c=0
+    IFS=. read -r a b c <<< "$v"
+    [[ "$a" =~ ^[0-9]+$ ]] || a=0
+    [[ "$b" =~ ^[0-9]+$ ]] || b=0
+    [[ "$c" =~ ^[0-9]+$ ]] || c=0
+    printf '%d%03d%03d\n' "$a" "$b" "$c"
+}
+
+script_file_version() {
+    local file="$1"
+    sed -n 's/^VERSION="\([0-9][0-9.]*\)".*/\1/p' "$file" 2>/dev/null | head -1
+}
+
+downloaded_script_is_older() {
+    local file="$1" remote_ver
+    remote_ver=$(script_file_version "$file")
+    [ -n "$remote_ver" ] || return 1
+    [ "$(version_to_num "$remote_ver")" -lt "$(version_to_num "$VERSION")" ]
 }
 
 state_field_from_line() {
@@ -1223,6 +1256,7 @@ Requires=snell.service
 
 [Service]
 Type=simple
+Environment=MONOIO_FORCE_LEGACY_DRIVER=1
 ExecStart=${bin} ${v3_arg} server --listen 0.0.0.0:${ext_port} --server 127.0.0.1:${int_port} --tls ${sni}:443 --password ${tls_pass}
 Restart=always
 RestartSec=5
@@ -1534,7 +1568,9 @@ anytls_output() {
     padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
     sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
 
-    local link="anytls://${pass}@${IP}:${port}#PD-AnyTLS"
+    local query=""
+    [ -n "$sni" ] && query="?sni=$(url_escape "$sni")&insecure=1"
+    local link="anytls://${pass}@${IP}:${port}${query}#PD-AnyTLS"
     output_header "AnyTLS" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
     echo -e "填充:   ${DIM}${padding}（当前服务端使用 anytls 默认）${RESET}"
@@ -2064,7 +2100,9 @@ show_config_only() {
             sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
             echo "anytls, ${IP}, ${port}, password=${pass}"
             echo ""
-            echo "# Shadowrocket: anytls://${pass}@${IP}:${port}#PD-AnyTLS" ;;
+            local query=""
+            [ -n "$sni" ] && query="?sni=$(url_escape "$sni")&insecure=1"
+            echo "# Shadowrocket: anytls://${pass}@${IP}:${port}${query}#PD-AnyTLS" ;;
     esac
 }
 
@@ -2169,18 +2207,185 @@ calculate_bbr_buf() {
     local buf=""
     if [ "$region" = "overseas" ]; then
         [ "$mbps" -le 100 ] && buf=8
-        [ "$mbps" -le 300 ] && [ -z "$buf" ] && buf=16
+        [ "$mbps" -le 200 ] && [ -z "$buf" ] && buf=16
+        [ "$mbps" -le 300 ] && [ -z "$buf" ] && buf=20
         [ "$mbps" -le 500 ] && [ -z "$buf" ] && buf=32
+        [ "$mbps" -le 700 ] && [ -z "$buf" ] && buf=48
         [ -z "$buf" ] && buf=64
     else
-        [ "$mbps" -le 100 ] && buf=4
-        [ "$mbps" -le 300 ] && [ -z "$buf" ] && buf=8
+        [ "$mbps" -le 100 ] && buf=6
+        [ "$mbps" -le 200 ] && [ -z "$buf" ] && buf=8
+        [ "$mbps" -le 300 ] && [ -z "$buf" ] && buf=10
         [ "$mbps" -le 500 ] && [ -z "$buf" ] && buf=12
+        [ "$mbps" -le 700 ] && [ -z "$buf" ] && buf=14
         [ "$mbps" -le 1000 ] && [ -z "$buf" ] && buf=16
+        [ "$mbps" -le 1500 ] && [ -z "$buf" ] && buf=20
         [ "$mbps" -le 2000 ] && [ -z "$buf" ] && buf=24
+        [ "$mbps" -le 2500 ] && [ -z "$buf" ] && buf=28
         [ -z "$buf" ] && buf=32
     fi
     echo "$buf"
+}
+
+install_speedtest_cli() {
+    command -v speedtest >/dev/null 2>&1 && return 0
+    local cpu_arch url tmpdir
+    cpu_arch=$(uname -m)
+    case "$cpu_arch" in
+        x86_64|amd64) url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
+        aarch64|arm64) url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
+        *) warn "speedtest 不支持当前架构: $cpu_arch" >&2; return 1 ;;
+    esac
+    tmpdir=$(mktemp -d /tmp/pd-speedtest-XXXXXX)
+    curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$tmpdir/speedtest.tgz" || { rm -rf "$tmpdir"; return 1; }
+    tar -xzf "$tmpdir/speedtest.tgz" -C "$tmpdir" >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 1; }
+    install -m 0755 "$tmpdir/speedtest" /usr/local/bin/speedtest || { rm -rf "$tmpdir"; return 1; }
+    rm -rf "$tmpdir"
+    return 0
+}
+
+parse_speedtest_upload() {
+    sed -nE 's/.*[Uu]pload:[[:space:]]*([0-9]+)(\.[0-9]+)?.*/\1/p' | head -1
+}
+
+detect_bbr_bandwidth() {
+    local choice="" server_id="" output="" upload="" servers="" attempt=0
+    echo "" >&2
+    echo -e "  ${MAGENTA}▸ 服务器带宽检测${RESET}" >&2
+    echo "  [1] 自动检测（推荐）" >&2
+    echo "  [2] 手动指定测速服务器 ID" >&2
+    echo "  [3] 手动选择预设档位" >&2
+    echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: " >&2
+    read -r choice || choice=""
+    choice=${choice:-1}
+    case "$choice" in
+        1)
+            if ! install_speedtest_cli; then
+                warn "speedtest 安装失败，使用默认 1000 Mbps" >&2
+                echo 1000
+                return 0
+            fi
+            step "正在搜索附近测速服务器..." >&2
+            servers=$(speedtest --accept-license --accept-gdpr --servers 2>/dev/null | sed -nE 's/^[[:space:]]*([0-9]+).*/\1/p' | head -n 10 || true)
+            [ -n "$servers" ] || servers="auto"
+            for server_id in $servers; do
+                attempt=$((attempt + 1))
+                [ "$attempt" -gt 5 ] && break
+                if [ "$server_id" = "auto" ]; then
+                    output=$(speedtest --accept-license --accept-gdpr 2>&1 || true)
+                else
+                    output=$(speedtest --accept-license --accept-gdpr --server-id="$server_id" 2>&1 || true)
+                fi
+                upload=$(printf '%s\n' "$output" | parse_speedtest_upload || true)
+                if [ -n "$upload" ] && ! printf '%s\n' "$output" | grep -qi 'FAILED\|error'; then
+                    info "检测到上传带宽: ${upload} Mbps" >&2
+                    echo "$upload"
+                    return 0
+                fi
+            done
+            warn "自动测速失败，使用默认 1000 Mbps" >&2
+            echo 1000 ;;
+        2)
+            if ! install_speedtest_cli; then
+                warn "speedtest 安装失败，使用默认 1000 Mbps" >&2
+                echo 1000
+                return 0
+            fi
+            echo -ne "  输入测速服务器 ID: " >&2
+            read -r server_id || server_id=""
+            if [[ "$server_id" =~ ^[0-9]+$ ]]; then
+                output=$(speedtest --accept-license --accept-gdpr --server-id="$server_id" 2>&1 || true)
+                upload=$(printf '%s\n' "$output" | parse_speedtest_upload || true)
+                if [ -n "$upload" ] && ! printf '%s\n' "$output" | grep -qi 'FAILED\|error'; then
+                    info "检测到上传带宽: ${upload} Mbps" >&2
+                    echo "$upload"
+                    return 0
+                fi
+            fi
+            warn "指定服务器测速失败，使用默认 1000 Mbps" >&2
+            echo 1000 ;;
+        3)
+            prompt_bbr_bandwidth_preset ;;
+        *)
+            echo 1000 ;;
+    esac
+}
+
+prompt_bbr_bandwidth_preset() {
+    local c custom
+    echo "" >&2
+    echo -e "  ${MAGENTA}▸ 手动选择带宽档位${RESET}" >&2
+    echo "  [1] 100 Mbps   [2] 200 Mbps   [3] 300 Mbps" >&2
+    echo "  [4] 500 Mbps   [5] 700 Mbps   [6] 1000 Mbps" >&2
+    echo "  [7] 1500 Mbps  [8] 2000 Mbps  [9] 2500 Mbps" >&2
+    echo "  [10] 自定义输入" >&2
+    echo -ne "  ${MAGENTA}▸${RESET} 选择 [6]: " >&2
+    read -r c || c=""
+    case "${c:-6}" in
+        1) echo 100 ;; 2) echo 200 ;; 3) echo 300 ;; 4) echo 500 ;; 5) echo 700 ;;
+        6) echo 1000 ;; 7) echo 1500 ;; 8) echo 2000 ;; 9) echo 2500 ;;
+        10)
+            while true; do
+                echo -ne "  输入带宽 Mbps: " >&2
+                read -r custom || custom=""
+                [[ "$custom" =~ ^[0-9]+$ ]] && [ "$custom" -gt 0 ] && { echo "$custom"; return 0; }
+                warn "请输入有效数字" >&2
+            done ;;
+        *) echo 1000 ;;
+    esac
+}
+
+prompt_bbr_region() {
+    local c
+    echo "" >&2
+    echo -e "  ${MAGENTA}▸ 服务地区${RESET}" >&2
+    echo "  [1] 亚太地区（港/日/新/韩等，RTT < 100ms）" >&2
+    echo "  [2] 美国/欧洲（跨洋，RTT 150-300ms）" >&2
+    echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: " >&2
+    read -r c || c=""
+    case "$c" in 2) echo overseas ;; *) echo asia ;; esac
+}
+
+apply_mss_clamp() {
+    command -v iptables >/dev/null 2>&1 || return 0
+    iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 \
+        || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+}
+
+write_bbr_persist_service() {
+    cat > /usr/local/bin/pd-bbr-apply.sh <<'EOF'
+#!/usr/bin/env bash
+for d in /sys/class/net/*; do
+    [ -e "$d" ] || continue
+    dev=$(basename "$d")
+    case "$dev" in lo|docker*|veth*|br-*|virbr*|zt*|tailscale*|wg*|tun*|tap*) continue ;; esac
+    tc qdisc replace dev "$dev" root fq 2>/dev/null || true
+done
+if command -v iptables >/dev/null 2>&1; then
+    iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 \
+        || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+fi
+if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
+    echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+fi
+EOF
+    chmod +x /usr/local/bin/pd-bbr-apply.sh
+    cat > /etc/systemd/system/pd-bbr-apply.service <<'EOF'
+[Unit]
+Description=PD-proxy BBR network runtime tuning
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/pd-bbr-apply.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable pd-bbr-apply.service >/dev/null 2>&1 || true
 }
 
 clean_sysctl_conflicts() {
@@ -2243,6 +2448,28 @@ select_xanmod_package() {
     fi
 }
 
+select_xanmod_package_candidates() {
+    local base_pkg
+    base_pkg=$(select_xanmod_package)
+    case "$base_pkg" in
+        linux-xanmod-x64v1)
+            printf '%s\n' linux-xanmod-x64v1 linux-xanmod-lts-x64v1 ;;
+        linux-xanmod-x64v2)
+            printf '%s\n' linux-xanmod-x64v2 linux-xanmod-lts-x64v2 ;;
+        linux-xanmod-x64v3)
+            printf '%s\n' linux-xanmod-x64v3 linux-xanmod-lts-x64v3 ;;
+        *)
+            printf '%s\n' "$base_pkg" ;;
+    esac
+}
+
+xanmod_supported_codename() {
+    case "$1" in
+        bookworm|trixie|forky|sid|noble|plucky|questing|resolute|faye|gigi|wilma|xia|zara|zena) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 enable_bbr() {
     local running_cc buf_mb buf_bytes band region
     running_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
@@ -2276,9 +2503,23 @@ enable_bbr() {
     # ④ 清理旧配置
     clean_sysctl_conflicts
 
-    # ⑤ 计算缓冲区
-    band="${PD_BBR_BANDWIDTH:-1000}"
-    region="${PD_BBR_REGION:-asia}"
+    # ⑤ 按 vps-tcp-tune 逻辑：自动/手动带宽 + 地区决定缓冲区
+    if [ -n "${PD_BBR_BANDWIDTH:-}" ]; then
+        band="$PD_BBR_BANDWIDTH"
+    elif [ -t 0 ]; then
+        band=$(detect_bbr_bandwidth)
+    else
+        band=1000
+    fi
+    if [ -n "${PD_BBR_REGION:-}" ]; then
+        region="$PD_BBR_REGION"
+    elif [ -t 0 ]; then
+        region=$(prompt_bbr_region)
+    else
+        region=asia
+    fi
+    [[ "$band" =~ ^[0-9]+$ ]] || band=1000
+    case "$region" in asia|overseas) ;; *) region=asia ;; esac
     buf_mb=$(calculate_bbr_buf "$band" "$region")
     buf_bytes=$((buf_mb * 1024 * 1024))
 
@@ -2332,6 +2573,14 @@ net.ipv4.udp_wmem_min=8192
 
 # 安全
 net.ipv4.tcp_syncookies=1
+
+# 虚拟内存与调度优化
+vm.swappiness=5
+vm.dirty_ratio=15
+vm.dirty_background_ratio=5
+vm.overcommit_memory=1
+vm.vfs_cache_pressure=50
+kernel.sched_autogroup_enabled=0
 SYSCTL_EOF
 
     # ⑦ 应用：先尝试加载模块，再应用 sysctl，避免 congestion_control=bbr 失败提前退出。
@@ -2340,6 +2589,8 @@ SYSCTL_EOF
 
     # ⑧ tc fq 即时生效
     apply_tc_fq
+    apply_mss_clamp
+    write_bbr_persist_service
 
     # ⑨ 验证
     running_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
@@ -2356,8 +2607,7 @@ enable_bbrv3_kernel() {
 
     # ① 已安装
     if grep -qi 'xanmod' /proc/version 2>/dev/null; then
-        info "XanMod 内核已运行，跳过安装"
-        return
+        info "XanMod 内核已运行，将检查仓库中是否有可更新内核"
     fi
 
     # ② 虚拟化限制
@@ -2390,14 +2640,34 @@ enable_bbrv3_kernel() {
     curl -fsSL https://dl.xanmod.org/archive.key -o "$key_tmp" || { warn "下载 XanMod GPG key 失败"; return; }
     rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg
     gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg "$key_tmp" 2>/dev/null || { warn "导入 XanMod GPG key 失败"; return; }
-    echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $(lsb_release -sc 2>/dev/null || echo 'bookworm') main" \
+    local codename
+    codename=$(lsb_release -sc 2>/dev/null || sed -n 's/^VERSION_CODENAME=//p' /etc/os-release 2>/dev/null | head -1 || true)
+    [ -n "$codename" ] || { warn "无法识别系统代号，无法添加 XanMod 源"; return; }
+    if ! xanmod_supported_codename "$codename"; then
+        warn "XanMod 官方源暂不支持当前系统代号: $codename"
+        warn "支持: bookworm/trixie/forky/sid/noble/plucky/questing/resolute 以及 Linux Mint faye/gigi/wilma/xia/zara/zena"
+        warn "已取消 BBRv3 内核安装；可继续使用 pd --bbr 开启普通 BBR"
+        return
+    fi
+    echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${codename} main" \
         > /etc/apt/sources.list.d/xanmod-release.list
 
     apt-get update -qq || { rm -f /etc/apt/sources.list.d/xanmod-release.list; warn "刷新 XanMod APT 源失败，已移除 XanMod 源"; return; }
-    local xanmod_pkg
-    xanmod_pkg=$(select_xanmod_package)
+    local xanmod_pkg="" candidate
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        if apt-cache show "$candidate" >/dev/null 2>&1; then
+            xanmod_pkg="$candidate"
+            break
+        fi
+        warn "当前系统源中没有 $candidate 包，尝试下一个兼容包..."
+    done < <(select_xanmod_package_candidates)
+    if [ -z "$xanmod_pkg" ]; then
+        rm -f /etc/apt/sources.list.d/xanmod-release.list
+        warn "当前 XanMod 源没有适合此 CPU/系统的内核包，已移除 XanMod 源"
+        return
+    fi
     info "选择内核包: $xanmod_pkg"
-    apt-cache show "$xanmod_pkg" >/dev/null 2>&1 || { rm -f /etc/apt/sources.list.d/xanmod-release.list; warn "当前系统源中没有 $xanmod_pkg 包，已移除 XanMod 源"; return; }
     if ! apt-get install -y -qq "$xanmod_pkg" 2>/dev/null; then
         rm -f /etc/apt/sources.list.d/xanmod-release.list
         warn "XanMod 内核安装失败，已移除 XanMod 源，请检查 APT 源或系统兼容性"
@@ -2444,6 +2714,13 @@ self_install() {
                 warn "下载到的脚本语法校验失败，已保留当前版本"
                 return 1
             }
+            if downloaded_script_is_older "$tmp_pd"; then
+                local remote_ver
+                remote_ver=$(script_file_version "$tmp_pd")
+                rm -f "$tmp_pd"
+                warn "远端脚本版本 $remote_ver 低于当前 $VERSION，已拒绝降级"
+                return 1
+            fi
             mv "$tmp_pd" "$BASE_DIR/install.sh"
             chmod +x "$BASE_DIR/install.sh"
         elif $source_is_file; then
@@ -2479,6 +2756,13 @@ self_install() {
             warn "下载到的脚本语法校验失败，无法持久化 pd 命令"
             return 1
         }
+        if downloaded_script_is_older "$tmp_pd"; then
+            local remote_ver
+            remote_ver=$(script_file_version "$tmp_pd")
+            rm -f "$tmp_pd"
+            warn "远端脚本版本 $remote_ver 低于当前 $VERSION，已拒绝降级"
+            return 1
+        fi
         mv "$tmp_pd" "$BASE_DIR/install.sh"
         chmod +x "$BASE_DIR/install.sh"
     elif [ ! -f "$BASE_DIR/install.sh" ]; then
@@ -2910,18 +3194,20 @@ menu_view() {
 menu_system() {
     echo -e "  ${MAGENTA}▸ 系统工具${RESET}"
     echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
-    echo -e "  ${CYAN}│${RESET} [1] BBR 优化（秒开）                  ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [2] BBRv3 内核（XanMod，需重启）       ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [3] 卸载全部协议                       ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [1] 安装/更新 XanMod 内核 + BBR v3     ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [2] 卸载 XanMod 内核 ${DIM}(预留)${RESET}              ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [3] BBR 直连/落地优化（智能带宽）      ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [4] 卸载全部协议                       ${CYAN}│${RESET}"
     echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回主菜单${RESET}                      ${CYAN}│${RESET}"
     echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
     echo ""
     echo -ne "  ${MAGENTA}▸${RESET} 选择: "
     read -r cc
     case "$cc" in
-        1) enable_bbr ;;
-        2) enable_bbrv3_kernel ;;
-        3) remove_all ;;
+        1) enable_bbrv3_kernel ;;
+        2) warn "XanMod 内核卸载功能暂未集成；如需回退，请先保留云厂商默认内核并手动 apt purge 对应 linux-xanmod 包" ;;
+        3) enable_bbr ;;
+        4) remove_all ;;
         [Bb]) return 1 ;;
         [Qq]) info "再见 👋"; exit 0 ;;
         *) warn "无效选择" ;;
