@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v3.6.7
+# PD-proxy — 多协议代理一键部署脚本 v3.6.8
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="3.6.7"
+VERSION="3.6.8"
 SCRIPT_URL="${PD_SCRIPT_URL:-https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh}"
 
 # 纯查询命令，不需要锁和 root
@@ -2470,6 +2470,34 @@ xanmod_supported_codename() {
     esac
 }
 
+check_xanmod_disk_space() {
+    local root_avail boot_avail
+    root_avail=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
+    [[ "$root_avail" =~ ^[0-9]+$ ]] || root_avail=0
+    if [ "$root_avail" -lt 1200 ]; then
+        warn "根分区可用空间不足：${root_avail}MB，安装 XanMod 内核建议至少 1200MB"
+        warn "请先清理空间：apt-get clean && apt-get autoremove --purge"
+        return 1
+    fi
+    if mountpoint -q /boot 2>/dev/null; then
+        boot_avail=$(df -Pm /boot 2>/dev/null | awk 'NR==2{print $4}' || echo 0)
+        [[ "$boot_avail" =~ ^[0-9]+$ ]] || boot_avail=0
+        if [ "$boot_avail" -lt 300 ]; then
+            warn "/boot 可用空间不足：${boot_avail}MB，安装新内核建议至少 300MB"
+            warn "请先清理旧内核或扩大 /boot 分区"
+            return 1
+        fi
+    fi
+    return 0
+}
+
+recover_xanmod_apt_failure() {
+    rm -f /etc/apt/sources.list.d/xanmod-release.list
+    apt-get -f install -y >/dev/null 2>&1 || true
+    apt-get autoremove --purge -y >/dev/null 2>&1 || true
+    apt-get clean >/dev/null 2>&1 || true
+}
+
 enable_bbr() {
     local running_cc buf_mb buf_bytes band region
     running_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
@@ -2631,6 +2659,7 @@ enable_bbrv3_kernel() {
 
     # ⑤ 安装依赖
     step "安装 XanMod BBRv3 内核..."
+    check_xanmod_disk_space || return
     apt-get update -qq || { warn "apt-get update 失败，无法安装 XanMod"; return; }
     apt-get install -y -qq gnupg lsb-release curl ca-certificates >/dev/null || { warn "安装 XanMod 依赖失败"; return; }
     mkdir -p /etc/apt/keyrings
@@ -2669,8 +2698,9 @@ enable_bbrv3_kernel() {
     fi
     info "选择内核包: $xanmod_pkg"
     if ! apt-get install -y -qq "$xanmod_pkg" 2>/dev/null; then
-        rm -f /etc/apt/sources.list.d/xanmod-release.list
-        warn "XanMod 内核安装失败，已移除 XanMod 源，请检查 APT 源或系统兼容性"
+        recover_xanmod_apt_failure
+        warn "XanMod 内核安装失败，已移除 XanMod 源并尝试修复 APT 状态"
+        warn "如果日志出现 No space left on device，请清理磁盘后重试：apt-get clean && apt-get autoremove --purge"
         return
     fi
     update-grub 2>/dev/null || true
