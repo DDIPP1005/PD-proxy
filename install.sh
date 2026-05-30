@@ -254,9 +254,9 @@ snell_manual_html() {
 
 snell_probe_candidates() {
     local major="$1" minor patch
-    local max_minor="${PD_SNELL_PROBE_MINOR_MAX:-3}"
+    local max_minor="${PD_SNELL_PROBE_MINOR_MAX:-9}"
     local max_patch="${PD_SNELL_PROBE_PATCH_MAX:-12}"
-    [[ "$max_minor" =~ ^[0-9]+$ ]] || max_minor=3
+    [[ "$max_minor" =~ ^[0-9]+$ ]] || max_minor=9
     [[ "$max_patch" =~ ^[0-9]+$ ]] || max_patch=12
     [ "$max_minor" -gt 20 ] && max_minor=20
     [ "$max_patch" -gt 50 ] && max_patch=50
@@ -738,7 +738,9 @@ snell_get_version() {
         | sed -n 's/.*snell-server-v\(5\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
         | grep -v 'b' | head -1 || true)
     if [ -n "$v" ]; then
-        echo "v${v}" | tee "$cache_file"; return 0
+        echo "v${v}" > "$cache_file"
+        echo "v${v}"
+        return 0
     fi
 
     # 2. 权威源不可达时，默认进入可用性 fallback：HEAD 探测当前 release 目录中可下载的最高版本。
@@ -746,14 +748,16 @@ snell_get_version() {
     if [ "${PD_STRICT_LATEST:-0}" = "1" ]; then
         die "Snell 最新版检测失败：4 秒内无法读取 Surge 手册。严格最新版模式下拒绝 fallback；可重试或设置 PD_SNELL_MANUAL_TIMEOUT=10"
     fi
-    warn "无法快速读取 Surge 手册，改用下载源探测可用版本；这会保证可用并尽量新，但不是严格权威最新版"
+    warn "无法快速读取 Surge 手册，改用下载源探测可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
     v=$(snell_probe_latest 5 || true)
     if [ -n "$v" ]; then
-        echo "$v" | tee "$cache_file"; return 0
+        echo "$v" > "$cache_file"
+        echo "$v"
+        return 0
     fi
 
     if [ -s "$cache_file" ]; then
-        warn "下载源探测失败，使用上次成功缓存版本"
+        warn "下载源探测失败，使用上次成功缓存版本" >&2
         cat "$cache_file"
         return 0
     fi
@@ -770,20 +774,24 @@ snell_v4_get_version() {
         | sed -n 's/.*snell-server-v\(4\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
         | grep -v 'b' | head -1 || true)
     if [ -n "$v" ]; then
-        echo "v${v}" | tee "$cache_file"; return 0
+        echo "v${v}" > "$cache_file"
+        echo "v${v}"
+        return 0
     fi
 
     if [ "${PD_STRICT_LATEST:-0}" = "1" ]; then
         die "Snell v4 最新版检测失败：4 秒内无法读取 Surge 手册。严格最新版模式下拒绝 fallback；可重试或设置 PD_SNELL_MANUAL_TIMEOUT=10"
     fi
-    warn "无法快速读取 Surge 手册，改用下载源探测 Snell v4 可用版本；这会保证可用并尽量新，但不是严格权威最新版"
+    warn "无法快速读取 Surge 手册，改用下载源探测 Snell v4 可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
     v=$(snell_probe_latest 4 || true)
     if [ -n "$v" ]; then
-        echo "$v" | tee "$cache_file"; return 0
+        echo "$v" > "$cache_file"
+        echo "$v"
+        return 0
     fi
 
     if [ -s "$cache_file" ]; then
-        warn "下载源探测失败，使用上次成功缓存版本"
+        warn "下载源探测失败，使用上次成功缓存版本" >&2
         cat "$cache_file"
         return 0
     fi
@@ -946,7 +954,7 @@ Requires=snell.service
 
 [Service]
 Type=simple
-ExecStart=${bin} ${v3_arg} server --listen 0.0.0.0:${ext_port} --server 127.0.0.1:${int_port} --tls ${sni}:443 --password ${tls_pass} --wildcard-sni authed
+ExecStart=${bin} ${v3_arg} server --listen 0.0.0.0:${ext_port} --server 127.0.0.1:${int_port} --tls ${sni}:443 --password ${tls_pass}
 Restart=always
 RestartSec=5
 LimitNOFILE=32768
