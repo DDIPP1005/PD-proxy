@@ -46,6 +46,16 @@ EOF
         echo "PD-proxy v${VERSION}"; exit 0 ;;
 esac
 
+# 无参数交互菜单不能用 `curl ... | bash`：stdin 会被脚本内容占用，read 无法从键盘取输入。
+# 带参数的一键安装仍可用，例如：curl ... | bash -s -- --install snell
+if [ "$#" -eq 0 ] && [ ! -t 0 ]; then
+    echo "交互菜单不能使用管道方式运行。请使用下面任一方式：" >&2
+    echo "  curl -fsSL <脚本URL> -o /tmp/pd.sh && bash /tmp/pd.sh" >&2
+    echo "  bash install-fixed.sh" >&2
+    echo "  curl -fsSL <脚本URL> | bash -s -- --install snell" >&2
+    exit 1
+fi
+
 # ============================================================
 # 颜色 & 常量
 # ============================================================
@@ -2177,16 +2187,6 @@ menu_system() {
 check_root
 detect_os; detect_arch; get_ip; get_mem
 self_install || warn "pd 更新失败，使用缓存版本"
-
-# 非终端拒绝交互模式（防止管道输入死循环）
-if [ ! -t 0 ]; then
-    err "交互模式需要终端。命令行用法："
-    echo "  pd --install <协议>     安装"
-    echo "  pd --status             查看状态"
-    echo "  pd --config <协议>      查看配置"
-    echo "  pd --help               完整帮助"
-    exit 1
-fi
 
 while true; do
     show_status
