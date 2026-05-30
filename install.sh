@@ -13,7 +13,6 @@ set -euo pipefail
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
 VERSION="2.7.9"
-SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 
 # 纯查询命令，不需要锁和 root
 case "${1:-}" in
@@ -38,7 +37,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   PD_SNELL_MODE=shadowtls  PD_HY2_HOP=5  PD_VLESS_DEST=...:443  PD_ANYTLS_PADDING=deep
 
 示例:
-  curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh | bash -s -- --install snell
+  bash install-fixed.sh --install snell
   PD_HY2_HOP=5 pd --install hy2
 EOF
         exit 0 ;;
@@ -46,13 +45,12 @@ EOF
         echo "PD-proxy v${VERSION}"; exit 0 ;;
 esac
 
-# 无参数交互菜单不能用 `curl ... | bash`：stdin 会被脚本内容占用，read 无法从键盘取输入。
-# 带参数的一键安装仍可用，例如：curl ... | bash -s -- --install snell
-if [ "$#" -eq 0 ] && [ ! -t 0 ]; then
-    echo "交互菜单不能使用管道方式运行。请使用下面任一方式：" >&2
+# 不支持 `curl ... | bash` 直接管道运行：无法可靠持久化修复版脚本，后续 pd 可能回退原版。
+if [ ! -t 0 ]; then
+    echo "请先下载脚本文件再运行，不能直接使用管道方式：" >&2
     echo "  curl -fsSL <脚本URL> -o /tmp/pd.sh && bash /tmp/pd.sh" >&2
-    echo "  bash install-fixed.sh" >&2
-    echo "  curl -fsSL <脚本URL> | bash -s -- --install snell" >&2
+    echo "  bash /tmp/pd.sh --install snell" >&2
+    echo "  PD_HY2_HOP=5 bash /tmp/pd.sh --install hy2" >&2
     exit 1
 fi
 
@@ -1731,37 +1729,33 @@ enable_bbr() {
 self_install() {
     mkdir -p "$BASE_DIR"
     # 直接运行修复版时，优先安装当前脚本，避免后续 pd 命令回退到 GitHub 原版。
+    local source_path="${BASH_SOURCE[0]}"
+    local source_is_file=false
+    [ -n "$source_path" ] && [ "$source_path" != "bash" ] && [ "$source_path" != "-" ] && [ -r "$source_path" ] && source_is_file=true
     if [ "${PD_UPDATE:-}" = "1" ]; then
-        if [ -r "${BASH_SOURCE[0]}" ]; then
+        if $source_is_file; then
             local src_path dst_path
-            src_path=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+            src_path=$(readlink -f "$source_path" 2>/dev/null || echo "$source_path")
             dst_path=$(readlink -f "$BASE_DIR/install.sh" 2>/dev/null || echo "")
             if [ "$src_path" != "$dst_path" ]; then
-                cp "${BASH_SOURCE[0]}" "$BASE_DIR/install.sh"
+                cp "$source_path" "$BASE_DIR/install.sh"
                 chmod +x "$BASE_DIR/install.sh"
             fi
         elif [ ! -f "$BASE_DIR/install.sh" ]; then
             warn "找不到当前修复版脚本，无法刷新 /opt/pd/install.sh"
             return 1
         fi
-    elif [ -r "${BASH_SOURCE[0]}" ]; then
+    elif $source_is_file; then
         local src_path dst_path
-        src_path=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")
+        src_path=$(readlink -f "$source_path" 2>/dev/null || echo "$source_path")
         dst_path=$(readlink -f "$BASE_DIR/install.sh" 2>/dev/null || echo "")
         if [ "$src_path" != "$dst_path" ]; then
-            cp "${BASH_SOURCE[0]}" "$BASE_DIR/install.sh"
+            cp "$source_path" "$BASE_DIR/install.sh"
             chmod +x "$BASE_DIR/install.sh"
         fi
     elif [ ! -f "$BASE_DIR/install.sh" ]; then
-        local tmp_pd
-        tmp_pd=$(mktemp_pd)
-        curl -fsSL "$SCRIPT_URL" -o "$tmp_pd" || {
-            rm -f "$tmp_pd"
-            warn "无法从 GitHub 同步最新脚本，使用当前版本"
-            return 1
-        }
-        mv "$tmp_pd" "$BASE_DIR/install.sh"
-        chmod +x "$BASE_DIR/install.sh"
+        warn "当前通过管道执行，无法持久化修复版 pd 命令；请先下载脚本文件后运行"
+        return 1
     fi
     ln -sf "$BASE_DIR/install.sh" "$INSTALLED_BIN" 2>/dev/null || true
 }

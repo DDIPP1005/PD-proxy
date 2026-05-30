@@ -4,11 +4,20 @@
 
 数据驱动架构，全独立二进制，零运行时依赖。支持 Snell v5 / Snell v4 (ShadowTLS) / Hysteria2 / VLESS Reality / AnyTLS 四种协议。
 
-## 一键安装
+## 安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh)
+# 1. 下载脚本
+curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh -o /tmp/pd.sh
+
+# 2. 运行（交互菜单）
+bash /tmp/pd.sh
+
+# 或直接安装指定协议
+bash /tmp/pd.sh --install snell
 ```
+
+> 不支持 `curl ... | bash` 管道方式运行，请先下载脚本文件。
 
 安装后通过 `pd` 命令管理。首次运行进入交互菜单，后续每次自动显示状态面板。
 
