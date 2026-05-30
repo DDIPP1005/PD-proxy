@@ -38,10 +38,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   PD_SNELL_MODE=shadowtls  PD_HY2_HOP=5  PD_VLESS_DEST=...:443  PD_ANYTLS_PADDING=deep
 
 示例:
-  bash install-fixed.sh --install snell
   bash -c "\$(curl -fsSL ${SCRIPT_URL})"
-  bash -c "\$(curl -fsSL ${SCRIPT_URL})" pd --install snell
-  PD_HY2_HOP=5 pd --install hy2
 EOF
         exit 0 ;;
     --version|-v)
@@ -53,9 +50,6 @@ esac
 if [ "$#" -eq 0 ] && [ ! -t 0 ]; then
     echo "不能使用管道方式运行交互菜单，请改用：" >&2
     echo "  bash -c \"\$(curl -fsSL ${SCRIPT_URL})\"" >&2
-    echo "  bash <(curl -fsSL ${SCRIPT_URL})" >&2
-    echo "非交互安装也建议：" >&2
-    echo "  bash -c \"\$(curl -fsSL ${SCRIPT_URL})\" pd --install snell" >&2
     exit 1
 fi
 
