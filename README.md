@@ -2,7 +2,19 @@
 
 多协议代理一键部署脚本，专为 Surge / Shadowrocket 用户设计。
 
-数据驱动架构，全独立二进制，零运行时依赖。支持 Snell v5 / Snell v4 (ShadowTLS) / Hysteria2 / VLESS Reality / AnyTLS 五种模式。
+**3000 行纯 Bash，零运行时依赖。** 五分钟内从空白 VPS 到全协议跑通。
+
+---
+
+## 为什么选 PD-proxy
+
+- **一条命令部署五种协议** — 不用分别找 Snell、Hysteria2、Xray 的安装教程
+- **Surge 配置直达** — `pd --config snell` 输出可直接粘贴进 Surge，不用手写代理行
+- **安装即优化** — 内置 BBR 全参数调优（22 项内核参数 + fq 队列），装完协议跑满带宽
+- **防御式设计** — 安装失败自动回滚，不留残留文件，不污染系统配置
+- **数据驱动架构** — 新增协议只需定义元数据 + 实现三个函数，无需改流水线代码
+
+---
 
 ## 安装
 
@@ -10,124 +22,157 @@
 bash -c "$(curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh)"
 ```
 
-安装后通过 `pd` 命令管理。
+安装后自动生成 `pd` 命令，直接进入交互菜单。
 
-## 协议
+---
 
-| 协议 | 内存 | 磁盘 | Surge | Shadowrocket | 备注 |
-|------|------|------|:-----:|:------------:|------|
-| Snell v5 | 5MB | 20MB | ✅ | ❌ | Surge 专用，推荐首选 |
-| + ShadowTLS | +3MB | +10MB | ✅ | ❌ | Snell v4 TCP + TLS 伪装 |
-| Hysteria2 | 18MB | 30MB | ✅ | ✅ | 支持端口跳跃 |
-| VLESS Reality | 30MB | 60MB | ❌ | ✅ | 仅 Shadowrocket，Reality 伪装 |
-| AnyTLS | 5MB | 20MB | ✅ | ✅ | Surge 官方已支持 |
+## 协议支持
 
-> Snell v5 QUIC 仅 Surge 可用。VLESS 仅 Shadowrocket 可用。
+| 协议 | 内存 | 磁盘 | Surge | Shadowrocket | 说明 |
+|------|:----:|:----:|:-----:|:------------:|------|
+| **Snell v5** | 5MB | 20MB | ✅ | ❌ | QUIC 传输，Surge 推荐首选 |
+| Snell + ShadowTLS | +3MB | +10MB | ✅ | ❌ | v4 TCP + TLS 伪装，抗封锁 |
+| **Hysteria2** | 18MB | 30MB | ✅ | ✅ | 支持端口跳跃，双端通用 |
+| VLESS Reality | 30MB | 60MB | ❌ | ✅ | Xray 核心，Reality 伪装 |
+| **AnyTLS** | 5MB | 20MB | ✅ | ✅ | 轻量 TLS 隧道，双端通用 |
 
-## 管理命令
+---
 
-```bash
-pd                  # 交互菜单（状态面板 + 15 个操作）
-```
-
-### CLI 命令（15 个）
-
-```bash
-# 安装 / 卸载
-pd --install snell        # 安装 Snell v5（默认推荐）
-pd --install hy2          # 安装 Hysteria2
-pd --install vless        # 安装 VLESS Reality
-pd --install anytls       # 安装 AnyTLS
-pd --uninstall snell      # 卸载指定协议
-pd --remove-all --yes     # 静默卸载全部
-
-# 服务管理
-pd --upgrade snell        # 升级协议二进制（保留配置）
-pd --restart snell        # 重启服务
-pd --stop snell           # 停止服务
-pd --start snell          # 启动已停止的服务
-
-# 查看
-pd --status               # 状态一览：端口/运行时间/内存/版本
-pd --show                 # 完整配置（含二维码）
-pd --config snell         # 仅输出 Surge 配置行（无冗余）
-pd --config-all           # 输出所有已安装协议配置行
-pd --log snell            # 查看最近 50 行日志
-pd --export               # 导出所有配置到 /opt/pd/export.conf
-
-# 系统
-pd --bbr                  # 一键开启 BBR + 全参数优化
-pd --bbrv3                # 安装 XanMod BBRv3 内核（需重启）
-pd --update               # 更新 pd 自身
-pd --help                 # 帮助
-```
+## 使用方式
 
 ### 交互菜单
 
-二级菜单架构（v2.5.0+）：
-
-```
-主菜单: 1)安装 2)管理 3)查看 4)系统 Q)退出
-  安装: 1)Snell 2)HY2 3)VLESS 4)AnyTLS
-  管理: 1)升级 2)重启 3)停止 4)启动 5)日志 6)卸载
-  查看: 1)单协议 2)全部配置 3)导出
-  系统: 1)BBR 2)BBRv3内核 3)全部卸载
+```bash
+pd          # 进入主菜单
 ```
 
-## 环境变量参考
+```
+══════  PD-proxy v3.6.3  ══════
+  Snell v5    安装 📦  运行中 (5.2.3)  端口: 12345 14MB
+  Hysteria2   未安装
+  VLESS       未安装
+  AnyTLS      未安装
+══════════════════════════════
 
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `PD_SNELL_MODE` | `standard` | `shadowtls` 启用 Snell v4 + TLS 伪装 |
-| `PD_SNELL_VERSION` | 自动探测 | 强制指定版本（如 `v5.2.12`） |
-| `PD_SNELL_TLS_SNI` | `www.microsoft.com` | ShadowTLS 伪装域名 |
-| `PD_SNELL_TLS_VERSION` | `v3` | ShadowTLS 协议版本（v3 \| v2） |
+  [1] 安装协议    [2] 管理协议
+  [3] 查看配置    [4] 系统工具
+  [Q] 退出
+```
+
+安装子菜单支持自定义端口（自动分配 / 手动指定），Snell 安装支持 ShadowTLS 版本选择（v2 / v3）。
+
+### CLI 常用命令
+
+```bash
+# 安装
+pd --install snell                 # Snell v5
+PD_SNELL_MODE=shadowtls pd --install snell   # Snell v4 + ShadowTLS
+pd --install hy2                   # Hysteria2
+pd --install vless                 # VLESS Reality
+pd --install anytls                # AnyTLS
+
+# 查看
+pd --status                        # 状态概览
+pd --show                          # 完整配置 + 二维码
+pd --config snell                  # 仅 Surge 配置行（最常用）
+pd --config-all                    # 所有协议配置行
+
+# 管理
+pd --restart snell                 # 重启
+pd --log snell                     # 日志
+pd --upgrade snell                 # 升级二进制
+pd --remove-all --yes              # 卸载一切
+```
+
+---
+
+## BBR 优化
+
+PD-proxy 内置 TCP 优化引擎，一键开启 22 项内核参数调优。
+
+```bash
+pd --bbr                           # 秒开 BBR，即时生效
+```
+
+**调优参数覆盖**：拥塞控制（BBR + fq）、TCP 缓冲区（按带宽动态计算）、连接复用（`tcp_tw_reuse`）、TCP Fast Open、UDP 缓冲（Hysteria2/QUIC）、Keepalive、TIME_WAIT 回收等。
+
+支持环境变量控制缓冲策略：
+
+```bash
+PD_BBR_BANDWIDTH=2000 PD_BBR_REGION=overseas pd --bbr   # 2Gbps 欧美节点
+```
+
+另可独立安装 XanMod BBRv3 内核（需重启）：
+
+```bash
+pd --bbrv3
+```
+
+---
+
+## 环境变量
+
+所有变量均可在一键安装命令中前置传入，也可在交互菜单运行后通过 `pd` 命令重用。
+
+### 协议选择
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `PD_SNELL_MODE` | `standard` | `shadowtls` = Snell v4 + TLS 伪装 |
+| `PD_SNELL_VERSION` | 自动 | 锁定 Snell 版本，如 `v5.2.12` |
+| `PD_SNELL_TLS_VERSION` | `v3` | ShadowTLS 协议版本：`v3` 或 `v2` |
+| `PD_SNELL_TLS_SNI` | `www.microsoft.com` | ShadowTLS 伪装 SNI |
+| `PD_HY2_HOP` | `0` | Hysteria2 端口跳跃数 |
+| `PD_HY2_HOP_RANGE` | 自动 | 端口跳跃范围，如 `30000-30100` |
+| `PD_VLESS_DEST` | `addons.mozilla.org:443` | Reality 伪装目标 |
+| `PD_ANYTLS_SNI` | 空 | AnyTLS 伪装 SNI |
+
+### 端口指定
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `PD_SNELL_PORT` | 自动 | Snell 监听端口 |
+| `PD_HY2_PORT` | 自动 | Hysteria2 监听端口 |
+| `PD_VLESS_PORT` | 自动 | VLESS 监听端口 |
+| `PD_ANYTLS_PORT` | 自动 | AnyTLS 监听端口 |
+
+### Snell 版本探测
+| 变量 | 默认 | 说明 |
+|------|------|------|
 | `PD_SNELL_MANUAL_TIMEOUT` | `6` | Surge 手册抓取超时秒数（2–15） |
-| `PD_SNELL_PROBE_PARALLEL` | `12` | 版本探测并发数（2–32） |
-| `PD_STRICT_LATEST` | `0` | `1`=手册不可达时拒绝安装，不 fallback 探测 |
-| `PD_HY2_HOP` | `0` | Hysteria2 端口跳跃数（3/5） |
-| `PD_HY2_HOP_RANGE` | 自动分配 | 跳跃端口范围（如 `30000-30100`），优先于 HOP |
-| `PD_SNELL_PORT` | 自动分配 | Snell 监听端口 |
-| `PD_HY2_PORT` | 自动分配 | Hysteria2 监听端口 |
-| `PD_VLESS_PORT` | 自动分配 | VLESS 监听端口 |
-| `PD_ANYTLS_PORT` | 自动分配 | AnyTLS 监听端口 |
-| `PD_VLESS_DEST` | `addons.mozilla.org:443` | Reality 目标 |
-| `PD_ANYTLS_SNI` | 空 | AnyTLS SNI 伪装 |
-| `PD_XANMOD_PACKAGE` | 自动检测 | XanMod 包名（v1/v2/v3），由 CPU flags 自动判定 |
-| `PD_SCRIPT_URL` | GitHub raw URL | 脚本地址（自建镜像可覆盖） |
-| `PD_BBR_BANDWIDTH` | `1000` | 上传带宽 Mbps，影响 BBR 缓冲大小 |
-| `PD_BBR_REGION` | `asia` | `overseas` 使用更大缓冲（欧美高延迟） |
+| `PD_SNELL_PROBE_PARALLEL` | `12` | 版本探测并发请求数（2–32） |
+| `PD_STRICT_LATEST` | `0` | `1`=手册不可达时拒绝安装 |
+
+### BBR 调优
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `PD_BBR_BANDWIDTH` | `1000` | 上传带宽 Mbps，影响 TCP 缓冲大小 |
+| `PD_BBR_REGION` | `asia` | `overseas`=欧美高延迟大缓冲 |
+| `PD_XANMOD_PACKAGE` | 自动 | XanMod 内核包名，由 CPU flags 决定 |
+
+### 其他
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `PD_SCRIPT_URL` | GitHub raw | 脚本下载地址，自建镜像可覆盖 |
+
+---
 
 ## 安装路径
 
-| 路径 | 说明 |
+| 路径 | 内容 |
 |------|------|
-| `/opt/pd/` | 脚本和状态文件 |
+| `/opt/pd/` | 脚本 + 状态文件 |
+| `/usr/local/bin/pd` | pd 命令（→ `/opt/pd/install.sh`） |
 | `/opt/snell/` | Snell 二进制 + 配置 |
 | `/opt/shadowtls/` | ShadowTLS 二进制 |
 | `/opt/hysteria/` | Hysteria2 二进制 + 证书 + 配置 |
 | `/opt/xray/` | Xray-core 二进制 + 配置 |
 | `/opt/anytls/` | AnyTLS 二进制 + 密码 |
-| `/usr/local/bin/pd` | pd 命令（→ /opt/pd/install.sh 软链） |
+| `/etc/sysctl.d/99-pdproxy.conf` | BBR 内核参数 |
 
-## 架构
-
-- **数据驱动**：协议元数据定义在关联数组中，新增协议只需加一块定义 + 实现 `*_download` / `*_configure` / `*_output` 三个函数
-- **统一安装流水线**：所有协议走同一套流程（依赖→端口→密码→版本→下载→配置→systemd→防火墙→验证→保存状态→输出配置）
-- **安装失败自动回滚**：停服务 + 删 systemd 单元 + 关防火墙 + 清目录 + 删状态记录
-- **并发锁**：flock 防止多个 pd 实例同时操作
-- **零外部依赖**：状态管理用纯 bash flat file，不依赖数据库
-
-## 安全
-
-- 凭据文件（`export.conf`）+ 配置文件均 `chmod 600`
-- 二维码生成走 stdin，密钥不出现在 `/proc/cmdline`
-- 临时文件显式追踪，退出不误删其他进程文件
-- 下载的二进制验证 ELF 头 + 最小文件大小
-- `iptables-save` 写入前自动备份
+---
 
 ## 系统要求
 
-- Debian / Ubuntu（amd64 / arm64）
-- bash 4.0+（macOS 默认 /bin/bash 3.2 不支持，需 brew 安装）
-- root 权限
+- **系统**：Debian / Ubuntu（amd64 / arm64）
+- **Shell**：bash 4.0+
+- **权限**：root
+- **虚拟化**：KVM / 裸金属（OpenVZ / LXC 部分功能受限）
