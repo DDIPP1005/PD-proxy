@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v3.5.0
+# PD-proxy — 多协议代理一键部署脚本 v3.6.3
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="3.5.0"
+VERSION="3.6.3"
 SCRIPT_URL="${PD_SCRIPT_URL:-https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh}"
 
 # 纯查询命令，不需要锁和 root
@@ -35,7 +35,9 @@ PD-proxy v${VERSION} — 多协议代理一键部署
 协议: snell (Snell v5) | hy2 (Hysteria2) | vless (VLESS Reality) | anytls
 
 增强选项(环境变量):
-  PD_SNELL_MODE=shadowtls  PD_SNELL_TLS_VERSION=v3  PD_HY2_HOP=5  PD_VLESS_DEST=...:443
+  PD_SNELL_MODE=shadowtls  PD_SNELL_TLS_VERSION=v3  PD_HY2_HOP=5  PD_HY2_HOP_RANGE=30000-30100
+  PD_SNELL_PORT=12345  PD_HY2_PORT=23456  PD_VLESS_PORT=34567  PD_ANYTLS_PORT=45678
+  PD_VLESS_DEST=...:443
   PD_SNELL_MANUAL_TIMEOUT=6  PD_SNELL_PROBE_PARALLEL=12  PD_SNELL_VERSION=v5.x.x
   PD_BBR_BANDWIDTH=1000  PD_BBR_REGION=asia
 
@@ -92,6 +94,7 @@ PD_OPT_SNELL_TLS_VERSION="${PD_SNELL_TLS_VERSION:-v3}"  # v3 | v2
 
 # HY2 选项
 PD_OPT_HY2_HOP="${PD_HY2_HOP:-0}"                       # 0=单端口, 3 或 5
+PD_OPT_HY2_HOP_RANGE="${PD_HY2_HOP_RANGE:-}"             # start-end，优先于 PD_HY2_HOP
 
 # VLESS 选项
 PD_OPT_VLESS_DEST="${PD_VLESS_DEST:-addons.mozilla.org:443}"
@@ -216,6 +219,34 @@ rand_port() {
         attempts=$((attempts + 1))
     done
     die "无法分配空闲端口（10000-60000），请手动指定"
+}
+
+rand_port_range() {
+    local count="$1" used_ports=" $(get_all_ports) " attempts=0 max_base p end busy
+    [[ "$count" =~ ^[0-9]+$ ]] || die "端口范围数量无效: $count"
+    [ "$count" -ge 1 ] || die "端口范围数量无效: $count"
+    max_base=$((60000 - count + 1))
+    [ "$max_base" -ge 10000 ] || die "端口范围过大，无法在 10000-60000 内自动分配"
+    while [ $attempts -lt 200 ]; do
+        p=$(( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % (max_base - 10000 + 1) + 10000 ))
+        end=$((p + count - 1))
+        if state_port_range_conflict "$p" "$end" ""; then
+            attempts=$((attempts + 1))
+            continue
+        fi
+        busy=$(system_port_range_conflict "$p" "$end" || true)
+        if [ -n "$busy" ]; then
+            attempts=$((attempts + 1))
+            continue
+        fi
+        if echo "$used_ports" | grep -q " $p "; then
+            attempts=$((attempts + 1))
+            continue
+        fi
+        echo "$p"
+        return 0
+    done
+    die "无法分配连续空闲端口范围（${count} 个端口），请手动指定 PD_HY2_HOP_RANGE"
 }
 
 rand_pass() {
@@ -425,11 +456,104 @@ validate_port() {
     [ "$value" -ge 1 ] && [ "$value" -le 65535 ] || die "$label 端口超出范围: $value"
 }
 
+port_in_use() {
+    local port="$1"
+    ss -tlnp 2>/dev/null | grep -q ":${port} " && return 0
+    ss -ulnp 2>/dev/null | grep -q ":${port} " && return 0
+    return 1
+}
+
+system_port_range_conflict() {
+    local start="$1" end="$2" p
+    for ((p=start; p<=end; p++)); do
+        if port_in_use "$p"; then
+            echo "$p"
+            return 0
+        fi
+    done
+    return 1
+}
+
+port_var_name() {
+    local proto="$1" key
+    key=$(pkey "$proto")
+    printf 'PD_%s_PORT' "$(echo "$key" | tr '[:lower:]' '[:upper:]')"
+}
+
+set_protocol_port() {
+    local proto="$1" port="$2" port_var
+    validate_port "$port" "端口"
+    port_var=$(port_var_name "$proto")
+    printf -v "$port_var" '%s' "$port"
+}
+
+prompt_protocol_port() {
+    local proto="$1" name port_var port pc
+    name=$(pname "$proto")
+    port_var=$(port_var_name "$proto")
+    while true; do
+        echo ""
+        echo -e "  ${MAGENTA}▸ ${name} — 监听端口${RESET}"
+        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+        echo -e "  ${CYAN}│${RESET} [1] ${GREEN}自动分配${RESET}         推荐              ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [2] 自定义端口                        ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回${RESET}                            ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
+        read -r pc
+        case "$pc" in
+            2)
+                echo -ne "  输入端口 (1-65535): "
+                read -r port
+                validate_port "$port" "端口"
+                if state_port_range_conflict "$port" "$port" "$(pkey "$proto")"; then
+                    warn "端口 $port 已被其它 PD 协议使用，请换一个端口"
+                    continue
+                fi
+                if port_in_use "$port"; then
+                    warn "端口 $port 已被占用，请换一个端口"
+                    continue
+                fi
+                printf -v "$port_var" '%s' "$port"
+                return 0 ;;
+            [Bb]) return 1 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) unset "$port_var"; return 0 ;;
+        esac
+    done
+}
+
+apply_hy2_hop_range() {
+    local range="$1" start end count
+    [[ "$range" =~ ^[0-9]{1,5}-[0-9]{1,5}$ ]] || die "HY2 跳跃范围格式应为 start-end，例如 30000-30100"
+    start="${range%-*}"
+    end="${range#*-}"
+    validate_port "$start" "HY2 跳跃起始端口"
+    validate_port "$end" "HY2 跳跃结束端口"
+    [ "$end" -ge "$start" ] || die "HY2 跳跃范围结束端口必须大于等于起始端口"
+    count=$((end - start + 1))
+    [ "$count" -ge 3 ] || die "HY2 跳跃范围至少需要 3 个端口"
+    [ "$count" -le 1000 ] || die "HY2 跳跃范围最多 1000 个端口，避免防火墙规则过重"
+    if state_port_range_conflict "$start" "$end" "hy2"; then
+        die "HY2 跳跃范围 $range 与其它已安装 PD 协议端口冲突"
+    fi
+    local busy_port
+    busy_port=$(system_port_range_conflict "$start" "$end" || true)
+    [ -z "$busy_port" ] || die "HY2 跳跃范围 $range 中的端口 $busy_port 已被系统占用"
+    set_protocol_port hy2 "$start"
+    PD_OPT_HY2_HOP="$count"
+    PD_OPT_HY2_HOP_RANGE="$range"
+}
+
 validate_hy2_hop() {
-    case "$PD_OPT_HY2_HOP" in
-        0|3|5) ;;
-        *) die "PD_HY2_HOP 仅支持 0、3、5，当前: $PD_OPT_HY2_HOP" ;;
-    esac
+    if [ -n "${PD_OPT_HY2_HOP_RANGE:-}" ]; then
+        apply_hy2_hop_range "$PD_OPT_HY2_HOP_RANGE"
+    fi
+    [[ "$PD_OPT_HY2_HOP" =~ ^[0-9]+$ ]] || die "PD_HY2_HOP 必须是数字，当前: $PD_OPT_HY2_HOP"
+    if [ "$PD_OPT_HY2_HOP" -ne 0 ] && [ "$PD_OPT_HY2_HOP" -lt 3 ]; then
+        die "PD_HY2_HOP 只能为 0 或 >=3，当前: $PD_OPT_HY2_HOP"
+    fi
+    [ "$PD_OPT_HY2_HOP" -le 1000 ] || die "PD_HY2_HOP 最多 1000，避免防火墙规则过重"
 }
 
 setup_hy2_hop_rules() {
@@ -554,9 +678,30 @@ add_firewall() {
     fi
 }
 
+add_firewall_range() {
+    local start="$1" end="$2"
+    validate_port "$start" "防火墙起始端口"
+    validate_port "$end" "防火墙结束端口"
+    [ "$end" -ge "$start" ] || die "防火墙端口范围无效: $start-$end"
+    if [ "$start" = "$end" ]; then
+        add_firewall "$start"
+        return 0
+    fi
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw allow "${start}:${end}"/tcp >/dev/null 2>&1 || true
+        ufw allow "${start}:${end}"/udp >/dev/null 2>&1 || true
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -I INPUT -p tcp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
+        iptables -I INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
+        save_iptables
+    else
+        warn "未检测到 ufw/iptables，请确认云防火墙已放行端口范围 ${start}-${end}"
+    fi
+}
+
 del_firewall() {
     local port="$1"
-    if command -v ufw >/dev/null 2>&1; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
         ufw delete allow "$port"/tcp >/dev/null 2>&1 || true
         ufw delete allow "$port"/udp >/dev/null 2>&1 || true
     elif command -v iptables >/dev/null 2>&1; then
@@ -566,9 +711,31 @@ del_firewall() {
     fi
 }
 
+del_firewall_range() {
+    local start="$1" end="$2"
+    validate_port "$start" "防火墙起始端口"
+    validate_port "$end" "防火墙结束端口"
+    [ "$end" -ge "$start" ] || return 0
+    if [ "$start" = "$end" ]; then
+        del_firewall "$start"
+        return 0
+    fi
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+        ufw delete allow "${start}:${end}"/tcp >/dev/null 2>&1 || true
+        ufw delete allow "${start}:${end}"/udp >/dev/null 2>&1 || true
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -D INPUT -p tcp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
+        iptables -D INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
+        save_iptables
+    fi
+}
+
 install_deps() {
     local proto="${1:-}"
     local missing=""
+    if [ "$proto" = "hy2" ] && [ -n "${PD_OPT_HY2_HOP_RANGE:-}" ]; then
+        validate_hy2_hop
+    fi
     command -v curl >/dev/null 2>&1 || missing="$missing curl"
     [ -f /etc/ssl/certs/ca-certificates.crt ] || missing="$missing ca-certificates"
     command -v openssl >/dev/null 2>&1 || missing="$missing openssl"
@@ -655,7 +822,42 @@ state_installed() {
 
 get_all_ports() {
     [ -f "$STATE_FILE" ] || return 0
-    tr ' ' '\n' < "$STATE_FILE" | sed -n 's/^port=//p'
+    awk '
+        {
+            port=""; hop=1; status=""
+            for (i=2; i<=NF; i++) {
+                split($i, kv, "=")
+                if (kv[1] == "port") port=kv[2]
+                else if (kv[1] == "hop") hop=kv[2]
+                else if (kv[1] == "status") status=kv[2]
+            }
+            if (status != "installed" || port == "") next
+            if (hop !~ /^[0-9]+$/ || hop < 1) hop=1
+            for (p=port; p<port+hop; p++) print p
+        }
+    ' "$STATE_FILE"
+}
+
+state_port_range_conflict() {
+    local start="$1" end="$2" exclude_key="${3:-}"
+    [ -f "$STATE_FILE" ] || return 1
+    awk -v start="$start" -v end="$end" -v exclude="$exclude_key" '
+        {
+            key=$1; port=""; hop=1; status=""
+            for (i=2; i<=NF; i++) {
+                split($i, kv, "=")
+                if (kv[1] == "port") port=kv[2]
+                else if (kv[1] == "hop") hop=kv[2]
+                else if (kv[1] == "status") status=kv[2]
+            }
+            if (key == exclude || status != "installed" || port == "") next
+            if (hop !~ /^[0-9]+$/ || hop < 1) hop=1
+            other_start=port + 0
+            other_end=other_start + hop - 1
+            if (start <= other_end && end >= other_start) found=1
+        }
+        END { exit found ? 0 : 1 }
+    ' "$STATE_FILE"
 }
 
 # ============================================================
@@ -905,18 +1107,30 @@ snell_service_args() {
     echo "-c $(pdir snell)/snell.conf"
 }
 
+snell_shadowtls_unit_values() {
+    local svc_file="/etc/systemd/system/shadowtls-snell.service"
+    [ -f "$svc_file" ] || return 1
+    local tls_pass tls_sni tls_proto
+    tls_pass=$(unit_password_value "$svc_file" || echo "")
+    tls_sni=$(unit_arg_value "--tls" "$svc_file" || echo "")
+    [ -n "$tls_pass" ] && [ -n "$tls_sni" ] || return 1
+    tls_proto="2"
+    grep -q -- '--v3' "$svc_file" 2>/dev/null && tls_proto="3"
+    printf '%s\n%s\n%s\n' "$tls_pass" "$tls_sni" "$tls_proto"
+}
+
 snell_output() {
     local port="$1" psk="$2"
-    local tls_pass="" tls_sni=""
-    local svc_file="/etc/systemd/system/shadowtls-snell.service"
-    if [ -f "$svc_file" ] && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
-        # 主提取（脚本生成的标准单行 ExecStart）
-        tls_pass=$(unit_password_value "$svc_file" || echo "")
-        tls_sni=$(unit_arg_value "--tls" "$svc_file" || echo "")
+    local tls_pass="" tls_sni="" tls_proto=""
+    local tls_values=""
+    tls_values=$(snell_shadowtls_unit_values 2>/dev/null || true)
+    if [ -n "$tls_values" ]; then
+        tls_pass=$(printf '%s\n' "$tls_values" | sed -n '1p')
+        tls_sni=$(printf '%s\n' "$tls_values" | sed -n '2p')
+        tls_proto=$(printf '%s\n' "$tls_values" | sed -n '3p')
+        [ -n "$tls_proto" ] || tls_proto="2"
     fi
     if [ -n "$tls_pass" ]; then
-        local tls_proto="2"
-        grep -q -- '--v3' "$svc_file" 2>/dev/null && tls_proto="3"
         output_header "Snell v4 + ShadowTLS" "$port"
         echo -e "PSK:     ${GREEN}${psk}${RESET}"
         echo -e "TLS密码: ${GREEN}${tls_pass}${RESET}"
@@ -1063,18 +1277,17 @@ hy2_configure() {
         fi
     fi
     if [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
-        local hop_ports="$port"
+        local last_port=$((port + PD_OPT_HY2_HOP - 1))
         local i
         for i in $(seq 1 $((PD_OPT_HY2_HOP - 1))); do
             local hp=$((port + i))
-            hop_ports="$hop_ports,$hp"
             if ss -tlnp 2>/dev/null | grep -q ":${hp} " || ss -ulnp 2>/dev/null | grep -q ":${hp} "; then
                 warn "跳跃端口 $hp 已被占用，端口跳跃可能不可用"
             fi
         done
         # Hysteria2 只监听主端口，额外端口通过 nft redirect 转发到主端口。
         listen=":${port}"
-        info "端口跳跃: $hop_ports"
+        info "端口跳跃: ${port}-${last_port} (${PD_OPT_HY2_HOP} 个端口)"
     fi
     cat > "$(pdir hy2)/config.yaml" <<EOF
 listen: ${listen}
@@ -1114,12 +1327,7 @@ hy2_output() {
     hop_count=$(state_get hy2 hop)
     if [ "${hop_count:-0}" -ge 3 ] 2>/dev/null; then
         local last_port=$((port + hop_count - 1))
-        local hop_list="$port"
-        local i
-        for i in $(seq 1 $((hop_count - 1))); do
-            hop_list="${hop_list},$((port + i))"
-        done
-        echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${hop_list}${RESET}"
+        echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}${RESET}"
     else
         echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
     fi
@@ -1138,10 +1346,12 @@ vless_get_version() {
 }
 
 vless_download() {
+    local ver="$1"
     local arch_suffix="64"
     [ "$ARCH" = "arm64" ] && arch_suffix="arm64-v8a"
-    local url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${arch_suffix}.zip"
-    step "下载 Xray-core ..."
+    require_version "$ver" "Xray"
+    local url="https://github.com/XTLS/Xray-core/releases/download/${ver}/Xray-linux-${arch_suffix}.zip"
+    step "下载 Xray-core $ver ..."
     mkdir -p "$(pdir vless)"
     local tmpzip
     tmpzip=$(mktemp_pd)
@@ -1381,18 +1591,46 @@ install_protocol() {
         return 0
     fi
 
-    local port port_var="PD_$(echo "$key" | tr '[:lower:]' '[:upper:]')_PORT"
+    if [ "$proto" = "hy2" ] && [ -n "${PD_OPT_HY2_HOP_RANGE:-}" ]; then
+        validate_hy2_hop
+    fi
+
+    local port port_var
+    port_var=$(port_var_name "$proto")
     if [ -n "${!port_var:-}" ]; then
         port="${!port_var}"
         validate_port "$port" "$port_var"
+        if state_port_range_conflict "$port" "$port" "$key"; then
+            die "端口 $port 已被其它已安装 PD 协议使用，请更换 $port_var"
+        fi
+        if port_in_use "$port"; then
+            die "端口 $port 已被系统占用，请更换 $port_var"
+        fi
         info "端口(手动): $port"
     else
-        port=$(rand_port)
+        if [ "$proto" = "hy2" ]; then
+            validate_hy2_hop
+            if [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
+                port=$(rand_port_range "$PD_OPT_HY2_HOP")
+            else
+                port=$(rand_port)
+            fi
+        else
+            port=$(rand_port)
+        fi
         info "端口(自动): $port"
     fi
     if [ "$proto" = "hy2" ]; then
         validate_hy2_hop
         [ $((port + PD_OPT_HY2_HOP - 1)) -le 65535 ] || die "HY2 跳跃端口超过 65535，请降低 ${port_var} 或 PD_HY2_HOP"
+        if [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null && state_port_range_conflict "$port" "$((port + PD_OPT_HY2_HOP - 1))" "$key"; then
+            die "HY2 跳跃端口范围 ${port}-$((port + PD_OPT_HY2_HOP - 1)) 与其它已安装 PD 协议端口冲突"
+        fi
+        if [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
+            local busy_port
+            busy_port=$(system_port_range_conflict "$port" "$((port + PD_OPT_HY2_HOP - 1))" || true)
+            [ -z "$busy_port" ] || die "HY2 跳跃端口范围 ${port}-$((port + PD_OPT_HY2_HOP - 1)) 中的端口 $busy_port 已被系统占用"
+        fi
     fi
 
     # 回滚陷阱（端口已确定后才设置，确保 _rollback_port 被正确展开）
@@ -1407,7 +1645,12 @@ install_protocol() {
             rm -rf '/opt/shadowtls'
         fi
         systemctl daemon-reload
-        del_firewall '$_rollback_port'
+        if [ '$proto' = 'hy2' ] && [ "\${PD_OPT_HY2_HOP:-0}" -ge 3 ] 2>/dev/null; then
+            _pd_rb_end=$((_rollback_port + PD_OPT_HY2_HOP - 1))
+            del_firewall_range '$_rollback_port' "\$_pd_rb_end"
+        else
+            del_firewall '$_rollback_port'
+        fi
         if [ '$proto' = 'hy2' ]; then
             clear_hy2_hop_rules
         fi
@@ -1468,16 +1711,16 @@ install_protocol() {
         snell_shadowtls_configure "$port" "$snell_int"
     fi
 
-    add_firewall "$port"
-    # 端口跳跃：额外开放跳跃端口
     if [ "$proto" = "hy2" ] && [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
-        local i
-        for i in $(seq 1 $((PD_OPT_HY2_HOP - 1))); do
-            add_firewall $((port + i))
-        done
+        add_firewall_range "$port" "$((port + PD_OPT_HY2_HOP - 1))"
         state_set "$key" "hop" "$PD_OPT_HY2_HOP"
-    elif [ "$proto" = "hy2" ]; then
-        state_set "$key" "hop" "0"
+        [ -n "${PD_OPT_HY2_HOP_RANGE:-}" ] && state_set "$key" "hop_range" "$PD_OPT_HY2_HOP_RANGE"
+    else
+        add_firewall "$port"
+        if [ "$proto" = "hy2" ]; then
+            state_set "$key" "hop" "0"
+            state_set "$key" "hop_range" ""
+        fi
     fi
     verify_port "$port" "$svc" || warn "请检查服务状态"
     # Snell + ShadowTLS: 外部端口由 shadowtls-snell 监听
@@ -1527,8 +1770,6 @@ uninstall_protocol() {
     systemctl daemon-reload
     systemctl reset-failed "${svc}.service" 2>/dev/null || true
 
-    [ -n "$port" ] && del_firewall "$port"
-    # HY2 端口跳跃防火墙清理
     if [ "$proto" = "hy2" ]; then
         local listen_line
         listen_line=$(grep 'listen:' "$(pdir hy2)/config.yaml" 2>/dev/null || echo "")
@@ -1536,12 +1777,13 @@ uninstall_protocol() {
         hop_count=$(state_get "$key" "hop")
         [ -n "$hop_count" ] || hop_count=$(echo "$listen_line" | tr ',' '\n' | wc -l | tr -d ' \n')
         if [ "$hop_count" -ge 2 ] 2>/dev/null; then
-            local i
-            for i in $(seq 1 $((hop_count - 1))); do
-                del_firewall $((port + i)) 2>/dev/null || true
-            done
+            del_firewall_range "$port" "$((port + hop_count - 1))" 2>/dev/null || true
             clear_hy2_hop_rules
+        else
+            [ -n "$port" ] && del_firewall "$port"
         fi
+    else
+        [ -n "$port" ] && del_firewall "$port"
     fi
     rm -rf "$(pdir "$proto")"
     state_del "$key"
@@ -1781,12 +2023,13 @@ show_config_only() {
         snell)
             local psk tls_pass tls_sni tls_proto
             psk=$(conf_value "psk" "$(pdir snell)/snell.conf" || echo "")
-            local svc_file="/etc/systemd/system/shadowtls-snell.service"
-            if [ -f "$svc_file" ] && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
-                tls_pass=$(unit_password_value "$svc_file" || echo "")
-                tls_sni=$(unit_arg_value "--tls" "$svc_file" || echo "")
-                tls_proto="2"
-                grep -q -- '--v3' "$svc_file" 2>/dev/null && tls_proto="3"
+            local tls_values=""
+            tls_values=$(snell_shadowtls_unit_values 2>/dev/null || true)
+            if [ -n "$tls_values" ]; then
+                tls_pass=$(printf '%s\n' "$tls_values" | sed -n '1p')
+                tls_sni=$(printf '%s\n' "$tls_values" | sed -n '2p')
+                tls_proto=$(printf '%s\n' "$tls_values" | sed -n '3p')
+                [ -n "$tls_proto" ] || tls_proto="2"
                 echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}"
             else
                 echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true"
@@ -1797,12 +2040,7 @@ show_config_only() {
             hop=$(state_get "$key" "hop")
             if [ "$hop" -ge 3 ] 2>/dev/null; then
                 local last_port=$((port + hop - 1))
-                local hop_list="$port"
-                local i
-                for i in $(seq 1 $((hop - 1))); do
-                    hop_list="${hop_list},$((port + i))"
-                done
-                echo "Proxy = hysteria2, ${IP}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${hop_list}"
+                echo "Proxy = hysteria2, ${IP}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}"
             else
                 echo "Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
             fi
@@ -1928,7 +2166,7 @@ show_config() {
 calculate_bbr_buf() {
     local mbps=${1:-1000} region=${2:-asia}
     [[ "$mbps" =~ ^[0-9]+$ ]] || mbps=1000
-    local buf
+    local buf=""
     if [ "$region" = "overseas" ]; then
         [ "$mbps" -le 100 ] && buf=8
         [ "$mbps" -le 300 ] && [ -z "$buf" ] && buf=16
@@ -1948,6 +2186,7 @@ calculate_bbr_buf() {
 clean_sysctl_conflicts() {
     local conf=/etc/sysctl.conf changed=0
     [ -f "$conf" ] || return
+    [ -f /etc/sysctl.conf.pdproxy.bak ] || cp "$conf" /etc/sysctl.conf.pdproxy.bak 2>/dev/null || true
     local -a keys=(
         "net\\.ipv4\\.tcp_congestion_control"
         "net\\.core\\.default_qdisc"
@@ -1978,30 +2217,60 @@ apply_tc_fq() {
     [ $applied -gt 0 ] && info "已对 ${applied} 个网卡应用 fq 队列算法（即时生效）"
 }
 
+select_xanmod_package() {
+    if [ -n "${PD_XANMOD_PACKAGE:-}" ]; then
+        echo "$PD_XANMOD_PACKAGE"
+        return 0
+    fi
+    local flags=""
+    flags=$(sed -n 's/^flags[[:space:]]*: //p' /proc/cpuinfo 2>/dev/null | head -1 || true)
+    local has_v2=true has_v3=true f
+    for f in cx16 lahf_lm popcnt sse4_1 sse4_2 ssse3; do
+        echo " $flags " | grep -q " $f " || has_v2=false
+    done
+    for f in avx avx2 bmi1 bmi2 f16c fma movbe xsave; do
+        echo " $flags " | grep -q " $f " || has_v3=false
+    done
+    if ! echo " $flags " | grep -Eq ' (lzcnt|abm) '; then
+        has_v3=false
+    fi
+    if $has_v2 && $has_v3; then
+        echo "linux-xanmod-x64v3"
+    elif $has_v2; then
+        echo "linux-xanmod-x64v2"
+    else
+        echo "linux-xanmod-x64v1"
+    fi
+}
+
 enable_bbr() {
     local running_cc buf_mb buf_bytes band region
     running_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
 
-    # ① 已运行：输出摘要
+    # ① 已运行：输出摘要，但仍继续刷新调优参数
     if [ "$running_cc" = "bbr" ]; then
         local qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
         local rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "?")
         echo -e "  BBR 已运行：${GREEN}${running_cc}${RESET} / qdisc: ${CYAN}${qdisc}${RESET}"
         echo -e "  缓冲上限: rmem_max=$(numfmt --to=iec "$rmem_max" 2>/dev/null || echo "$rmem_max")"
-        return
     fi
 
-    # ② 内核版本
-    local kernel_major=$(uname -r | cut -d. -f1)
-    if [ "$kernel_major" -lt 4 ]; then
-        warn "内核版本过低 ($(uname -r))，BBR 需要 ≥ 4.9"
-        return
-    fi
+    # ② 未运行 BBR 时才检查内核/虚拟化；已运行 BBR 则允许刷新调优参数。
+    if [ "$running_cc" != "bbr" ]; then
+        local kernel_major kernel_minor
+        kernel_major=$(uname -r | cut -d. -f1)
+        kernel_minor=$(uname -r | cut -d. -f2 | sed 's/[^0-9].*//')
+        [[ "$kernel_major" =~ ^[0-9]+$ ]] || kernel_major=0
+        [[ "$kernel_minor" =~ ^[0-9]+$ ]] || kernel_minor=0
+        if [ "$kernel_major" -lt 4 ] || { [ "$kernel_major" -eq 4 ] && [ "$kernel_minor" -lt 9 ]; }; then
+            warn "内核版本过低 ($(uname -r))，BBR 需要 ≥ 4.9"
+            return
+        fi
 
-    # ③ 虚拟化检测
-    if detect_virt 2>/dev/null | grep -qiE 'openvz|virtuozzo|lxc'; then
-        warn "当前虚拟化环境不支持加载内核模块，无法开启 BBR"
-        return
+        if detect_virt 2>/dev/null | grep -qiE 'openvz|virtuozzo|lxc'; then
+            warn "当前虚拟化环境不支持加载内核模块，无法开启 BBR"
+            return
+        fi
     fi
 
     # ④ 清理旧配置
@@ -2065,9 +2334,9 @@ net.ipv4.udp_wmem_min=8192
 net.ipv4.tcp_syncookies=1
 SYSCTL_EOF
 
-    # ⑦ 应用
-    sysctl -p "$sysctl_conf" >/dev/null 2>&1
+    # ⑦ 应用：先尝试加载模块，再应用 sysctl，避免 congestion_control=bbr 失败提前退出。
     modprobe tcp_bbr 2>/dev/null || true
+    sysctl -p "$sysctl_conf" >/dev/null 2>&1 || warn "部分内核参数未能立即应用，可能需要重启或内核不支持"
 
     # ⑧ tc fq 即时生效
     apply_tc_fq
@@ -2097,26 +2366,41 @@ enable_bbrv3_kernel() {
         return
     fi
 
-    # ③ 确认
+    # ③ 架构限制：XanMod x64 系列仅适用于 x86_64/amd64
+    case "$(uname -m)" in
+        x86_64|amd64) ;;
+        *) warn "XanMod x64 内核仅支持 x86_64/amd64，当前架构: $(uname -m)"; return ;;
+    esac
+
+    # ④ 确认
     echo ""
     warn "安装 XanMod 内核后需要重启系统才能生效"
     echo -ne "  是否继续？(y/N): "
-    read -r ans
+    read -r ans || ans=""
     [ "$ans" != "y" ] && [ "$ans" != "Y" ] && { info "已取消"; return; }
 
-    # ④ 安装依赖
+    # ⑤ 安装依赖
     step "安装 XanMod BBRv3 内核..."
-    apt-get update -qq 2>/dev/null || true
-    apt-get install -y -qq gnupg lsb-release curl 2>/dev/null || true
+    apt-get update -qq || { warn "apt-get update 失败，无法安装 XanMod"; return; }
+    apt-get install -y -qq gnupg lsb-release curl ca-certificates >/dev/null || { warn "安装 XanMod 依赖失败"; return; }
     mkdir -p /etc/apt/keyrings
 
-    curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null
+    local key_tmp
+    key_tmp=$(mktemp_pd)
+    curl -fsSL https://dl.xanmod.org/archive.key -o "$key_tmp" || { warn "下载 XanMod GPG key 失败"; return; }
+    rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg
+    gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg "$key_tmp" 2>/dev/null || { warn "导入 XanMod GPG key 失败"; return; }
     echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $(lsb_release -sc 2>/dev/null || echo 'bookworm') main" \
         > /etc/apt/sources.list.d/xanmod-release.list
 
-    apt-get update -qq 2>/dev/null || true
-    if ! apt-get install -y -qq linux-xanmod-x64v3 2>/dev/null; then
-        warn "XanMod 内核安装失败，请检查 APT 源或系统兼容性"
+    apt-get update -qq || { rm -f /etc/apt/sources.list.d/xanmod-release.list; warn "刷新 XanMod APT 源失败，已移除 XanMod 源"; return; }
+    local xanmod_pkg
+    xanmod_pkg=$(select_xanmod_package)
+    info "选择内核包: $xanmod_pkg"
+    apt-cache show "$xanmod_pkg" >/dev/null 2>&1 || { rm -f /etc/apt/sources.list.d/xanmod-release.list; warn "当前系统源中没有 $xanmod_pkg 包，已移除 XanMod 源"; return; }
+    if ! apt-get install -y -qq "$xanmod_pkg" 2>/dev/null; then
+        rm -f /etc/apt/sources.list.d/xanmod-release.list
+        warn "XanMod 内核安装失败，已移除 XanMod 源，请检查 APT 源或系统兼容性"
         return
     fi
     update-grub 2>/dev/null || true
@@ -2125,7 +2409,7 @@ enable_bbrv3_kernel() {
     echo ""
     warn "需要重启才能生效，重启后执行 pd --bbr 即可开启 BBRv3"
     echo -ne "  是否现在重启？(y/N): "
-    read -r ans
+    read -r ans || ans=""
     [ "$ans" != "y" ] && [ "$ans" != "Y" ] && { info "请稍后手动重启"; return; }
     reboot
 }
@@ -2214,7 +2498,7 @@ remove_all() {
         info "自动确认 (--yes)"
     else
         echo -n "确认？输入 yes: "
-        read -r confirm
+        read -r confirm || confirm=""
         [ "$confirm" = "yes" ] || { info "已取消"; return; }
     fi
 
@@ -2291,6 +2575,7 @@ cli_dispatch() {
             # CLI 路径：无环境变量时重置为默认值，防止交互菜单污染
             [ -z "${PD_SNELL_MODE:-}" ] && PD_OPT_SNELL_MODE="standard"
             [ -z "${PD_HY2_HOP:-}" ] && PD_OPT_HY2_HOP=0
+            [ -z "${PD_HY2_HOP_RANGE:-}" ] && PD_OPT_HY2_HOP_RANGE=""
             [ -z "${PD_VLESS_DEST:-}" ] && PD_OPT_VLESS_DEST="addons.mozilla.org:443"
             [ -z "${PD_VLESS_SNI:-}" ] && PD_OPT_VLESS_SNI="addons.mozilla.org"
             [ -z "${PD_VLESS_TRANSPORT:-}" ] && PD_OPT_VLESS_TRANSPORT="tcp"
@@ -2364,9 +2649,9 @@ case "${1:-}" in
     --export)
         check_root; run_export; exit 0 ;;
     --bbr)
-        check_root; enable_bbr; exit 0 ;;
+        check_root; detect_os; enable_bbr; exit 0 ;;
     --bbrv3)
-        check_root; enable_bbrv3_kernel; exit 0 ;;
+        check_root; detect_os; detect_arch; enable_bbrv3_kernel; exit 0 ;;
     --update)
         check_root; PD_UPDATE=1 self_install
         info "PD-proxy 修复版已更新"; exit 0 ;;
@@ -2428,12 +2713,14 @@ menu_snell_config() {
             *) warn "无效选择" ;;
         esac
     done
+    prompt_protocol_port snell || return 1
     install_protocol snell
     return 0
 }
 
 # ---- HY2 配置子菜单 ----
 menu_hy2_config() {
+    local hy2_range
     while true; do
         echo ""
         echo -e "  ${MAGENTA}▸ Hysteria2 — 端口模式${RESET}"
@@ -2441,14 +2728,20 @@ menu_hy2_config() {
         echo -e "  ${CYAN}│${RESET} [1] ${GREEN}单端口${RESET}           标准              ${CYAN}│${RESET}"
         echo -e "  ${CYAN}│${RESET} [2] ${MAGENTA}3 端口跳跃${RESET}       轻量混淆          ${CYAN}│${RESET}"
         echo -e "  ${CYAN}│${RESET} [3] ${MAGENTA}5 端口跳跃${RESET}       深度混淆 (推荐)   ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [4] ${MAGENTA}范围端口跳跃${RESET}     自定义 start-end ${CYAN}│${RESET}"
         echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回${RESET}                            ${CYAN}│${RESET}"
         echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
         echo -ne "  ${MAGENTA}▸${RESET} 选择: "
         read -r cc
         case "$cc" in
-            1) PD_OPT_HY2_HOP=0; break ;;
-            2) PD_OPT_HY2_HOP=3; break ;;
-            3) PD_OPT_HY2_HOP=5; break ;;
+            1) PD_OPT_HY2_HOP=0; PD_OPT_HY2_HOP_RANGE=""; prompt_protocol_port hy2 || return 1; break ;;
+            2) PD_OPT_HY2_HOP=3; PD_OPT_HY2_HOP_RANGE=""; prompt_protocol_port hy2 || return 1; break ;;
+            3) PD_OPT_HY2_HOP=5; PD_OPT_HY2_HOP_RANGE=""; prompt_protocol_port hy2 || return 1; break ;;
+            4)
+                echo -ne "  输入跳跃范围 (例如 30000-30100): "
+                read -r hy2_range
+                apply_hy2_hop_range "$hy2_range"
+                break ;;
             [Bb]) return 1 ;;
             [Qq]) info "再见 👋"; exit 0 ;;
             *) warn "无效选择" ;;
@@ -2495,6 +2788,7 @@ menu_vless_config() {
             5) PD_OPT_VLESS_FP="randomized" ;;
             *) PD_OPT_VLESS_FP="chrome" ;;
         esac
+        prompt_protocol_port vless || return 1
         break
     done
     install_protocol vless
@@ -2535,6 +2829,7 @@ menu_anytls_config() {
             4) PD_OPT_ANYTLS_SNI="cloudflare.com" ;;
             *) PD_OPT_ANYTLS_SNI="" ;;
         esac
+        prompt_protocol_port anytls || return 1
         break
     done
     install_protocol anytls

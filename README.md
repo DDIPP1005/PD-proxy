@@ -86,8 +86,14 @@ pd --help                 # 帮助
 | `PD_SNELL_PROBE_PARALLEL` | `12` | 版本探测并发数（2–32） |
 | `PD_STRICT_LATEST` | `0` | `1`=手册不可达时拒绝安装，不 fallback 探测 |
 | `PD_HY2_HOP` | `0` | Hysteria2 端口跳跃数（3/5） |
+| `PD_HY2_HOP_RANGE` | 自动分配 | 跳跃端口范围（如 `30000-30100`），优先于 HOP |
+| `PD_SNELL_PORT` | 自动分配 | Snell 监听端口 |
+| `PD_HY2_PORT` | 自动分配 | Hysteria2 监听端口 |
+| `PD_VLESS_PORT` | 自动分配 | VLESS 监听端口 |
+| `PD_ANYTLS_PORT` | 自动分配 | AnyTLS 监听端口 |
 | `PD_VLESS_DEST` | `addons.mozilla.org:443` | Reality 目标 |
 | `PD_ANYTLS_SNI` | 空 | AnyTLS SNI 伪装 |
+| `PD_XANMOD_PACKAGE` | 自动检测 | XanMod 包名（v1/v2/v3），由 CPU flags 自动判定 |
 | `PD_SCRIPT_URL` | GitHub raw URL | 脚本地址（自建镜像可覆盖） |
 | `PD_BBR_BANDWIDTH` | `1000` | 上传带宽 Mbps，影响 BBR 缓冲大小 |
 | `PD_BBR_REGION` | `asia` | `overseas` 使用更大缓冲（欧美高延迟） |
