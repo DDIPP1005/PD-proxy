@@ -7,17 +7,21 @@
 ## 安装
 
 ```bash
-# 1. 下载脚本
+# 方式一：下载脚本文件后运行（推荐）
 curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh -o /tmp/pd.sh
-
-# 2. 运行（交互菜单）
 bash /tmp/pd.sh
 
-# 或直接安装指定协议
+# 方式二：bash -c 子 shell（无需落盘）
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh)"
+
+# 方式三：进程替换
+bash <(curl -fsSL https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh)
+
+# 直接安装指定协议
 bash /tmp/pd.sh --install snell
 ```
 
-> 不支持 `curl ... | bash` 管道方式运行，请先下载脚本文件。
+> 不支持 `curl ... | bash` 管道方式，stdin 会被脚本占用导致交互菜单无法读取键盘。
 
 安装后通过 `pd` 命令管理。首次运行进入交互菜单，后续每次自动显示状态面板。
 

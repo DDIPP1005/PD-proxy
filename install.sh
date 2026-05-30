@@ -13,6 +13,7 @@ set -euo pipefail
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 bash 4.0+，当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
 VERSION="2.7.9"
+SCRIPT_URL="${PD_SCRIPT_URL:-https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh}"
 
 # 纯查询命令，不需要锁和 root
 case "${1:-}" in
@@ -38,6 +39,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
 
 示例:
   bash install-fixed.sh --install snell
+  bash -c "$(curl -fsSL ${SCRIPT_URL})"
   PD_HY2_HOP=5 pd --install hy2
 EOF
         exit 0 ;;
@@ -45,12 +47,14 @@ EOF
         echo "PD-proxy v${VERSION}"; exit 0 ;;
 esac
 
-# 不支持 `curl ... | bash` 直接管道运行：无法可靠持久化修复版脚本，后续 pd 可能回退原版。
+# 不支持 `curl ... | bash` 直接管道运行：stdin 会被脚本占用，交互菜单无法读取键盘。
+# 请使用 `bash -c "$(curl -fsSL URL)"` 或 `bash <(curl -fsSL URL)`。
 if [ ! -t 0 ]; then
-    echo "请先下载脚本文件再运行，不能直接使用管道方式：" >&2
-    echo "  curl -fsSL <脚本URL> -o /tmp/pd.sh && bash /tmp/pd.sh" >&2
-    echo "  bash /tmp/pd.sh --install snell" >&2
-    echo "  PD_HY2_HOP=5 bash /tmp/pd.sh --install hy2" >&2
+    echo "不能使用管道方式运行交互菜单，请改用：" >&2
+    echo "  bash -c \"\$(curl -fsSL ${SCRIPT_URL})\"" >&2
+    echo "  bash <(curl -fsSL ${SCRIPT_URL})" >&2
+    echo "非交互安装也建议：" >&2
+    echo "  bash -c \"\$(curl -fsSL ${SCRIPT_URL})\" -- --install snell" >&2
     exit 1
 fi
 
@@ -763,13 +767,24 @@ install_shadowtls() {
     local dir bin
     dir="/opt/shadowtls"
     bin="$dir/shadow-tls"
-    [ -x "$bin" ] && { info "ShadowTLS 已安装" >&2; echo "$bin"; return 0; }
 
-    step "下载 ShadowTLS ..." >&2
     local ver
     ver=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" 2>/dev/null \
         | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
     [ -n "$ver" ] || die "ShadowTLS 版本检测失败"
+
+    if [ -x "$bin" ]; then
+        local current_ver
+        current_ver=$("$bin" --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1 || echo "")
+        if [ "v${current_ver}" = "$ver" ]; then
+            info "ShadowTLS 已是最新版 $ver" >&2
+            echo "$bin"
+            return 0
+        fi
+        step "升级 ShadowTLS ${current_ver:-unknown} → $ver ..." >&2
+    else
+        step "下载 ShadowTLS $ver ..." >&2
+    fi
 
     # shadow-tls release 用 x86_64 / aarch64 而非 amd64 / arm64
     local stls_arch="$ARCH"
@@ -1173,7 +1188,8 @@ install_protocol() {
                 return 1
             fi
         fi
-        warn "$name 已安装，跳过"
+        warn "$name 已安装，执行最新版检查..."
+        upgrade_protocol "$proto"
         return 0
     fi
 
@@ -1363,7 +1379,9 @@ upgrade_protocol() {
         ver=$(snell_v4_get_version)
         local old_ver=$(state_get "$key" "version")
         if [ "$ver" = "$old_ver" ] && [ -n "$ver" ]; then
-            info "Snell v4 已是最新版 ($ver)，跳过"
+            info "Snell v4 已是最新版 ($ver)"
+            install_shadowtls >/dev/null
+            systemctl restart shadowtls-snell 2>/dev/null || warn "ShadowTLS 启动失败"
             return 0
         fi
         info "版本: $old_ver → $ver"
@@ -1430,6 +1448,7 @@ upgrade_protocol() {
     fi
     # Snell + ShadowTLS: Requires= 只传播 stop 不传播 start，需手动拉起
     if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+        install_shadowtls >/dev/null
         systemctl restart shadowtls-snell 2>/dev/null || warn "ShadowTLS 启动失败"
     fi
     if [ "$proto" = "hy2" ]; then
@@ -1732,6 +1751,8 @@ self_install() {
     local source_path="${BASH_SOURCE[0]}"
     local source_is_file=false
     [ -n "$source_path" ] && [ "$source_path" != "bash" ] && [ "$source_path" != "-" ] && [ -r "$source_path" ] && source_is_file=true
+    local install_from_url=false
+    [ -n "${SCRIPT_URL:-}" ] && install_from_url=true
     if [ "${PD_UPDATE:-}" = "1" ]; then
         if $source_is_file; then
             local src_path dst_path
@@ -1741,8 +1762,18 @@ self_install() {
                 cp "$source_path" "$BASE_DIR/install.sh"
                 chmod +x "$BASE_DIR/install.sh"
             fi
+        elif $install_from_url; then
+            local tmp_pd
+            tmp_pd=$(mktemp_pd)
+            curl -fsSL "$SCRIPT_URL" -o "$tmp_pd" || {
+                rm -f "$tmp_pd"
+                warn "无法从 SCRIPT_URL 同步脚本: $SCRIPT_URL"
+                return 1
+            }
+            mv "$tmp_pd" "$BASE_DIR/install.sh"
+            chmod +x "$BASE_DIR/install.sh"
         elif [ ! -f "$BASE_DIR/install.sh" ]; then
-            warn "找不到当前修复版脚本，无法刷新 /opt/pd/install.sh"
+            warn "找不到当前脚本文件，无法刷新 /opt/pd/install.sh"
             return 1
         fi
     elif $source_is_file; then
@@ -1754,8 +1785,20 @@ self_install() {
             chmod +x "$BASE_DIR/install.sh"
         fi
     elif [ ! -f "$BASE_DIR/install.sh" ]; then
-        warn "当前通过管道执行，无法持久化修复版 pd 命令；请先下载脚本文件后运行"
-        return 1
+        if $install_from_url; then
+            local tmp_pd
+            tmp_pd=$(mktemp_pd)
+            curl -fsSL "$SCRIPT_URL" -o "$tmp_pd" || {
+                rm -f "$tmp_pd"
+                warn "无法从 SCRIPT_URL 同步脚本: $SCRIPT_URL"
+                return 1
+            }
+            mv "$tmp_pd" "$BASE_DIR/install.sh"
+            chmod +x "$BASE_DIR/install.sh"
+        else
+            warn "当前脚本不是文件，无法持久化 pd 命令；请设置 PD_SCRIPT_URL 或下载后运行"
+            return 1
+        fi
     fi
     ln -sf "$BASE_DIR/install.sh" "$INSTALLED_BIN" 2>/dev/null || true
 }
