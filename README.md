@@ -56,7 +56,8 @@ pd --log snell            # 查看最近 50 行日志
 pd --export               # 导出所有配置到 /opt/pd/export.conf
 
 # 系统
-pd --bbr                  # 一键开启 BBR 优化
+pd --bbr                  # 一键开启 BBR + 全参数优化
+pd --bbrv3                # 安装 XanMod BBRv3 内核（需重启）
 pd --update               # 更新 pd 自身
 pd --help                 # 帮助
 ```
@@ -70,7 +71,7 @@ pd --help                 # 帮助
   安装: 1)Snell 2)HY2 3)VLESS 4)AnyTLS
   管理: 1)升级 2)重启 3)停止 4)启动 5)日志 6)卸载
   查看: 1)单协议 2)全部配置 3)导出
-  系统: 1)BBR 2)全部卸载
+  系统: 1)BBR 2)BBRv3内核 3)全部卸载
 ```
 
 ## 环境变量参考
@@ -88,6 +89,8 @@ pd --help                 # 帮助
 | `PD_VLESS_DEST` | `addons.mozilla.org:443` | Reality 目标 |
 | `PD_ANYTLS_SNI` | 空 | AnyTLS SNI 伪装 |
 | `PD_SCRIPT_URL` | GitHub raw URL | 脚本地址（自建镜像可覆盖） |
+| `PD_BBR_BANDWIDTH` | `1000` | 上传带宽 Mbps，影响 BBR 缓冲大小 |
+| `PD_BBR_REGION` | `asia` | `overseas` 使用更大缓冲（欧美高延迟） |
 
 ## 安装路径
 

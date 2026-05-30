@@ -29,14 +29,15 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   pd --log        <协议>   日志  pd --config    <协议> 配置
   pd --config-all          全部配置  pd --export   导出
   pd --status              状态  pd --show      详情
-  pd --bbr                 开启BBR  pd --update   更新
-  pd --remove-all [--yes]  卸载全部
+  pd --bbr                 开启BBR  pd --bbrv3     BBRv3内核
+  pd --update              更新    pd --remove-all [--yes]  卸载全部
 
 协议: snell (Snell v5) | hy2 (Hysteria2) | vless (VLESS Reality) | anytls
 
 增强选项(环境变量):
   PD_SNELL_MODE=shadowtls  PD_SNELL_TLS_VERSION=v3  PD_HY2_HOP=5  PD_VLESS_DEST=...:443
   PD_SNELL_MANUAL_TIMEOUT=6  PD_SNELL_PROBE_PARALLEL=12  PD_SNELL_VERSION=v5.x.x
+  PD_BBR_BANDWIDTH=1000  PD_BBR_REGION=asia
 
 示例:
   bash -c "\$(curl -fsSL ${SCRIPT_URL})"
@@ -1924,44 +1925,209 @@ show_config() {
 # BBR
 # ============================================================
 
-enable_bbr() {
-    # 优先检查运行时（比模块检测可靠：BBR 可能编译进内核而非模块）
-    local running_cc
-    running_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
-    if [ "$running_cc" = "bbr" ]; then
-        info "BBR 已运行，跳过"
-        return
-    fi
-
-    local kernel_ver=$(uname -r | cut -d. -f1)
-    if [ "$kernel_ver" -lt 4 ]; then
-        warn "内核版本过低 ($(uname -r))，不支持 BBR"
-        return
-    fi
-
-    # 检查持久化配置（避免重复写入 sysctl.conf）
-    if grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf 2>/dev/null; then
-        info "BBR 已配置（sysctl.conf），加载中..."
-        sysctl -p >/dev/null 2>&1 || true
-        running_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
-        if [ "$running_cc" = "bbr" ]; then
-            info "BBR 已开启"
-        else
-            warn "BBR 配置存在但未生效，可能需要重启或加载 tcp_bbr 模块"
-        fi
-        return
-    fi
-
-    echo "net.core.default_qdisc=fq" >> /etc/sysctl.conf
-    echo "net.ipv4.tcp_congestion_control=bbr" >> /etc/sysctl.conf
-    sysctl -p >/dev/null 2>&1 || true
-    running_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
-    if [ "$running_cc" = "bbr" ]; then
-        info "BBR 已开启"
+calculate_bbr_buf() {
+    local mbps=${1:-1000} region=${2:-asia}
+    [[ "$mbps" =~ ^[0-9]+$ ]] || mbps=1000
+    local buf
+    if [ "$region" = "overseas" ]; then
+        [ "$mbps" -le 100 ] && buf=8
+        [ "$mbps" -le 300 ] && [ -z "$buf" ] && buf=16
+        [ "$mbps" -le 500 ] && [ -z "$buf" ] && buf=32
+        [ -z "$buf" ] && buf=64
     else
-        warn "BBR 写入 sysctl.conf 但未生效，尝试加载模块..."
-        modprobe tcp_bbr 2>/dev/null && sysctl -p >/dev/null 2>&1 && info "BBR 已开启" || warn "BBR 开启失败，可能需要重启系统"
+        [ "$mbps" -le 100 ] && buf=4
+        [ "$mbps" -le 300 ] && [ -z "$buf" ] && buf=8
+        [ "$mbps" -le 500 ] && [ -z "$buf" ] && buf=12
+        [ "$mbps" -le 1000 ] && [ -z "$buf" ] && buf=16
+        [ "$mbps" -le 2000 ] && [ -z "$buf" ] && buf=24
+        [ -z "$buf" ] && buf=32
     fi
+    echo "$buf"
+}
+
+clean_sysctl_conflicts() {
+    local conf=/etc/sysctl.conf changed=0
+    [ -f "$conf" ] || return
+    local -a keys=(
+        "net\\.ipv4\\.tcp_congestion_control"
+        "net\\.core\\.default_qdisc"
+        "net\\.core\\.rmem_max"
+        "net\\.core\\.wmem_max"
+        "net\\.ipv4\\.tcp_rmem"
+        "net\\.ipv4\\.tcp_wmem"
+    )
+    local k
+    for k in "${keys[@]}"; do
+        if grep -q "^${k}" "$conf" 2>/dev/null; then
+            sed -i -E "s/^(${k}.*)/#&  # 已迁移到 \/etc\/sysctl.d\/99-pdproxy.conf/" "$conf"
+            changed=1
+        fi
+    done
+    [ "$changed" -eq 1 ] && info "已迁移 sysctl.conf 中的旧 BBR 配置"
+}
+
+apply_tc_fq() {
+    if ! command -v tc >/dev/null 2>&1; then return; fi
+    local applied=0 dev
+    for dev in $(ls /sys/class/net/ 2>/dev/null); do
+        case "$dev" in
+            lo|docker*|veth*|br-*|virbr*|zt*|tailscale*|wg*|tun*|tap*) continue ;;
+        esac
+        tc qdisc replace dev "$dev" root fq 2>/dev/null && applied=$((applied+1))
+    done
+    [ $applied -gt 0 ] && info "已对 ${applied} 个网卡应用 fq 队列算法（即时生效）"
+}
+
+enable_bbr() {
+    local running_cc buf_mb buf_bytes band region
+    running_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+
+    # ① 已运行：输出摘要
+    if [ "$running_cc" = "bbr" ]; then
+        local qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
+        local rmem_max=$(sysctl -n net.core.rmem_max 2>/dev/null || echo "?")
+        echo -e "  BBR 已运行：${GREEN}${running_cc}${RESET} / qdisc: ${CYAN}${qdisc}${RESET}"
+        echo -e "  缓冲上限: rmem_max=$(numfmt --to=iec "$rmem_max" 2>/dev/null || echo "$rmem_max")"
+        return
+    fi
+
+    # ② 内核版本
+    local kernel_major=$(uname -r | cut -d. -f1)
+    if [ "$kernel_major" -lt 4 ]; then
+        warn "内核版本过低 ($(uname -r))，BBR 需要 ≥ 4.9"
+        return
+    fi
+
+    # ③ 虚拟化检测
+    if detect_virt 2>/dev/null | grep -qiE 'openvz|virtuozzo|lxc'; then
+        warn "当前虚拟化环境不支持加载内核模块，无法开启 BBR"
+        return
+    fi
+
+    # ④ 清理旧配置
+    clean_sysctl_conflicts
+
+    # ⑤ 计算缓冲区
+    band="${PD_BBR_BANDWIDTH:-1000}"
+    region="${PD_BBR_REGION:-asia}"
+    buf_mb=$(calculate_bbr_buf "$band" "$region")
+    buf_bytes=$((buf_mb * 1024 * 1024))
+
+    local region_label="亚太"
+    [ "$region" = "overseas" ] && region_label="欧美"
+
+    step "开启 BBR (带宽: ${band} Mbps / 地区: ${region_label} / 缓冲: ${buf_mb} MB)"
+
+    # ⑥ 写入独立配置文件
+    mkdir -p /etc/sysctl.d
+    local sysctl_conf=/etc/sysctl.d/99-pdproxy.conf
+    cat > "$sysctl_conf" << SYSCTL_EOF
+# PD-proxy BBR 优化 ($(date '+%F %T'))
+# 带宽: ${band} Mbps | 地区: ${region_label} | 缓冲: ${buf_mb} MB
+
+# 拥塞控制
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+
+# TCP 缓冲 (${buf_mb}MB)
+net.core.rmem_max=${buf_bytes}
+net.core.wmem_max=${buf_bytes}
+net.ipv4.tcp_rmem=4096 87380 ${buf_bytes}
+net.ipv4.tcp_wmem=4096 65536 ${buf_bytes}
+
+# 连接优化
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.ip_local_port_range=1024 65535
+net.core.somaxconn=4096
+net.ipv4.tcp_max_syn_backlog=8192
+net.core.netdev_max_backlog=5000
+
+# TCP 高级
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_notsent_lowat=16384
+net.ipv4.tcp_fastopen=3
+
+# 连接回收
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_max_tw_buckets=5000
+
+# 保活
+net.ipv4.tcp_keepalive_time=300
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
+
+# UDP (Hysteria2 / QUIC)
+net.ipv4.udp_rmem_min=8192
+net.ipv4.udp_wmem_min=8192
+
+# 安全
+net.ipv4.tcp_syncookies=1
+SYSCTL_EOF
+
+    # ⑦ 应用
+    sysctl -p "$sysctl_conf" >/dev/null 2>&1
+    modprobe tcp_bbr 2>/dev/null || true
+
+    # ⑧ tc fq 即时生效
+    apply_tc_fq
+
+    # ⑨ 验证
+    running_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
+    if [ "$running_cc" = "bbr" ]; then
+        info "BBR 已开启 (${running_cc})"
+    else
+        warn "BBR 未生效 (当前: ${running_cc})，可能需要重启系统"
+    fi
+}
+
+# ---- BBRv3 内核（XanMod）----
+enable_bbrv3_kernel() {
+    info "正在检查内核..."
+
+    # ① 已安装
+    if grep -qi 'xanmod' /proc/version 2>/dev/null; then
+        info "XanMod 内核已运行，跳过安装"
+        return
+    fi
+
+    # ② 虚拟化限制
+    if detect_virt 2>/dev/null | grep -qiE 'openvz|virtuozzo|lxc'; then
+        warn "当前虚拟化环境不支持更换内核（$(detect_virt 2>/dev/null)），跳过"
+        return
+    fi
+
+    # ③ 确认
+    echo ""
+    warn "安装 XanMod 内核后需要重启系统才能生效"
+    echo -ne "  是否继续？(y/N): "
+    read -r ans
+    [ "$ans" != "y" ] && [ "$ans" != "Y" ] && { info "已取消"; return; }
+
+    # ④ 安装依赖
+    step "安装 XanMod BBRv3 内核..."
+    apt-get update -qq 2>/dev/null || true
+    apt-get install -y -qq gnupg lsb-release curl 2>/dev/null || true
+    mkdir -p /etc/apt/keyrings
+
+    curl -fsSL https://dl.xanmod.org/archive.key | gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null
+    echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org $(lsb_release -sc 2>/dev/null || echo 'bookworm') main" \
+        > /etc/apt/sources.list.d/xanmod-release.list
+
+    apt-get update -qq 2>/dev/null || true
+    if ! apt-get install -y -qq linux-xanmod-x64v3 2>/dev/null; then
+        warn "XanMod 内核安装失败，请检查 APT 源或系统兼容性"
+        return
+    fi
+    update-grub 2>/dev/null || true
+
+    info "XanMod BBRv3 内核已安装"
+    echo ""
+    warn "需要重启才能生效，重启后执行 pd --bbr 即可开启 BBRv3"
+    echo -ne "  是否现在重启？(y/N): "
+    read -r ans
+    [ "$ans" != "y" ] && [ "$ans" != "Y" ] && { info "请稍后手动重启"; return; }
+    reboot
 }
 
 # ============================================================
@@ -2199,6 +2365,8 @@ case "${1:-}" in
         check_root; run_export; exit 0 ;;
     --bbr)
         check_root; enable_bbr; exit 0 ;;
+    --bbrv3)
+        check_root; enable_bbrv3_kernel; exit 0 ;;
     --update)
         check_root; PD_UPDATE=1 self_install
         info "PD-proxy 修复版已更新"; exit 0 ;;
@@ -2447,8 +2615,9 @@ menu_view() {
 menu_system() {
     echo -e "  ${MAGENTA}▸ 系统工具${RESET}"
     echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
-    echo -e "  ${CYAN}│${RESET} [1] BBR 优化                          ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [2] 卸载全部协议                       ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [1] BBR 优化（秒开）                  ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [2] BBRv3 内核（XanMod，需重启）       ${CYAN}│${RESET}"
+    echo -e "  ${CYAN}│${RESET} [3] 卸载全部协议                       ${CYAN}│${RESET}"
     echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回主菜单${RESET}                      ${CYAN}│${RESET}"
     echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
     echo ""
@@ -2456,7 +2625,8 @@ menu_system() {
     read -r cc
     case "$cc" in
         1) enable_bbr ;;
-        2) remove_all ;;
+        2) enable_bbrv3_kernel ;;
+        3) remove_all ;;
         [Bb]) return 1 ;;
         [Qq]) info "再见 👋"; exit 0 ;;
         *) warn "无效选择" ;;
