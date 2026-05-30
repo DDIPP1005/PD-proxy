@@ -82,6 +82,7 @@ pd --help                 # 帮助
 | `PD_SNELL_TLS_SNI` | `www.microsoft.com` | ShadowTLS 伪装域名 |
 | `PD_SNELL_TLS_VERSION` | `v3` | ShadowTLS 协议版本（v3 \| v2） |
 | `PD_SNELL_MANUAL_TIMEOUT` | `4` | Surge 手册抓取超时秒数（2–15） |
+| `PD_SNELL_PROBE_PARALLEL` | `12` | 版本探测并发数（2–32） |
 | `PD_STRICT_LATEST` | `0` | `1`=手册不可达时拒绝安装，不 fallback 探测 |
 | `PD_HY2_HOP` | `0` | Hysteria2 端口跳跃数（3/5） |
 | `PD_VLESS_DEST` | `addons.mozilla.org:443` | Reality 目标 |

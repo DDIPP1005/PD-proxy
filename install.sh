@@ -253,12 +253,12 @@ snell_manual_html() {
 }
 
 snell_probe_candidates() {
-    local major="$1" minor patch latest=""
+    local major="$1" minor patch
     local max_minor="${PD_SNELL_PROBE_MINOR_MAX:-3}"
     local max_patch="${PD_SNELL_PROBE_PATCH_MAX:-12}"
     [[ "$max_minor" =~ ^[0-9]+$ ]] || max_minor=3
     [[ "$max_patch" =~ ^[0-9]+$ ]] || max_patch=12
-    [ "$max_minor" -gt 9 ] && max_minor=9
+    [ "$max_minor" -gt 20 ] && max_minor=20
     [ "$max_patch" -gt 50 ] && max_patch=50
     for ((minor=max_minor; minor>=0; minor--)); do
         for ((patch=max_patch; patch>=0; patch--)); do
@@ -268,15 +268,57 @@ snell_probe_candidates() {
 }
 
 snell_probe_latest() {
-    local major="$1" probe probe_url
+    local major="$1" batch_size="${PD_SNELL_PROBE_PARALLEL:-12}"
+    [[ "$batch_size" =~ ^[0-9]+$ ]] || batch_size=12
+    [ "$batch_size" -lt 2 ] && batch_size=2
+    [ "$batch_size" -gt 32 ] && batch_size=32
+
+    local -a batch=()
+    local probe found
     while IFS= read -r probe; do
-        probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
-        if curl -fsI --connect-timeout 2 --max-time 4 "$probe_url" >/dev/null 2>&1; then
-            echo "$probe"
-            return 0
+        batch+=("$probe")
+        if [ "${#batch[@]}" -ge "$batch_size" ]; then
+            found=$(snell_probe_batch "${batch[@]}" || true)
+            if [ -n "$found" ]; then
+                echo "$found"
+                return 0
+            fi
+            batch=()
         fi
     done < <(snell_probe_candidates "$major")
+    if [ "${#batch[@]}" -gt 0 ]; then
+        found=$(snell_probe_batch "${batch[@]}" || true)
+        if [ -n "$found" ]; then
+            echo "$found"
+            return 0
+        fi
+    fi
     return 1
+}
+
+snell_probe_batch() {
+    local tmp probe probe_url pid
+    local -a pids=()
+    tmp=$(mktemp_pd)
+    for probe in "$@"; do
+        (
+            probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
+            curl -fsI --connect-timeout 1 --max-time 3 "$probe_url" >/dev/null 2>&1 && printf '%s\n' "$probe" >> "$tmp"
+        ) &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    if [ -s "$tmp" ]; then
+        snell_version_sort < "$tmp" | head -1
+        return 0
+    fi
+    return 1
+}
+
+snell_version_sort() {
+    sed 's/^v//' | sort -t. -k1,1nr -k2,2nr -k3,3nr | sed 's/^/v/'
 }
 
 state_field_from_line() {
