@@ -78,8 +78,11 @@ pd --help                 # 帮助
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `PD_SNELL_MODE` | `standard` | `shadowtls` 启用 Snell v4 + TLS 伪装 |
+| `PD_SNELL_VERSION` | 自动探测 | 强制指定版本（如 `v5.2.12`） |
 | `PD_SNELL_TLS_SNI` | `www.microsoft.com` | ShadowTLS 伪装域名 |
-| `PD_SNELL_TLS_VERSION` | `v3` | ShadowTLS 协议版本（v3 | v2） |
+| `PD_SNELL_TLS_VERSION` | `v3` | ShadowTLS 协议版本（v3 \| v2） |
+| `PD_SNELL_MANUAL_TIMEOUT` | `4` | Surge 手册抓取超时秒数（2–15） |
+| `PD_STRICT_LATEST` | `0` | `1`=手册不可达时拒绝安装，不 fallback 探测 |
 | `PD_HY2_HOP` | `0` | Hysteria2 端口跳跃数（3/5） |
 | `PD_VLESS_DEST` | `addons.mozilla.org:443` | Reality 目标 |
 | `PD_ANYTLS_SNI` | 空 | AnyTLS SNI 伪装 |

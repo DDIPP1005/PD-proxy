@@ -36,6 +36,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
 
 增强选项(环境变量):
   PD_SNELL_MODE=shadowtls  PD_SNELL_TLS_VERSION=v3  PD_HY2_HOP=5  PD_VLESS_DEST=...:443
+  PD_SNELL_MANUAL_TIMEOUT=4  PD_SNELL_VERSION=v5.x.x  PD_STRICT_LATEST=1
 
 示例:
   bash -c "\$(curl -fsSL ${SCRIPT_URL})"
@@ -241,6 +242,41 @@ json_escape() {
 
 json_tag_name() {
     sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1
+}
+
+snell_manual_html() {
+    local timeout="${PD_SNELL_MANUAL_TIMEOUT:-4}"
+    [[ "$timeout" =~ ^[0-9]+$ ]] || timeout=4
+    [ "$timeout" -lt 2 ] && timeout=2
+    [ "$timeout" -gt 15 ] && timeout=15
+    curl -fsSL --connect-timeout 2 --max-time "$timeout" "https://manual.nssurge.com/others/snell.html" 2>/dev/null || true
+}
+
+snell_probe_candidates() {
+    local major="$1" minor patch latest=""
+    local max_minor="${PD_SNELL_PROBE_MINOR_MAX:-3}"
+    local max_patch="${PD_SNELL_PROBE_PATCH_MAX:-12}"
+    [[ "$max_minor" =~ ^[0-9]+$ ]] || max_minor=3
+    [[ "$max_patch" =~ ^[0-9]+$ ]] || max_patch=12
+    [ "$max_minor" -gt 9 ] && max_minor=9
+    [ "$max_patch" -gt 50 ] && max_patch=50
+    for ((minor=max_minor; minor>=0; minor--)); do
+        for ((patch=max_patch; patch>=0; patch--)); do
+            printf 'v%s.%s.%s\n' "$major" "$minor" "$patch"
+        done
+    done
+}
+
+snell_probe_latest() {
+    local major="$1" probe probe_url
+    while IFS= read -r probe; do
+        probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
+        if curl -fsI --connect-timeout 2 --max-time 4 "$probe_url" >/dev/null 2>&1; then
+            echo "$probe"
+            return 0
+        fi
+    done < <(snell_probe_candidates "$major")
+    return 1
 }
 
 state_field_from_line() {
@@ -654,58 +690,63 @@ snell_get_version() {
         echo "$PD_SNELL_VERSION"
         return 0
     fi
-    # 1. 从 Surge 手册抓取
-    v=$(curl -fs --max-time 15 "https://manual.nssurge.com/others/snell.html" 2>/dev/null \
+    # 1. 从 Surge 手册抓取最新版。Snell 没有官方 API，手册是默认权威来源。
+    # 默认 4 秒内完成：成功则保证最新版；失败则明确报错，不静默装旧版。
+    v=$(snell_manual_html \
         | sed -n 's/.*snell-server-v\(5\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
         | grep -v 'b' | head -1 || true)
     if [ -n "$v" ]; then
         echo "v${v}" | tee "$cache_file"; return 0
     fi
-    # 2. 级联 HEAD 探测：Surge 手册临时不可用时仍尽量找到最新版。
-    local max_minor="${PD_SNELL_PROBE_MAX:-30}"
-    [[ "$max_minor" =~ ^[0-9]+$ ]] || max_minor=30
-    [ "$max_minor" -gt 100 ] && max_minor=100
-    for ver_prefix in "5.9" "5.8" "5.7" "5.6" "5.5" "5.4" "5.3" "5.2" "5.1" "5.0"; do
-        local minor=$max_minor
-        while [ $minor -ge 0 ]; do
-            local probe="v${ver_prefix}.${minor}"
-            local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
-            if curl -fsI --max-time 10 "$probe_url" >/dev/null 2>&1; then
-                echo "$probe" | tee "$cache_file"; return 0
-            fi
-            minor=$((minor - 1))
-        done
-    done
-    die "Snell 版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v5.0.x"
+
+    # 2. 权威源不可达时，默认进入可用性 fallback：HEAD 探测当前 release 目录中可下载的最高版本。
+    # 这能保证可用和尽量新；如必须严格权威最新版，设置 PD_STRICT_LATEST=1。
+    if [ "${PD_STRICT_LATEST:-0}" = "1" ]; then
+        die "Snell 最新版检测失败：4 秒内无法读取 Surge 手册。严格最新版模式下拒绝 fallback；可重试或设置 PD_SNELL_MANUAL_TIMEOUT=10"
+    fi
+    warn "无法快速读取 Surge 手册，改用下载源探测可用版本；这会保证可用并尽量新，但不是严格权威最新版"
+    v=$(snell_probe_latest 5 || true)
+    if [ -n "$v" ]; then
+        echo "$v" | tee "$cache_file"; return 0
+    fi
+
+    if [ -s "$cache_file" ]; then
+        warn "下载源探测失败，使用上次成功缓存版本"
+        cat "$cache_file"
+        return 0
+    fi
+
+    die "Snell 可用版本检测失败，请检查网络或手动指定: PD_SNELL_VERSION=v5.x.x"
 }
 
 snell_v4_get_version() {
     local v cache_file="$BASE_DIR/.snell-v4-version-${ARCH}"
     mkdir -p "$BASE_DIR"
-    # 1. 从 Surge 手册抓取
-    v=$(curl -fs --max-time 15 "https://manual.nssurge.com/others/snell.html" 2>/dev/null \
+    # 1. 从 Surge 手册抓取最新版。Snell 没有官方 API，手册是默认权威来源。
+    # 默认 4 秒内完成：成功则保证最新版；失败则明确报错，不静默装旧版。
+    v=$(snell_manual_html \
         | sed -n 's/.*snell-server-v\(4\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
         | grep -v 'b' | head -1 || true)
     if [ -n "$v" ]; then
         echo "v${v}" | tee "$cache_file"; return 0
     fi
-    # 2. 级联 HEAD 探测 v4.x（Surge 手册可能临时不可用）
-    local ver_prefix minor
-    local max_minor="${PD_SNELL_V4_PROBE_MAX:-30}"
-    [[ "$max_minor" =~ ^[0-9]+$ ]] || max_minor=30
-    [ "$max_minor" -gt 100 ] && max_minor=100
-    for ver_prefix in "4.9" "4.8" "4.7" "4.6" "4.5" "4.4" "4.3" "4.2" "4.1" "4.0"; do
-        minor=$max_minor
-        while [ $minor -ge 0 ]; do
-            local probe="v${ver_prefix}.${minor}"
-            local probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-${ARCH}.zip"
-            if curl -fsI --max-time 10 "$probe_url" >/dev/null 2>&1; then
-                echo "$probe" | tee "$cache_file"; return 0
-            fi
-            minor=$((minor - 1))
-        done
-    done
-    die "Snell v4 版本检测失败，请检查网络"
+
+    if [ "${PD_STRICT_LATEST:-0}" = "1" ]; then
+        die "Snell v4 最新版检测失败：4 秒内无法读取 Surge 手册。严格最新版模式下拒绝 fallback；可重试或设置 PD_SNELL_MANUAL_TIMEOUT=10"
+    fi
+    warn "无法快速读取 Surge 手册，改用下载源探测 Snell v4 可用版本；这会保证可用并尽量新，但不是严格权威最新版"
+    v=$(snell_probe_latest 4 || true)
+    if [ -n "$v" ]; then
+        echo "$v" | tee "$cache_file"; return 0
+    fi
+
+    if [ -s "$cache_file" ]; then
+        warn "下载源探测失败，使用上次成功缓存版本"
+        cat "$cache_file"
+        return 0
+    fi
+
+    die "Snell v4 可用版本检测失败，请检查网络"
 }
 
 snell_v4_download() {
