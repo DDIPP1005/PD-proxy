@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v3.7.1
+# PD-proxy — 多协议代理一键部署脚本 v3.7.2
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="3.7.1"
+VERSION="3.7.2"
 SCRIPT_URL="${PD_SCRIPT_URL:-https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh}"
 
 # 纯查询命令，不需要锁和 root
@@ -156,6 +156,10 @@ get_ip() {
       || curl -s4 --max-time 5 ip.sb 2>/dev/null \
       || curl -s4 --max-time 5 icanhazip.com 2>/dev/null \
       || echo "未知")
+    IP6=$(curl -s6 --max-time 5 ifconfig.me 2>/dev/null \
+      || curl -s6 --max-time 5 ip.sb 2>/dev/null \
+      || curl -s6 --max-time 5 icanhazip.com 2>/dev/null \
+      || echo "")
 }
 
 get_mem() {
@@ -165,6 +169,14 @@ get_mem() {
 
 has_ipv6() {
     ip -6 addr show scope global 2>/dev/null | grep -q inet6 && return 0 || return 1
+}
+
+format_proxy_host() {
+    local host="$1"
+    case "$host" in
+        *:*) printf '[%s]' "$host" ;;
+        *) printf '%s' "$host" ;;
+    esac
 }
 
 check_nftables() {
@@ -694,6 +706,10 @@ save_iptables() {
     elif [ -d /etc/iptables ]; then
         cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak 2>/dev/null || true
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        if command -v ip6tables-save >/dev/null 2>&1; then
+            cp /etc/iptables/rules.v6 /etc/iptables/rules.v6.bak 2>/dev/null || true
+            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+        fi
     fi
 }
 
@@ -705,6 +721,10 @@ add_firewall() {
     elif command -v iptables >/dev/null 2>&1; then
         iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
         iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        if command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+            ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        fi
         save_iptables
     else
         warn "未检测到 ufw/iptables，请确认云防火墙已放行端口 $port"
@@ -726,6 +746,10 @@ add_firewall_range() {
     elif command -v iptables >/dev/null 2>&1; then
         iptables -I INPUT -p tcp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
         iptables -I INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
+        if command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -I INPUT -p tcp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
+            ip6tables -I INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
+        fi
         save_iptables
     else
         warn "未检测到 ufw/iptables，请确认云防火墙已放行端口范围 ${start}-${end}"
@@ -740,6 +764,10 @@ del_firewall() {
     elif command -v iptables >/dev/null 2>&1; then
         iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        if command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
+            ip6tables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+        fi
         save_iptables
     fi
 }
@@ -759,6 +787,10 @@ del_firewall_range() {
     elif command -v iptables >/dev/null 2>&1; then
         iptables -D INPUT -p tcp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
         iptables -D INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
+        if command -v ip6tables >/dev/null 2>&1; then
+            ip6tables -D INPUT -p tcp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
+            ip6tables -D INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
+        fi
         save_iptables
     fi
 }
@@ -1126,7 +1158,12 @@ snell_download() {
 snell_configure() {
     local port="$1" psk="$2" listen_addr="${3:-0.0.0.0}"
     local ipv6_enabled="false"
-    has_ipv6 && ipv6_enabled="true"
+    if [ "$listen_addr" = "0.0.0.0" ] && has_ipv6; then
+        listen_addr="[::]"
+        ipv6_enabled="true"
+    elif has_ipv6; then
+        ipv6_enabled="true"
+    fi
     cat > "$(pdir snell)/snell.conf" <<EOF
 [snell-server]
 listen = ${listen_addr}:${port}
@@ -1164,6 +1201,10 @@ snell_output() {
         [ -n "$tls_proto" ] || tls_proto="2"
     fi
     if [ -n "$tls_pass" ]; then
+        local host4 host6
+        host4=$(format_proxy_host "$IP")
+        host6=""
+        [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
         output_header "Snell v4 + ShadowTLS" "$port"
         echo -e "PSK:     ${GREEN}${psk}${RESET}"
         echo -e "TLS密码: ${GREEN}${tls_pass}${RESET}"
@@ -1175,15 +1216,70 @@ snell_output() {
         fi
         echo ""
         echo -e "${CYAN}[Surge 配置]${RESET}"
-        echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}${RESET}"
+        echo -e "${GREEN}Proxy = snell, ${host4}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}${RESET}"
+        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = snell, ${host6}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}${RESET}"
         output_footer
     else
+        local host4 host6
+        host4=$(format_proxy_host "$IP")
+        host6=""
+        [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
         output_header "Snell v5" "$port"
         echo -e "PSK:    ${GREEN}${psk}${RESET}"
         echo ""
         echo -e "${CYAN}[Surge 配置]${RESET}"
-        echo -e "${GREEN}Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true${RESET}"
+        echo -e "${GREEN}Proxy = snell, ${host4}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true${RESET}"
+        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = snell, ${host6}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true${RESET}"
         output_footer
+    fi
+}
+
+repair_snell_ipv6() {
+    local port psk was_active=false
+    port=$(state_get snell "port")
+    psk=$(conf_value "psk" "$(pdir snell)/snell.conf" || echo "")
+    [ -n "$port" ] && [ -n "$psk" ] || return 0
+
+    systemctl is-active --quiet snell 2>/dev/null && was_active=true
+
+    if [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+        local svc_file="/etc/systemd/system/shadowtls-snell.service"
+        local bin="/opt/shadowtls/shadow-tls" tls_pass tls_sni tls_proto server_arg listen_host v3_arg="--v3"
+        tls_pass=$(unit_password_value "$svc_file" || echo "")
+        tls_sni=$(unit_arg_value "--tls" "$svc_file" || echo "")
+        server_arg=$(unit_arg_value "--server" "$svc_file" || echo "")
+        grep -q -- '--v3' "$svc_file" 2>/dev/null || v3_arg=""
+        [ -n "$tls_pass" ] && [ -n "$tls_sni" ] && [ -n "$server_arg" ] || return 0
+        listen_host="0.0.0.0"
+        has_ipv6 && listen_host="[::]"
+        snell_configure "${server_arg##*:}" "$psk" "127.0.0.1"
+        cat > "$svc_file" <<EOF
+[Unit]
+Description=PD-proxy ShadowTLS for Snell
+After=network.target snell.service
+Requires=snell.service
+
+[Service]
+Type=simple
+User=root
+Environment=MONOIO_FORCE_LEGACY_DRIVER=1
+ExecStart=${bin} ${v3_arg} server --listen ${listen_host}:${port} --server ${server_arg} --tls ${tls_sni} --password ${tls_pass}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload 2>/dev/null || true
+        if $was_active; then
+            systemctl restart snell 2>/dev/null || true
+            systemctl restart shadowtls-snell 2>/dev/null || true
+        fi
+    else
+        snell_configure "$port" "$psk"
+        systemctl daemon-reload 2>/dev/null || true
+        $was_active && systemctl restart snell 2>/dev/null || true
     fi
 }
 
@@ -1243,6 +1339,8 @@ snell_shadowtls_configure() {
     PD_OPT_SNELL_TLS_PASS="$tls_pass"
     local v3_arg="--v3"
     [ "$tls_version" = "v2" ] && v3_arg=""
+    local listen_host="0.0.0.0"
+    has_ipv6 && listen_host="[::]"
 
     step "配置 ShadowTLS ${tls_version} (SNI: $sni) ..."
     local svc="shadowtls-snell"
@@ -1257,7 +1355,7 @@ Requires=snell.service
 [Service]
 Type=simple
 Environment=MONOIO_FORCE_LEGACY_DRIVER=1
-ExecStart=${bin} ${v3_arg} server --listen 0.0.0.0:${ext_port} --server 127.0.0.1:${int_port} --tls ${sni}:443 --password ${tls_pass}
+ExecStart=${bin} ${v3_arg} server --listen ${listen_host}:${ext_port} --server 127.0.0.1:${int_port} --tls ${sni}:443 --password ${tls_pass}
 Restart=always
 RestartSec=5
 LimitNOFILE=32768
@@ -1621,6 +1719,7 @@ install_protocol() {
                 install_protocol snell
                 return 0
             fi
+            repair_snell_ipv6 || warn "Snell IPv6 监听修复失败，请检查配置"
         fi
         warn "$name 已安装，执行最新版检查..."
         upgrade_protocol "$proto"
@@ -1976,6 +2075,9 @@ restart_service() {
         die "$(pname "$proto") 未安装"
     fi
     info "重启 $(pname "$proto") ..."
+    if [ "$proto" = "snell" ]; then
+        repair_snell_ipv6 || warn "Snell IPv6 监听修复失败，请检查配置"
+    fi
     systemctl restart "$svc" || die "重启失败: journalctl -u $svc -n 20"
     # Snell + ShadowTLS: Requires= 只传播 stop 不传播 start
     if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
@@ -2059,6 +2161,10 @@ show_config_only() {
         snell)
             local psk tls_pass tls_sni tls_proto
             psk=$(conf_value "psk" "$(pdir snell)/snell.conf" || echo "")
+            local host4 host6
+            host4=$(format_proxy_host "$IP")
+            host6=""
+            [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
             local tls_values=""
             tls_values=$(snell_shadowtls_unit_values 2>/dev/null || true)
             if [ -n "$tls_values" ]; then
@@ -2066,9 +2172,11 @@ show_config_only() {
                 tls_sni=$(printf '%s\n' "$tls_values" | sed -n '2p')
                 tls_proto=$(printf '%s\n' "$tls_values" | sed -n '3p')
                 [ -n "$tls_proto" ] || tls_proto="2"
-                echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}"
+                echo "Proxy = snell, ${host4}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}"
+                [ -n "$host6" ] && echo "Proxy-IPv6 = snell, ${host6}, ${port}, psk=${psk}, version=4, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}"
             else
-                echo "Proxy = snell, ${IP}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true"
+                echo "Proxy = snell, ${host4}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true"
+                [ -n "$host6" ] && echo "Proxy-IPv6 = snell, ${host6}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true"
             fi ;;
         hy2)
             local pass hop
