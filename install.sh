@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v3.7.2
+# PD-proxy — 多协议代理一键部署脚本 v3.7.4
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -12,7 +12,7 @@ set -euo pipefail
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="3.7.2"
+VERSION="3.7.4"
 SCRIPT_URL="${PD_SCRIPT_URL:-https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh}"
 
 # 纯查询命令，不需要锁和 root
@@ -1283,6 +1283,43 @@ EOF
     fi
 }
 
+repair_vless_ipv6() {
+    local cfg="$(pdir vless)/config.json" tmp svc was_active=false
+    [ -f "$cfg" ] || return 0
+    svc=$(psvc vless)
+    systemctl is-active --quiet "$svc" 2>/dev/null && was_active=true
+
+    if grep -q '"listen"' "$cfg" 2>/dev/null; then
+        if has_ipv6; then
+            sed -i 's/"listen"[[:space:]]*:[[:space:]]*"[^"]*"/"listen": "::"/' "$cfg" 2>/dev/null || true
+        else
+            sed -i 's/"listen"[[:space:]]*:[[:space:]]*"[^"]*"/"listen": "0.0.0.0"/' "$cfg" 2>/dev/null || true
+        fi
+    else
+        tmp=$(mktemp_pd)
+        if has_ipv6; then
+            awk '{print} /"inbounds"[[:space:]]*:[[:space:]]*\[\{/ && !done {print "    \"listen\": \"::\","; done=1}' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+        else
+            awk '{print} /"inbounds"[[:space:]]*:[[:space:]]*\[\{/ && !done {print "    \"listen\": \"0.0.0.0\","; done=1}' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+        fi
+    fi
+    $was_active && systemctl restart "$svc" 2>/dev/null || true
+}
+
+repair_anytls_ipv6() {
+    local port bin svc args was_active=false
+    port=$(state_get anytls "port")
+    [ -n "$port" ] || return 0
+    bin=$(pbin anytls)
+    svc=$(psvc anytls)
+    [ -x "$bin" ] || return 0
+    systemctl is-active --quiet "$svc" 2>/dev/null && was_active=true
+    args=$(anytls_service_args "$port")
+    write_systemd "$svc" "$bin" "$args"
+    systemctl daemon-reload 2>/dev/null || true
+    $was_active && systemctl restart "$svc" 2>/dev/null || true
+}
+
 # ============================================================
 # ShadowTLS（Snell 增强模式）
 # ============================================================
@@ -1451,6 +1488,10 @@ hy2_service_args() {
 
 hy2_output() {
     local port="$1" pass="$2"
+    local host4 host6
+    host4=$(format_proxy_host "$IP")
+    host6=""
+    [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
     output_header "Hysteria2" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
     echo ""
@@ -1459,13 +1500,16 @@ hy2_output() {
     hop_count=$(state_get hy2 hop)
     if [ "${hop_count:-0}" -ge 3 ] 2>/dev/null; then
         local last_port=$((port + hop_count - 1))
-        echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}${RESET}"
+        echo -e "${GREEN}Proxy = hysteria2, ${host4}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}${RESET}"
+        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = hysteria2, ${host6}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}${RESET}"
     else
-        echo -e "${GREEN}Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
+        echo -e "${GREEN}Proxy = hysteria2, ${host4}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
+        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = hysteria2, ${host6}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
     fi
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
-    gen_qr "hysteria2://${pass}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
+    gen_qr "hysteria2://${pass}@${host4}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
+    [ -n "$host6" ] && echo -e "${GREEN}hysteria2://${pass}@${host6}:${port}?sni=www.bing.com&insecure=1#PD-HY2-IPv6${RESET}"
     output_footer
 }
 
@@ -1525,6 +1569,8 @@ vless_configure() {
     shortid=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
     [ -n "$privkey" ] || die "Reality 私钥生成失败"
     [ -n "$pubkey" ] || die "Reality 公钥生成失败"
+    local listen_host="0.0.0.0"
+    has_ipv6 && listen_host="::"
 
     # 保存配置信息供输出使用
     echo "$pubkey" > "$(pdir vless)/.pubkey"
@@ -1548,6 +1594,7 @@ vless_configure() {
     cat > "$(pdir vless)/config.json" <<EOF
 {
   "inbounds": [{
+    "listen": "$(json_escape "$listen_host")",
     "port": ${port},
     "protocol": "vless",
     "settings": {
@@ -1585,7 +1632,12 @@ vless_output() {
     transport=$(cat "$(pdir vless)/.transport" 2>/dev/null || echo "tcp")
     fp=$(cat "$(pdir vless)/.fp" 2>/dev/null || echo "chrome")
     local dest_host="${dest%:*}"
-    local link="vless://${uuid}@${IP}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS"
+    local host4 host6 link link6
+    host4=$(format_proxy_host "$IP")
+    host6=""
+    [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
+    link="vless://${uuid}@${host4}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS"
+    [ -n "$host6" ] && link6="vless://${uuid}@${host6}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS-IPv6"
 
     output_header "VLESS Reality" "$port"
     echo -e "UUID:   ${GREEN}${uuid}${RESET}"
@@ -1600,6 +1652,7 @@ vless_output() {
     echo ""
     echo -e "${CYAN}[通用链接]${RESET}"
     echo -e "${GREEN}${link}${RESET}"
+    [ -n "${link6:-}" ] && echo -e "${GREEN}${link6}${RESET}"
     output_footer
 }
 
@@ -1650,7 +1703,9 @@ anytls_service_args() {
     padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
     sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
 
-    local args="-l 0.0.0.0:${port} -p ${pass}"
+    local listen_host="0.0.0.0"
+    has_ipv6 && listen_host="[::]"
+    local args="-l ${listen_host}:${port} -p ${pass}"
     case "$padding" in
         # anytls-server v0.0.12: --padding-scheme 接受文件路径非预设名
         # 仅当用户指定了文件路径时才传递，预设名不兼容
@@ -1666,22 +1721,28 @@ anytls_output() {
     padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
     sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
 
-    local query=""
+    local host4 host6 query="" link link6
+    host4=$(format_proxy_host "$IP")
+    host6=""
+    [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
     [ -n "$sni" ] && query="?sni=$(url_escape "$sni")&insecure=1"
-    local link="anytls://${pass}@${IP}:${port}${query}#PD-AnyTLS"
+    link="anytls://${pass}@${host4}:${port}${query}#PD-AnyTLS"
+    [ -n "$host6" ] && link6="anytls://${pass}@${host6}:${port}${query}#PD-AnyTLS-IPv6"
     output_header "AnyTLS" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
     echo -e "填充:   ${DIM}${padding}（当前服务端使用 anytls 默认）${RESET}"
     [ -n "$sni" ] && echo -e "SNI:    ${DIM}${sni}（客户端侧使用）${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
-    echo -e "${GREEN}anytls, ${IP}, ${port}, password=${pass}${RESET}"
+    echo -e "${GREEN}anytls, ${host4}, ${port}, password=${pass}${RESET}"
+    [ -n "$host6" ] && echo -e "${GREEN}anytls-ipv6, ${host6}, ${port}, password=${pass}${RESET}"
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
     gen_qr "$link"
     echo ""
     echo -e "${CYAN}[通用链接]${RESET}"
     echo -e "${GREEN}${link}${RESET}"
+    [ -n "${link6:-}" ] && echo -e "${GREEN}${link6}${RESET}"
     output_footer
 }
 
@@ -1720,6 +1781,10 @@ install_protocol() {
                 return 0
             fi
             repair_snell_ipv6 || warn "Snell IPv6 监听修复失败，请检查配置"
+        elif [ "$proto" = "vless" ]; then
+            repair_vless_ipv6 || warn "VLESS IPv6 监听修复失败，请检查配置"
+        elif [ "$proto" = "anytls" ]; then
+            repair_anytls_ipv6 || warn "AnyTLS IPv6 监听修复失败，请检查配置"
         fi
         warn "$name 已安装，执行最新版检查..."
         upgrade_protocol "$proto"
@@ -1945,6 +2010,13 @@ upgrade_protocol() {
     check_disk "$(pdisk "$proto")"
     local was_active=false
     systemctl is-active --quiet "$svc" 2>/dev/null && was_active=true
+    if [ "$proto" = "snell" ]; then
+        repair_snell_ipv6 || warn "Snell IPv6 监听修复失败，请检查配置"
+    elif [ "$proto" = "vless" ]; then
+        repair_vless_ipv6 || warn "VLESS IPv6 监听修复失败，请检查配置"
+    elif [ "$proto" = "anytls" ]; then
+        repair_anytls_ipv6 || warn "AnyTLS IPv6 监听修复失败，请检查配置"
+    fi
 
     local ver=""
     if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
@@ -2077,6 +2149,10 @@ restart_service() {
     info "重启 $(pname "$proto") ..."
     if [ "$proto" = "snell" ]; then
         repair_snell_ipv6 || warn "Snell IPv6 监听修复失败，请检查配置"
+    elif [ "$proto" = "vless" ]; then
+        repair_vless_ipv6 || warn "VLESS IPv6 监听修复失败，请检查配置"
+    elif [ "$proto" = "anytls" ]; then
+        repair_anytls_ipv6 || warn "AnyTLS IPv6 监听修复失败，请检查配置"
     fi
     systemctl restart "$svc" || die "重启失败: journalctl -u $svc -n 20"
     # Snell + ShadowTLS: Requires= 只传播 stop 不传播 start
@@ -2179,19 +2255,25 @@ show_config_only() {
                 [ -n "$host6" ] && echo "Proxy-IPv6 = snell, ${host6}, ${port}, psk=${psk}, version=5, reuse=true, tfo=true"
             fi ;;
         hy2)
-            local pass hop
+            local pass hop host4 host6
             pass=$(yaml_value "password" "$(pdir hy2)/config.yaml" || echo "")
             hop=$(state_get "$key" "hop")
+            host4=$(format_proxy_host "$IP")
+            host6=""
+            [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
             if [ "$hop" -ge 3 ] 2>/dev/null; then
                 local last_port=$((port + hop - 1))
-                echo "Proxy = hysteria2, ${IP}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}"
+                echo "Proxy = hysteria2, ${host4}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}"
+                [ -n "$host6" ] && echo "Proxy-IPv6 = hysteria2, ${host6}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}"
             else
-                echo "Proxy = hysteria2, ${IP}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
+                echo "Proxy = hysteria2, ${host4}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
+                [ -n "$host6" ] && echo "Proxy-IPv6 = hysteria2, ${host6}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
             fi
             echo ""
-            echo "# Shadowrocket: hysteria2://${pass}@${IP}:${port}?sni=www.bing.com&insecure=1#PD-HY2" ;;
+            echo "# Shadowrocket: hysteria2://${pass}@${host4}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
+            [ -n "$host6" ] && echo "# Shadowrocket-IPv6: hysteria2://${pass}@${host6}:${port}?sni=www.bing.com&insecure=1#PD-HY2-IPv6" ;;
         vless)
-            local uuid pubkey shortid dest transport fp dest_host
+            local uuid pubkey shortid dest transport fp dest_host host4 host6
             uuid=$(json_value "id" "$(pdir vless)/config.json" || echo "")
             pubkey=$(cat "$(pdir vless)/.pubkey" 2>/dev/null || echo "")
             shortid=$(cat "$(pdir vless)/.shortid" 2>/dev/null || echo "")
@@ -2199,18 +2281,27 @@ show_config_only() {
             transport=$(cat "$(pdir vless)/.transport" 2>/dev/null || echo "tcp")
             fp=$(cat "$(pdir vless)/.fp" 2>/dev/null || echo "chrome")
             dest_host="${dest%:*}"
+            host4=$(format_proxy_host "$IP")
+            host6=""
+            [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
             echo "# Surge 不支持 VLESS"
-            echo "vless://${uuid}@${IP}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS" ;;
+            echo "vless://${uuid}@${host4}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS"
+            [ -n "$host6" ] && echo "vless://${uuid}@${host6}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS-IPv6" ;;
         anytls)
-            local pass padding sni
+            local pass padding sni host4 host6
             pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "")
             padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
             sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
-            echo "anytls, ${IP}, ${port}, password=${pass}"
+            host4=$(format_proxy_host "$IP")
+            host6=""
+            [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
+            echo "anytls, ${host4}, ${port}, password=${pass}"
+            [ -n "$host6" ] && echo "anytls-ipv6, ${host6}, ${port}, password=${pass}"
             echo ""
             local query=""
             [ -n "$sni" ] && query="?sni=$(url_escape "$sni")&insecure=1"
-            echo "# Shadowrocket: anytls://${pass}@${IP}:${port}${query}#PD-AnyTLS" ;;
+            echo "# Shadowrocket: anytls://${pass}@${host4}:${port}${query}#PD-AnyTLS"
+            [ -n "$host6" ] && echo "# Shadowrocket-IPv6: anytls://${pass}@${host6}:${port}${query}#PD-AnyTLS-IPv6" ;;
     esac
 }
 
