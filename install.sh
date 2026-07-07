@@ -103,7 +103,7 @@ PD_OPT_VLESS_TRANSPORT="${PD_VLESS_TRANSPORT:-tcp}"     # tcp | grpc | ws
 PD_OPT_VLESS_FP="${PD_VLESS_FP:-chrome}"                # chrome | firefox | safari | ios | randomized
 
 # AnyTLS 选项
-PD_OPT_ANYTLS_PADDING="${PD_ANYTLS_PADDING:-standard}"  # standard | deep | fixed | none
+PD_OPT_ANYTLS_PADDING="${PD_ANYTLS_PADDING:-standard}"  # 兼容旧环境变量；当前服务端使用默认填充
 PD_OPT_ANYTLS_SNI="${PD_ANYTLS_SNI:-}"                  # 空=不伪装
 
 # 轻量化选项
@@ -151,15 +151,38 @@ detect_arch() {
     esac
 }
 
+valid_ipv4() {
+    local ip="$1" a b c d
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS=. read -r a b c d <<< "$ip"
+    for o in "$a" "$b" "$c" "$d"; do
+        [ "$o" -ge 0 ] 2>/dev/null && [ "$o" -le 255 ] || return 1
+    done
+    return 0
+}
+
+valid_ipv6() {
+    local ip="$1"
+    [[ "$ip" == *:* ]] || return 1
+    [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
+    return 0
+}
+
+fetch_public_ip() {
+    local family="$1" validator="$2" url ip
+    for url in ifconfig.me ip.sb icanhazip.com; do
+        ip=$(curl "-${family}" -fsSL --connect-timeout 2 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+        if [ -n "$ip" ] && "$validator" "$ip"; then
+            echo "$ip"
+            return 0
+        fi
+    done
+    return 1
+}
+
 get_ip() {
-    IP=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null \
-      || curl -s4 --max-time 5 ip.sb 2>/dev/null \
-      || curl -s4 --max-time 5 icanhazip.com 2>/dev/null \
-      || echo "未知")
-    IP6=$(curl -s6 --max-time 5 ifconfig.me 2>/dev/null \
-      || curl -s6 --max-time 5 ip.sb 2>/dev/null \
-      || curl -s6 --max-time 5 icanhazip.com 2>/dev/null \
-      || echo "")
+    IP=$(fetch_public_ip 4 valid_ipv4 || echo "未知")
+    IP6=$(fetch_public_ip 6 valid_ipv6 || echo "")
 }
 
 get_mem() {
@@ -617,8 +640,6 @@ table inet pd_hy2_hop {
   }
 }
 EOF
-    nft delete table inet pd_hy2_hop 2>/dev/null || true
-    nft -f "$(pdir hy2)/hop.nft"
     cat > /etc/systemd/system/pd-hy2-hop.service <<EOF
 [Unit]
 Description=PD-proxy: Hysteria2 port hopping nft rules
@@ -637,6 +658,7 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable pd-hy2-hop >/dev/null 2>&1 || true
+    systemctl restart pd-hy2-hop || die "HY2 端口跳跃规则加载失败"
 }
 
 write_hy2_systemd() {
@@ -1687,30 +1709,24 @@ anytls_configure() {
     local padding="${PD_OPT_ANYTLS_PADDING}"
     local sni="${PD_OPT_ANYTLS_SNI}"
     case "$padding" in standard|deep|fixed|none) ;; *) die "PD_ANYTLS_PADDING 无效: $padding" ;; esac
+    [ "$padding" = "standard" ] || warn "当前 anytls-server 未启用预设填充参数，PD_ANYTLS_PADDING=$padding 已忽略"
     [ -z "$sni" ] || validate_hostname "$sni" "PD_ANYTLS_SNI"
 
     echo "$pass" > "$(pdir anytls)/.password"
-    echo "$padding" > "$(pdir anytls)/.padding"
+    echo "server-default" > "$(pdir anytls)/.padding"
     [ -n "$sni" ] && echo "$sni" > "$(pdir anytls)/.sni" || rm -f "$(pdir anytls)/.sni"
     chmod 600 "$(pdir anytls)/.password"
 }
 
 anytls_service_args() {
     local port="$1"
-    local pass padding sni
+    local pass
     pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "")
     pass=$(systemd_escape_arg "$pass")
-    padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
-    sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
 
     local listen_host="0.0.0.0"
     has_ipv6 && listen_host="[::]"
     local args="-l ${listen_host}:${port} -p ${pass}"
-    case "$padding" in
-        # anytls-server v0.0.12: --padding-scheme 接受文件路径非预设名
-        # 仅当用户指定了文件路径时才传递，预设名不兼容
-        *)     ;;  # 使用 anytls 默认，不传 --padding-scheme
-    esac
     # anytls-server v0.0.12 无 -sni 参数，SNI 由客户端侧处理
     echo "$args"
 }
@@ -1730,7 +1746,7 @@ anytls_output() {
     [ -n "$host6" ] && link6="anytls://${pass}@${host6}:${port}${query}#PD-AnyTLS-IPv6"
     output_header "AnyTLS" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
-    echo -e "填充:   ${DIM}${padding}（当前服务端使用 anytls 默认）${RESET}"
+    echo -e "填充:   ${DIM}${padding}（服务端默认）${RESET}"
     [ -n "$sni" ] && echo -e "SNI:    ${DIM}${sni}（客户端侧使用）${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
@@ -2778,7 +2794,6 @@ rollback_xanmod_swap_if_created() {
 recover_xanmod_apt_failure() {
     rm -f /etc/apt/sources.list.d/xanmod-release.list
     apt-get -f install -y >/dev/null 2>&1 || true
-    apt-get autoremove --purge -y >/dev/null 2>&1 || true
     apt-get clean >/dev/null 2>&1 || true
 }
 
@@ -3216,7 +3231,7 @@ cli_dispatch() {
             show_log "$proto" ;;
         config)
             [ -z "$proto" ] && die "用法: pd --config <snell|hy2|vless|anytls>"
-            detect_os; detect_arch; get_ip
+            check_root; detect_os; detect_arch; get_ip
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
             show_config_only "$proto" ;;
     esac
@@ -3236,7 +3251,7 @@ case "${1:-}" in
     --log|-l)      cli_dispatch log      "${2:-}" ; exit 0 ;;
     --config|-c)   cli_dispatch config   "${2:-}" ; exit 0 ;;
     --config-all)
-        detect_os; detect_arch; get_ip
+        check_root; detect_os; detect_arch; get_ip
         for p in $ALL_PROTOS; do
             state_installed "$(pkey "$p")" || continue
             echo "=== $(pname "$p") ==="
@@ -3245,7 +3260,7 @@ case "${1:-}" in
         done
         exit 0 ;;
     --show)
-        detect_os; detect_arch; get_ip; get_mem; show_config; exit 0 ;;
+        check_root; detect_os; detect_arch; get_ip; get_mem; show_config; exit 0 ;;
     --status|-s)
         detect_os; detect_arch; get_ip; get_mem; show_status; exit 0 ;;
     --export)
@@ -3401,34 +3416,18 @@ menu_vless_config() {
 menu_anytls_config() {
     while true; do
         echo ""
-        echo -e "  ${MAGENTA}▸ AnyTLS — 填充模式${RESET}"
-        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
-        echo -e "  ${CYAN}│${RESET} [1] ${GREEN}标准填充${RESET}         随机 64-512B     ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [2] ${MAGENTA}深度填充${RESET}         随机 64-1024B    ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [3] 固定填充           固定 512B        ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [4] 无填充             纯转发           ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回${RESET}                            ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
-        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
-        read -r cc
-        case "$cc" in
-            2) PD_OPT_ANYTLS_PADDING="deep" ;;
-            3) PD_OPT_ANYTLS_PADDING="fixed" ;;
-            4) PD_OPT_ANYTLS_PADDING="none" ;;
-            [Bb]) return 1 ;;
-            [Qq]) info "再见 👋"; exit 0 ;;
-            *) PD_OPT_ANYTLS_PADDING="standard" ;;
-        esac
-
-        echo ""
         echo -e "  ${MAGENTA}▸ SNI 伪装${RESET}"
+        echo -e "  ${DIM}  AnyTLS 服务端使用默认填充；SNI 仅写入客户端链接${RESET}"
         echo -e "  [1] 不伪装  [2] microsoft.com  [3] apple.com  [4] cloudflare.com"
+        echo -e "  [B] 返回"
         echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
         read -r sni_c
         case "$sni_c" in
             2) PD_OPT_ANYTLS_SNI="www.microsoft.com" ;;
             3) PD_OPT_ANYTLS_SNI="www.apple.com" ;;
             4) PD_OPT_ANYTLS_SNI="cloudflare.com" ;;
+            [Bb]) return 1 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
             *) PD_OPT_ANYTLS_SNI="" ;;
         esac
         prompt_protocol_port anytls || return 1
