@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v3.7.4
+# PD-proxy — 多协议代理一键部署脚本 v3.8.0
 # 协议: Snell v5 | Snell v4 (ShadowTLS) | Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -8,16 +8,25 @@
 # 原则：零静默错误 — 每步失败显式报错退出，不再吞噬错误
 # ============================================================
 set -euo pipefail
+umask 077
 
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="3.7.4"
-SCRIPT_URL="${PD_SCRIPT_URL:-https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh}"
+VERSION="3.8.0"
+DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
+SCRIPT_URL="${PD_SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
+
+cli_usage_error() {
+    echo "参数错误: $*" >&2
+    echo "使用 --help 查看支持的命令" >&2
+    exit 2
+}
 
 # 纯查询命令，不需要锁和 root
 case "${1:-}" in
     --help|-h)
+        [ "$#" -eq 1 ] || cli_usage_error "$1 不接受额外参数"
         cat <<EOF
 PD-proxy v${VERSION} — 多协议代理一键部署
 
@@ -29,6 +38,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   pd --log        <协议>   日志  pd --config    <协议> 配置
   pd --config-all          全部配置  pd --export   导出
   pd --status              状态  pd --show      详情
+  pd --doctor [--json]     只读诊断
   pd --bbr                 开启BBR  pd --bbrv3     BBRv3内核
   pd --update              更新    pd --remove-all [--yes]  卸载全部
 
@@ -40,20 +50,26 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   PD_VLESS_DEST=...:443
   PD_SNELL_MANUAL_TIMEOUT=6  PD_SNELL_PROBE_PARALLEL=12  PD_SNELL_VERSION=v5.x.x
   PD_BBR_BANDWIDTH=1000  PD_BBR_REGION=asia
+  PD_LISTEN_FAMILY=auto  PD_PUBLIC_HOST=proxy.example.com
+  PD_PUBLIC_IPV4=203.0.113.10  PD_PUBLIC_IPV6=2001:db8::10
+  PD_STRICT_CHECKSUM=1  PD_SCRIPT_SHA256=<64位十六进制摘要>
 
 示例:
-  bash -c "\$(curl -fsSL ${SCRIPT_URL})"
+  curl --proto '=https' --proto-redir '=https' -fsSLo /tmp/pd-install.sh ${DEFAULT_SCRIPT_URL}
+  sudo bash /tmp/pd-install.sh
 EOF
         exit 0 ;;
     --version|-v)
+        [ "$#" -eq 1 ] || cli_usage_error "$1 不接受额外参数"
         echo "PD-proxy v${VERSION}"; exit 0 ;;
 esac
 
 # 无参数交互菜单不能用 `curl ... | bash`：stdin 会被脚本内容占用，菜单无法读取键盘。
 # 带参数 CLI 允许非终端运行，便于自动化；持久化由 self_install 单独处理。
-if [ "$#" -eq 0 ] && [ ! -t 0 ]; then
+if [ "${PD_TEST_MODE:-0}" != "1" ] && [ "$#" -eq 0 ] && [ ! -t 0 ]; then
     echo "不能使用管道方式运行交互菜单，请改用：" >&2
-    echo "  bash -c \"\$(curl -fsSL ${SCRIPT_URL})\"" >&2
+    echo "  curl --proto '=https' --proto-redir '=https' -fsSLo /tmp/pd-install.sh ${DEFAULT_SCRIPT_URL}" >&2
+    echo "  sudo bash /tmp/pd-install.sh" >&2
     exit 1
 fi
 
@@ -69,10 +85,11 @@ if [ ! -t 1 ]; then
     RED=''; GREEN=''; YELLOW=''; CYAN=''; MAGENTA=''; BLUE=''; BOLD=''; DIM=''; RESET=''
 fi
 
-BASE_DIR="/opt/pd"
-STATE_FILE="$BASE_DIR/state"
-INSTALLED_BIN="/usr/local/bin/pd"
-LOCK_FILE="/tmp/pd-proxy.lock"
+BASE_DIR="${PD_BASE_DIR:-/opt/pd}"
+STATE_FILE="${PD_STATE_FILE:-$BASE_DIR/state}"
+INSTALLED_BIN="${PD_INSTALLED_BIN:-/usr/local/bin/pd}"
+SYSTEMD_DIR="${PD_SYSTEMD_DIR:-/etc/systemd/system}"
+LOCK_FILE="${PD_LOCK_FILE:-/run/lock/pd-proxy.lock}"
 
 # 日志函数必须在锁之前定义；锁失败路径也会使用 die。
 info()  { echo -e "${GREEN}[✓]${RESET} $*"; }
@@ -109,17 +126,181 @@ PD_OPT_ANYTLS_SNI="${PD_ANYTLS_SNI:-}"                  # 空=不伪装
 # 轻量化选项
 PD_OPT_INSTALL_QR="${PD_INSTALL_QR:-0}"                  # 1=安装 qrencode 生成二维码
 
-# 并发锁
-exec 200>"$LOCK_FILE"
-flock -n 200 || die "已有 PD-proxy 进程在运行，请稍后再试"
-
 # 临时文件追踪（只清理自己创建的，不误删其他进程的文件）
 declare -a _PD_TMPFILES=()
 mktemp_pd() {
-    local f; f=$(mktemp /tmp/pd-XXXXXX)
-    _PD_TMPFILES+=("$f"); echo "$f"
+    local out_var="${1:-}" f
+    [ -n "$out_var" ] || die "mktemp_pd 需要接收变量名"
+    f=$(mktemp "${TMPDIR:-/tmp}/pd-XXXXXX") || die "创建临时文件失败"
+    _PD_TMPFILES+=("$f")
+    printf -v "$out_var" '%s' "$f"
 }
-trap 'rm -f "${_PD_TMPFILES[@]}" 2>/dev/null' EXIT
+mktemp_dir_pd() {
+    local out_var="${1:-}" d
+    [ -n "$out_var" ] || die "mktemp_dir_pd 需要接收变量名"
+    d=$(mktemp -d "${TMPDIR:-/tmp}/pd-dir-XXXXXX") || die "创建临时目录失败"
+    _PD_TMPFILES+=("$d")
+    printf -v "$out_var" '%s' "$d"
+}
+cleanup_tmpfiles() {
+    local f
+    for f in "${_PD_TMPFILES[@]}"; do
+        [ -n "$f" ] && rm -rf -- "$f"
+    done
+    return 0
+}
+trap cleanup_tmpfiles EXIT
+
+atomic_write_file() {
+    local path="$1" mode="${2:-600}" dir base tmp
+    dir=$(dirname "$path")
+    base=$(basename "$path")
+    [ -d "$dir" ] || { err "目标目录不存在: $dir"; return 1; }
+    [ ! -L "$path" ] || { err "拒绝原子覆盖符号链接: $path"; return 1; }
+    [ ! -e "$path" ] || [ -f "$path" ] || { err "目标不是普通文件: $path"; return 1; }
+    tmp=$(mktemp "$dir/.${base}.XXXXXX") || return 1
+    chmod "$mode" "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! cat > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if [ "$(id -u)" = 0 ]; then
+        chown root:root "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    mv -f "$tmp" "$path" || { rm -f "$tmp"; return 1; }
+}
+
+sha256_file() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print tolower($1)}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print tolower($1)}'
+    else
+        return 1
+    fi
+}
+
+validate_https_url() {
+    case "$1" in
+        https://*) return 0 ;;
+        *) err "拒绝非 HTTPS URL: $1"; return 1 ;;
+    esac
+}
+
+curl_https() {
+    command curl --proto '=https' --proto-redir '=https' "$@"
+}
+
+verify_expected_sha256() {
+    local file="$1" expected="$2" label="$3" actual
+    expected=$(printf '%s' "$expected" | tr 'A-F' 'a-f')
+    [[ "$expected" =~ ^[0-9a-f]{64}$ ]] || { err "$label 的 SHA-256 格式无效"; return 1; }
+    actual=$(sha256_file "$file") || { err "缺少 SHA-256 工具，无法校验 $label"; return 1; }
+    [ "$actual" = "$expected" ] || { err "$label SHA-256 不匹配"; return 1; }
+}
+
+github_release_digest() {
+    local repo="$1" tag="$2" asset="$3"
+    curl_https -fsS --retry 2 --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/${repo}/releases/tags/${tag}" 2>/dev/null \
+        | awk -v asset="$asset" '
+            /"name"[[:space:]]*:/ {
+                line=$0; sub(/^.*"name"[[:space:]]*:[[:space:]]*"/, "", line); sub(/".*$/, "", line)
+                wanted=(line == asset)
+            }
+            wanted && /"digest"[[:space:]]*:[[:space:]]*"sha256:/ {
+                line=$0; sub(/^.*"digest"[[:space:]]*:[[:space:]]*"sha256:/, "", line); sub(/".*$/, "", line)
+                print tolower(line); exit
+            }
+        '
+}
+
+verify_release_checksum() {
+    local file="$1" label="$2" repo="${3:-}" tag="${4:-}" asset="${5:-}" digest=""
+    if [ -n "$repo" ] && [ -n "$tag" ] && [ -n "$asset" ]; then
+        digest=$(github_release_digest "$repo" "$tag" "$asset" || true)
+    fi
+    if [ -n "$digest" ]; then
+        verify_expected_sha256 "$file" "$digest" "$label" || return 1
+        info "$label 已按 GitHub release 官方 digest 校验"
+        return 0
+    fi
+    if [ "${PD_STRICT_CHECKSUM:-0}" = 1 ]; then
+        err "$label 未发布可读取的官方 SHA-256 digest；严格模式拒绝继续"
+        return 1
+    fi
+    warn "$label 未提供可读取的官方 SHA-256 digest；仅完成 HTTPS、大小和格式校验"
+}
+
+download_https() {
+    local url="$1" dest="$2" label="$3" repo="${4:-}" tag="${5:-}" asset
+    validate_https_url "$url" || return 1
+    curl_https -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$dest" "$url" || return 1
+    asset=${url##*/}
+    verify_release_checksum "$dest" "$label" "$repo" "$tag" "$asset"
+}
+
+archive_paths_are_safe() {
+    local path
+    while IFS= read -r path; do
+        case "$path" in
+            /*|../*|*/../*|*/..) err "压缩包包含不安全路径: $path"; return 1 ;;
+        esac
+    done
+}
+
+extract_zip_binary() {
+    local archive="$1" expected="$2" target="$3" label="$4" tmpdir source
+    unzip -Z1 "$archive" | archive_paths_are_safe || return 1
+    mktemp_dir_pd tmpdir
+    unzip -q "$archive" -d "$tmpdir" || return 1
+    if find "$tmpdir" -type l -print -quit | grep -q .; then
+        err "$label 压缩包包含符号链接，拒绝安装"
+        return 1
+    fi
+    source=$(find "$tmpdir" -type f -name "$expected" -print -quit)
+    [ -n "$source" ] || { err "$label 压缩包缺少 $expected"; return 1; }
+    install -m 0755 "$source" "$target"
+}
+
+# 写锁只在变更动作执行期间持有。/run/lock 由 root 管理，且拒绝符号链接。
+_PD_LOCK_DEPTH=0
+write_lock_acquire() {
+    if [ "$_PD_LOCK_DEPTH" -gt 0 ]; then
+        _PD_LOCK_DEPTH=$((_PD_LOCK_DEPTH + 1))
+        return 0
+    fi
+    local lock_dir
+    command -v flock >/dev/null 2>&1 || die "缺少 flock，无法安全执行写操作"
+    lock_dir=$(dirname "$LOCK_FILE")
+    mkdir -p "$lock_dir" || die "无法创建锁目录: $lock_dir"
+    [ ! -L "$lock_dir" ] || die "拒绝使用符号链接锁目录: $lock_dir"
+    [ ! -L "$LOCK_FILE" ] || die "拒绝使用符号链接锁文件: $LOCK_FILE"
+    [ ! -e "$LOCK_FILE" ] || [ -f "$LOCK_FILE" ] || die "锁路径不是普通文件: $LOCK_FILE"
+    exec 200<>"$LOCK_FILE" || die "无法打开写锁: $LOCK_FILE"
+    chmod 600 "$LOCK_FILE" || { exec 200>&-; die "无法保护写锁: $LOCK_FILE"; }
+    flock -n 200 || { exec 200>&-; die "已有 PD-proxy 写操作在运行，请稍后再试"; }
+    _PD_LOCK_DEPTH=1
+}
+
+write_lock_release() {
+    [ "$_PD_LOCK_DEPTH" -gt 0 ] || return 0
+    _PD_LOCK_DEPTH=$((_PD_LOCK_DEPTH - 1))
+    [ "$_PD_LOCK_DEPTH" -eq 0 ] || return 0
+    flock -u 200 || return 1
+    exec 200>&-
+}
+
+run_write_locked() {
+    local rc
+    write_lock_acquire
+    set +e
+    "$@"
+    rc=$?
+    set -e
+    write_lock_release || { err "释放写锁失败"; [ "$rc" -ne 0 ] || rc=1; }
+    return "$rc"
+}
 
 # ============================================================
 # 公共工具
@@ -162,27 +343,69 @@ valid_ipv4() {
 }
 
 valid_ipv6() {
-    local ip="$1"
+    local ip="$1" expanded part compressed=0 groups=0
+    local -a _ipv6_parts=()
     [[ "$ip" == *:* ]] || return 1
-    [[ "$ip" =~ ^[0-9A-Fa-f:.]+$ ]] || return 1
-    return 0
+    [[ "$ip" =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+    [[ "$ip" != *:::* ]] || return 1
+    if [[ "$ip" == *::* ]]; then
+        [[ "${ip#*::}" != *::* ]] || return 1
+        compressed=1
+        expanded=${ip/::/:x:}
+    else
+        expanded="$ip"
+    fi
+    IFS=: read -r -a _ipv6_parts <<< "$expanded"
+    for part in "${_ipv6_parts[@]}"; do
+        [ -n "$part" ] || continue
+        [ "$part" = x ] && continue
+        [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+        groups=$((groups + 1))
+    done
+    if [ "$compressed" = 1 ]; then
+        [ "$groups" -lt 8 ]
+    else
+        [ "$groups" -eq 8 ]
+    fi
 }
 
 fetch_public_ip() {
-    local family="$1" validator="$2" url ip
-    for url in ifconfig.me ip.sb icanhazip.com; do
-        ip=$(curl "-${family}" -fsSL --connect-timeout 2 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+    local family="$1" validator="$2" url ip first="" replies=0
+    for url in "https://ifconfig.me/ip" "https://api.ipify.org" "https://icanhazip.com"; do
+        ip=$(curl_https "-${family}" -fsS --connect-timeout 2 --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
         if [ -n "$ip" ] && "$validator" "$ip"; then
-            echo "$ip"
-            return 0
+            replies=$((replies + 1))
+            if [ -z "$first" ]; then
+                first="$ip"
+            elif [ "$ip" != "$first" ]; then
+                warn "公网 IPv${family} 来源结果不一致，已拒绝使用自动探测地址" >&2
+                return 2
+            fi
         fi
     done
-    return 1
+    [ "$replies" -gt 0 ] || return 1
+    printf '%s\n' "$first"
 }
 
 get_ip() {
-    IP=$(fetch_public_ip 4 valid_ipv4 || echo "未知")
-    IP6=$(fetch_public_ip 6 valid_ipv6 || echo "")
+    IP=""; IP6=""; PUBLIC_HOST=""
+    if [ -n "${PD_PUBLIC_HOST:-}" ]; then
+        validate_hostname "$PD_PUBLIC_HOST" "PD_PUBLIC_HOST"
+        PUBLIC_HOST="$PD_PUBLIC_HOST"
+    fi
+    if [ -n "${PD_PUBLIC_IPV4:-}" ]; then
+        valid_ipv4 "$PD_PUBLIC_IPV4" || die "PD_PUBLIC_IPV4 不是有效 IPv4 地址"
+        IP="$PD_PUBLIC_IPV4"
+    elif [ -z "$PUBLIC_HOST" ]; then
+        IP=$(fetch_public_ip 4 valid_ipv4 || true)
+    fi
+    if [ -n "${PD_PUBLIC_IPV6:-}" ]; then
+        valid_ipv6 "$PD_PUBLIC_IPV6" || die "PD_PUBLIC_IPV6 不是有效 IPv6 地址"
+        IP6="$PD_PUBLIC_IPV6"
+    elif [ -z "$PUBLIC_HOST" ]; then
+        IP6=$(fetch_public_ip 6 valid_ipv6 || true)
+    fi
+    return 0
 }
 
 get_mem() {
@@ -192,6 +415,80 @@ get_mem() {
 
 has_ipv6() {
     ip -6 addr show scope global 2>/dev/null | grep -q inet6 && return 0 || return 1
+}
+
+bindv6only_value() {
+    local value
+    value=$(sysctl -n net.ipv6.bindv6only 2>/dev/null || cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 1)
+    case "$value" in 0|1) printf '%s\n' "$value" ;; *) printf '1\n' ;; esac
+}
+
+prepare_listen_family() {
+    local requested="${PD_LISTEN_FAMILY:-auto}" bindonly
+    case "$requested" in auto|ipv4|ipv6|dual) ;; *) die "PD_LISTEN_FAMILY 仅支持 auto|ipv4|ipv6|dual" ;; esac
+    bindonly=$(bindv6only_value)
+    case "$requested" in
+        auto)
+            if has_ipv6 && [ "$bindonly" = 0 ]; then
+                PD_EFFECTIVE_LISTEN_FAMILY=dual
+                PD_LISTEN_HOST="::"
+            else
+                PD_EFFECTIVE_LISTEN_FAMILY=ipv4
+                PD_LISTEN_HOST="0.0.0.0"
+            fi ;;
+        ipv4) PD_EFFECTIVE_LISTEN_FAMILY=ipv4; PD_LISTEN_HOST="0.0.0.0" ;;
+        ipv6)
+            has_ipv6 || die "PD_LISTEN_FAMILY=ipv6，但系统没有全局 IPv6 地址"
+            PD_EFFECTIVE_LISTEN_FAMILY=ipv6; PD_LISTEN_HOST="::" ;;
+        dual)
+            has_ipv6 || die "PD_LISTEN_FAMILY=dual，但系统没有全局 IPv6 地址"
+            PD_EFFECTIVE_LISTEN_FAMILY=dual; PD_LISTEN_HOST="::"
+            [ "$bindonly" = 0 ] || warn "net.ipv6.bindv6only=1；将启动后实测双栈，若程序未自行关闭 IPV6_V6ONLY 则回滚" ;;
+    esac
+}
+
+listen_endpoint() {
+    local port="$1"
+    case "$PD_LISTEN_HOST" in *:*) printf '[%s]:%s' "$PD_LISTEN_HOST" "$port" ;; *) printf '%s:%s' "$PD_LISTEN_HOST" "$port" ;; esac
+}
+
+require_public_endpoint() {
+    [ -n "${PUBLIC_HOST:-}" ] || [ -n "${IP:-}" ] || [ -n "${IP6:-}" ] || die "无法得到一致、有效的公网地址；请设置 PD_PUBLIC_HOST/PD_PUBLIC_IPV4/PD_PUBLIC_IPV6"
+}
+
+output_hosts() {
+    local key="$1" allow4 allow6 port service transport
+    OUTPUT_HOST4=""; OUTPUT_HOST6=""
+    allow4=$(state_get "$key" listen_ipv4 2>/dev/null || true)
+    allow6=$(state_get "$key" listen_ipv6 2>/dev/null || true)
+    if [ -z "$allow4$allow6" ]; then
+        port=$(state_get "$key" port 2>/dev/null || true)
+        case "$key" in
+            snell) service=snell; transport=tcp; [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && service=shadowtls-snell ;;
+            hy2) service=hysteria2; transport=udp ;;
+            vless) service=xray; transport=tcp ;;
+            anytls) service=anytls; transport=tcp ;;
+            *) return 1 ;;
+        esac
+        if [[ "$port" =~ ^[0-9]+$ ]] && systemctl is-active --quiet "$service" 2>/dev/null; then
+            service_port_family_listening "$port" "$transport" "$service" ipv4 && allow4=1 || allow4=0
+            service_port_family_listening "$port" "$transport" "$service" ipv6 && allow6=1 || allow6=0
+        fi
+    fi
+    if [ -n "${PUBLIC_HOST:-}" ] && { [ "$allow4" = 1 ] || [ "$allow6" = 1 ]; }; then
+        OUTPUT_HOST4=$(format_proxy_host "$PUBLIC_HOST")
+        return 0
+    fi
+    [ "$allow4" = 1 ] && [ -n "${IP:-}" ] && OUTPUT_HOST4=$(format_proxy_host "$IP")
+    [ "$allow6" = 1 ] && [ -n "${IP6:-}" ] && OUTPUT_HOST6=$(format_proxy_host "$IP6")
+    [ -n "$OUTPUT_HOST4" ] || [ -n "$OUTPUT_HOST6" ] || {
+        err "没有与实际监听地址族匹配的已验证公网地址，拒绝生成配置"
+        return 1
+    }
+    if [ -z "$OUTPUT_HOST4" ]; then
+        OUTPUT_HOST4="$OUTPUT_HOST6"
+        OUTPUT_HOST6=""
+    fi
 }
 
 format_proxy_host() {
@@ -238,16 +535,17 @@ check_disk() {
 }
 
 rand_port() {
-    local used_ports=" $(get_all_ports) "
     local attempts=0
     while [ $attempts -lt 100 ]; do
         local p=$(( $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
-        if ! echo "$used_ports" | grep -q " $p "; then
+        if ! get_all_ports | awk -v p="$p" '$1 == p { found=1 } END { exit found ? 0 : 1 }'; then
             # 额外检查：确保端口未被非 PD 服务占用
-            if ss -tlnp 2>/dev/null | grep -q ":${p} " || ss -ulnp 2>/dev/null | grep -q ":${p} "; then
+            if port_in_use "$p"; then
                 attempts=$((attempts + 1))
                 continue
             fi
+            # 候选生成后再复检状态，避免并发或多行输出造成冲突。
+            state_port_range_conflict "$p" "$p" "" && { attempts=$((attempts + 1)); continue; }
             echo "$p"
             return 0
         fi
@@ -257,7 +555,7 @@ rand_port() {
 }
 
 rand_port_range() {
-    local count="$1" used_ports=" $(get_all_ports) " attempts=0 max_base p end busy
+    local count="$1" attempts=0 max_base p end busy
     [[ "$count" =~ ^[0-9]+$ ]] || die "端口范围数量无效: $count"
     [ "$count" -ge 1 ] || die "端口范围数量无效: $count"
     max_base=$((60000 - count + 1))
@@ -274,10 +572,7 @@ rand_port_range() {
             attempts=$((attempts + 1))
             continue
         fi
-        if echo "$used_ports" | grep -q " $p "; then
-            attempts=$((attempts + 1))
-            continue
-        fi
+        state_port_range_conflict "$p" "$end" "" && { attempts=$((attempts + 1)); continue; }
         echo "$p"
         return 0
     done
@@ -326,8 +621,8 @@ json_tag_name() {
 snell_manual_html() {
     local timeout
     timeout=$(snell_manual_timeout)
-    curl -fsSL --connect-timeout 2 --max-time "$timeout" "https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell" 2>/dev/null \
-        || curl -fsSL --connect-timeout 2 --max-time "$timeout" "https://manual.nssurge.com/others/snell.html" 2>/dev/null \
+    curl_https -fsSL --connect-timeout 2 --max-time "$timeout" "https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell" 2>/dev/null \
+        || curl_https -fsSL --connect-timeout 2 --max-time "$timeout" "https://manual.nssurge.com/others/snell.html" 2>/dev/null \
         || true
 }
 
@@ -411,7 +706,7 @@ snell_probe_batch() {
         (
             trap - EXIT ERR
             probe_url="https://dl.nssurge.com/snell/snell-server-${probe}-linux-$(snell_arch).zip"
-            curl -fsI --connect-timeout 1 --max-time 3 "$probe_url" >/dev/null 2>&1 && printf '%s\n' "$probe" > "$tmpdir/${probe}"
+            curl_https -fsI --connect-timeout 1 --max-time 3 "$probe_url" >/dev/null 2>&1 && printf '%s\n' "$probe" > "$tmpdir/${probe}"
         ) &
         pids+=("$!")
     done
@@ -526,9 +821,83 @@ validate_port() {
 
 port_in_use() {
     local port="$1"
-    ss -tlnp 2>/dev/null | grep -q ":${port} " && return 0
-    ss -ulnp 2>/dev/null | grep -q ":${port} " && return 0
+    ss_port_listening "$port" tcp && return 0
+    ss_port_listening "$port" udp && return 0
     return 1
+}
+
+ss_port_listening() {
+    local port="$1" transport="$2" flag
+    case "$transport" in tcp) flag=-ltn ;; udp) flag=-lun ;; *) return 2 ;; esac
+    ss -H "$flag" 2>/dev/null | awk -v port="$port" '
+        {
+            addr=$4
+            sub(/%[^:]*:/, ":", addr)
+            if (addr ~ (":" port "$")) found=1
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+service_port_listening() {
+    local port="$1" transport="$2" service="$3" flag pid
+    case "$transport" in tcp) flag=-ltnp ;; udp) flag=-lunp ;; *) return 2 ;; esac
+    pid=$(systemctl show -p MainPID --value "$service" 2>/dev/null) || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    ss -H "$flag" 2>/dev/null | awk -v port="$port" -v pid="$pid" '
+        {
+            addr=$4
+            sub(/%[^:]*:/, ":", addr)
+            if (addr ~ (":" port "$")) {
+                marker="pid=" pid "([,)]|$)"
+                if ($0 ~ marker) found=1
+            }
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+service_port_family_listening() {
+    local port="$1" transport="$2" service="$3" family="$4" flag pid bindonly
+    case "$transport" in tcp) flag=-ltnp ;; udp) flag=-lunp ;; *) return 2 ;; esac
+    pid=$(systemctl show -p MainPID --value "$service" 2>/dev/null) || return 1
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    bindonly=$(bindv6only_value)
+    ss -H "$flag" 2>/dev/null | awk -v port="$port" -v pid="$pid" -v family="$family" -v bindonly="$bindonly" '
+        {
+            addr=$4
+            marker="pid=" pid "([,)]|$)"
+            if ($0 !~ marker || addr !~ (":" port "$")) next
+            is6=(addr ~ /^\[/ || gsub(/:/, ":", addr) > 1)
+            if (family == "ipv6" && is6) found=1
+            if (family == "ipv4" && !is6) found=1
+            if (family == "ipv4" && is6 && bindonly == 0 && (addr ~ /^\[?::\]?:/ || addr ~ /^\*:/)) found=1
+        }
+        END { exit found ? 0 : 1 }
+    '
+}
+
+verify_and_record_listen_families() {
+    local key="$1" port="$2" transport="$3" service="$4" got4=0 got6=0
+    service_port_family_listening "$port" "$transport" "$service" ipv4 && got4=1
+    service_port_family_listening "$port" "$transport" "$service" ipv6 && got6=1
+    case "${PD_EFFECTIVE_LISTEN_FAMILY:-auto}" in
+        ipv4) [ "$got4" = 1 ] && [ "$got6" = 0 ] || { err "服务未实现仅 IPv4 监听（IPv4=$got4 IPv6=$got6）"; return 1; } ;;
+        ipv6) [ "$got6" = 1 ] && [ "$got4" = 0 ] || { err "服务未实现仅 IPv6 监听（IPv4=$got4 IPv6=$got6）"; return 1; } ;;
+        dual) [ "$got4" = 1 ] && [ "$got6" = 1 ] || { err "服务未实际提供双栈监听（IPv4=$got4 IPv6=$got6）"; return 1; } ;;
+        auto) [ "$got4" = 1 ] || [ "$got6" = 1 ] || return 1 ;;
+    esac
+    state_set "$key" listen_ipv4 "$got4" || return 1
+    state_set "$key" listen_ipv6 "$got6" || return 1
+    state_set "$key" listen_family "${PD_EFFECTIVE_LISTEN_FAMILY:-auto}"
+}
+
+protocol_transport() {
+    case "$1" in
+        hy2) echo udp ;;
+        snell|vless|anytls) echo tcp ;;
+        *) return 1 ;;
+    esac
 }
 
 system_port_range_conflict() {
@@ -631,8 +1000,14 @@ setup_hy2_hop_rules() {
     local last_port=$((base_port + hop_count - 1))
     local nft_bin
     nft_bin=$(command -v nft)
+    if nft list table inet pd_hy2_hop >/dev/null 2>&1; then
+        if ! unit_is_pd_owned "$SYSTEMD_DIR/pd-hy2-hop.service"; then
+            die "nft table inet pd_hy2_hop 已存在且所有权未知"
+        fi
+        nft delete table inet pd_hy2_hop || die "无法替换本脚本的旧 HY2 hop table"
+    fi
     mkdir -p "$(pdir hy2)"
-    cat > "$(pdir hy2)/hop.nft" <<EOF
+    atomic_write_file "$(pdir hy2)/hop.nft" 600 <<EOF || return 1
 table inet pd_hy2_hop {
   chain prerouting {
     type nat hook prerouting priority dstnat; policy accept;
@@ -640,7 +1015,7 @@ table inet pd_hy2_hop {
   }
 }
 EOF
-    cat > /etc/systemd/system/pd-hy2-hop.service <<EOF
+    atomic_write_file "$SYSTEMD_DIR/pd-hy2-hop.service" 644 <<EOF || return 1
 [Unit]
 Description=PD-proxy: Hysteria2 port hopping nft rules
 After=network.target
@@ -657,13 +1032,14 @@ ExecStop=-${nft_bin} delete table inet pd_hy2_hop
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable pd-hy2-hop >/dev/null 2>&1 || true
+    systemctl enable pd-hy2-hop >/dev/null || die "启用 HY2 hop unit 失败"
     systemctl restart pd-hy2-hop || die "HY2 端口跳跃规则加载失败"
+    state_set hy2 hop_owned 1 || die "记录 HY2 hop 所有权失败"
 }
 
 write_hy2_systemd() {
     local svc="$1" bin="$2" args="$3"
-    cat > "/etc/systemd/system/${svc}.service" <<EOF
+    atomic_write_file "$SYSTEMD_DIR/${svc}.service" 644 <<EOF
 [Unit]
 Description=PD-proxy: ${svc}
 After=network.target pd-hy2-hop.service
@@ -687,11 +1063,24 @@ EOF
 }
 
 clear_hy2_hop_rules() {
-    command -v nft >/dev/null 2>&1 || return 0
-    systemctl disable --now pd-hy2-hop 2>/dev/null || true
-    rm -f /etc/systemd/system/pd-hy2-hop.service
-    systemctl daemon-reload 2>/dev/null || true
-    nft delete table inet pd_hy2_hop 2>/dev/null || true
+    local unit="$SYSTEMD_DIR/pd-hy2-hop.service" owned=false rc=0
+    [ -f "$unit" ] && grep -q '^Description=PD-proxy:' "$unit" && owned=true
+    if [ -e "$unit" ] || [ -L "$unit" ]; then
+        [ ! -L "$unit" ] || { err "拒绝删除符号链接 unit: $unit"; return 1; }
+        $owned || { err "拒绝删除非 PD-proxy 的 HY2 hop unit: $unit"; return 1; }
+        systemctl disable --now pd-hy2-hop || rc=1
+        rm -f "$unit" || rc=1
+        systemctl daemon-reload || rc=1
+    fi
+    if command -v nft >/dev/null 2>&1 && nft list table inet pd_hy2_hop >/dev/null 2>&1; then
+        if $owned || [ "$(state_get hy2 hop_owned 2>/dev/null || true)" = "1" ]; then
+            nft delete table inet pd_hy2_hop || rc=1
+        else
+            err "拒绝删除所有权未知的 nft table inet pd_hy2_hop"
+            rc=1
+        fi
+    fi
+    [ "$rc" -eq 0 ] || { err "清理 HY2 端口跳跃资源失败"; return 1; }
 }
 
 verify_download() {
@@ -711,111 +1100,197 @@ verify_download() {
 }
 
 verify_port() {
-    local port="$1" service="$2"
+    local port="$1" service="$2" transport="${3:-tcp}"
     sleep 2
-    if ss -tlnp 2>/dev/null | grep -q ":${port} " || ss -ulnp 2>/dev/null | grep -q ":${port} "; then
-        info "端口 $port 监听确认 ✅"
-        return 0
+    systemctl is-active --quiet "$service" 2>/dev/null || {
+        err "服务 $service 未运行"
+        return 1
+    }
+    if ! service_port_listening "$port" "$transport" "$service"; then
+        err "端口 $port/$transport 未由服务 $service 的 MainPID 监听"
+        warn "查看日志: journalctl -u $service -n 30 --no-pager"
+        return 1
     fi
-    err "端口 $port 未监听，服务可能启动失败"
-    warn "查看日志: journalctl -u $service -n 30 --no-pager"
-    return 1
+    info "端口 $port/${transport} 与服务 $service 验证通过 ✅"
+}
+
+verify_hy2_hop() {
+    local port count end
+    port="$1"; count="$2"; end=$((port + count - 1))
+    verify_port "$port" hysteria2 udp || return 1
+    systemctl is-active --quiet pd-hy2-hop 2>/dev/null || { err "HY2 hop unit 未运行"; return 1; }
+    command -v nft >/dev/null 2>&1 || { err "HY2 hop 验证缺少 nft"; return 1; }
+    nft list table inet pd_hy2_hop 2>/dev/null \
+        | tr '\n' ' ' \
+        | grep -Eq "udp dport ${port}-${end} redirect to :${port}([ ;]|$)" || {
+            err "HY2 hop nft 规则与目标范围 ${port}-${end}/udp 不匹配"
+            return 1
+        }
+}
+
+verify_shadowtls_stack() {
+    local ext_port="$1" int_port="$2"
+    verify_port "$int_port" snell tcp || return 1
+    verify_port "$ext_port" shadowtls-snell tcp || return 1
 }
 
 save_iptables() {
+    local tmp
     if command -v netfilter-persistent >/dev/null 2>&1; then
-        netfilter-persistent save >/dev/null 2>&1 || true
+        netfilter-persistent save >/dev/null || { err "持久化 iptables 规则失败"; return 1; }
     elif [ -d /etc/iptables ]; then
-        cp /etc/iptables/rules.v4 /etc/iptables/rules.v4.bak 2>/dev/null || true
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        tmp=$(mktemp /etc/iptables/.rules.v4.XXXXXX) || return 1
+        if ! iptables-save > "$tmp" || ! mv -f "$tmp" /etc/iptables/rules.v4; then
+            rm -f "$tmp"; err "写入 IPv4 防火墙持久化文件失败"; return 1
+        fi
         if command -v ip6tables-save >/dev/null 2>&1; then
-            cp /etc/iptables/rules.v6 /etc/iptables/rules.v6.bak 2>/dev/null || true
-            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+            tmp=$(mktemp /etc/iptables/.rules.v6.XXXXXX) || return 1
+            if ! ip6tables-save > "$tmp" || ! mv -f "$tmp" /etc/iptables/rules.v6; then
+                rm -f "$tmp"; err "写入 IPv6 防火墙持久化文件失败"; return 1
+            fi
         fi
     fi
 }
 
-add_firewall() {
-    local port="$1"
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "$port"/tcp >/dev/null 2>&1 || true
-        ufw allow "$port"/udp >/dev/null 2>&1 || true
-    elif command -v iptables >/dev/null 2>&1; then
-        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-        iptables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-        if command -v ip6tables >/dev/null 2>&1; then
-            ip6tables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-            ip6tables -I INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-        fi
-        save_iptables
-    else
-        warn "未检测到 ufw/iptables，请确认云防火墙已放行端口 $port"
-    fi
+firewall_spec() {
+    [ "$1" = "$2" ] && printf '%s' "$1" || printf '%s:%s' "$1" "$2"
 }
 
-add_firewall_range() {
-    local start="$1" end="$2"
+ufw_rule_exists() {
+    local rule="$1"
+    ufw show added 2>/dev/null | grep -Fqx "ufw allow $rule"
+}
+
+firewall_add() {
+    local key="$1" start="$2" end="$3" transport="$4" spec owned="" backend="none"
     validate_port "$start" "防火墙起始端口"
     validate_port "$end" "防火墙结束端口"
-    [ "$end" -ge "$start" ] || die "防火墙端口范围无效: $start-$end"
-    if [ "$start" = "$end" ]; then
-        add_firewall "$start"
-        return 0
-    fi
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw allow "${start}:${end}"/tcp >/dev/null 2>&1 || true
-        ufw allow "${start}:${end}"/udp >/dev/null 2>&1 || true
-    elif command -v iptables >/dev/null 2>&1; then
-        iptables -I INPUT -p tcp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
-        iptables -I INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
-        if command -v ip6tables >/dev/null 2>&1; then
-            ip6tables -I INPUT -p tcp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
-            ip6tables -I INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
+    [ "$end" -ge "$start" ] || { err "防火墙端口范围无效: $start-$end"; return 1; }
+    case "$transport" in tcp|udp) ;; *) err "未知传输层: $transport"; return 1 ;; esac
+    spec=$(firewall_spec "$start" "$end")
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+        backend=ufw
+        if ! ufw_rule_exists "${spec}/${transport}"; then
+            ufw allow "${spec}/${transport}" >/dev/null || { err "添加 ufw 规则 ${spec}/${transport} 失败"; return 1; }
+            owned=ufw
         fi
-        save_iptables
+    elif command -v iptables >/dev/null 2>&1; then
+        backend=iptables
+        if ! iptables -C INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1; then
+            iptables -I INPUT -p "$transport" --dport "$spec" -j ACCEPT || { err "添加 iptables 规则失败"; return 1; }
+            owned=iptables4
+        fi
+        if command -v ip6tables >/dev/null 2>&1 && ! ip6tables -C INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1; then
+            if ! ip6tables -I INPUT -p "$transport" --dport "$spec" -j ACCEPT; then
+                [ "$owned" = iptables4 ] && iptables -D INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1
+                err "添加 ip6tables 规则失败"; return 1
+            fi
+            owned="${owned:+$owned,}iptables6"
+        fi
+        if [ -n "$owned" ] && ! save_iptables; then
+            [[ ",$owned," == *,iptables6,* ]] && ip6tables -D INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1
+            [[ ",$owned," == *,iptables4,* ]] && iptables -D INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1
+            return 1
+        fi
     else
-        warn "未检测到 ufw/iptables，请确认云防火墙已放行端口范围 ${start}-${end}"
+        warn "未检测到活动的 ufw/iptables，请确认云防火墙已放行 ${spec}/${transport}"
+    fi
+    # 单字段先原子记录待提交所有权；后续任一状态字段失败时，事务仍能精确撤销规则。
+    if ! state_set "$key" fw_pending "${backend},${spec},${transport},${owned}" \
+        || ! state_set "$key" fw_backend "$backend" \
+        || ! state_set "$key" fw_spec "$spec" \
+        || ! state_set "$key" fw_proto "$transport" \
+        || ! state_set "$key" fw_owned "$owned" \
+        || ! state_set "$key" fw_pending ""; then
+        local cleanup_rc=0
+        [ "$owned" != ufw ] || ufw delete allow "${spec}/${transport}" >/dev/null || cleanup_rc=1
+        if [[ ",$owned," == *,iptables6,* ]]; then ip6tables -D INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null || cleanup_rc=1; fi
+        if [[ ",$owned," == *,iptables4,* ]]; then iptables -D INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null || cleanup_rc=1; fi
+        if [[ "$owned" == *iptables* ]]; then save_iptables || cleanup_rc=1; fi
+        [ "$cleanup_rc" -eq 0 ] || err "撤销新增防火墙规则失败，事务将再次清理"
+        err "记录防火墙规则所有权失败"
+        return 1
     fi
 }
 
-del_firewall() {
-    local port="$1"
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw delete allow "$port"/tcp >/dev/null 2>&1 || true
-        ufw delete allow "$port"/udp >/dev/null 2>&1 || true
-    elif command -v iptables >/dev/null 2>&1; then
-        iptables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-        if command -v ip6tables >/dev/null 2>&1; then
-            ip6tables -D INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || true
-            ip6tables -D INPUT -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-        fi
-        save_iptables
+firewall_remove_owned() {
+    local key="$1" backend spec transport owned pending rc=0
+    backend=$(state_get "$key" fw_backend) || return 1
+    spec=$(state_get "$key" fw_spec) || return 1
+    transport=$(state_get "$key" fw_proto) || return 1
+    owned=$(state_get "$key" fw_owned) || return 1
+    pending=$(state_get "$key" fw_pending) || return 1
+    if [ -n "$pending" ]; then
+        IFS=, read -r backend spec transport owned <<< "$pending"
     fi
-}
-
-del_firewall_range() {
-    local start="$1" end="$2"
-    validate_port "$start" "防火墙起始端口"
-    validate_port "$end" "防火墙结束端口"
-    [ "$end" -ge "$start" ] || return 0
-    if [ "$start" = "$end" ]; then
-        del_firewall "$start"
+    if [ -z "$owned" ]; then
+        [ -n "$backend" ] || {
+            err "旧状态缺少防火墙所有权记录，拒绝猜测或静默遗留规则"
+            return 1
+        }
         return 0
     fi
-    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-        ufw delete allow "${start}:${end}"/tcp >/dev/null 2>&1 || true
-        ufw delete allow "${start}:${end}"/udp >/dev/null 2>&1 || true
-    elif command -v iptables >/dev/null 2>&1; then
-        iptables -D INPUT -p tcp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
-        iptables -D INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
-        if command -v ip6tables >/dev/null 2>&1; then
-            ip6tables -D INPUT -p tcp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
-            ip6tables -D INPUT -p udp --dport "${start}:${end}" -j ACCEPT 2>/dev/null || true
-        fi
-        save_iptables
-    fi
+    case "$backend" in
+        ufw)
+            [ "$owned" = ufw ] || { err "ufw 所有权记录无效"; return 1; }
+            command -v ufw >/dev/null 2>&1 || { err "缺少 ufw，无法删除已记录规则"; return 1; }
+            if ufw_rule_exists "${spec}/${transport}"; then
+                ufw delete allow "${spec}/${transport}" >/dev/null || rc=1
+            fi ;;
+        iptables)
+            command -v iptables >/dev/null 2>&1 || { err "缺少 iptables，无法删除已记录规则"; return 1; }
+            if [[ ",$owned," == *,iptables6,* ]] && ! command -v ip6tables >/dev/null 2>&1; then
+                err "缺少 ip6tables，无法删除已记录 IPv6 规则"; return 1
+            fi
+            if [[ ",$owned," == *,iptables4,* ]] && iptables -C INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1; then
+                iptables -D INPUT -p "$transport" --dport "$spec" -j ACCEPT || rc=1
+            fi
+            if [[ ",$owned," == *,iptables6,* ]] && command -v ip6tables >/dev/null 2>&1 \
+                && ip6tables -C INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1; then
+                ip6tables -D INPUT -p "$transport" --dport "$spec" -j ACCEPT || rc=1
+            fi
+            [ "$rc" -ne 0 ] || save_iptables || rc=1 ;;
+        *) err "未知防火墙后端所有权记录: $backend"; return 1 ;;
+    esac
+    [ "$rc" -eq 0 ] || { err "删除本脚本创建的防火墙规则 ${spec}/${transport} 失败"; return 1; }
+    state_set "$key" fw_owned "" || return 1
+    state_set "$key" fw_pending ""
 }
+
+firewall_restore_owned() {
+    local key="$1" backend spec transport owned rc=0
+    backend=$(state_get "$key" fw_backend) || return 1
+    owned=$(state_get "$key" fw_owned) || return 1
+    [ -n "$owned" ] || return 0
+    spec=$(state_get "$key" fw_spec) || return 1
+    transport=$(state_get "$key" fw_proto) || return 1
+    case "$backend" in
+        ufw)
+            [ "$owned" = ufw ] || return 1
+            command -v ufw >/dev/null 2>&1 || return 1
+            if ! ufw_rule_exists "${spec}/${transport}"; then
+                ufw allow "${spec}/${transport}" >/dev/null || rc=1
+            fi ;;
+        iptables)
+            command -v iptables >/dev/null 2>&1 || return 1
+            if [[ ",$owned," == *,iptables6,* ]] && ! command -v ip6tables >/dev/null 2>&1; then return 1; fi
+            if [[ ",$owned," == *,iptables4,* ]] && ! iptables -C INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1; then
+                iptables -I INPUT -p "$transport" --dport "$spec" -j ACCEPT || rc=1
+            fi
+            if [[ ",$owned," == *,iptables6,* ]] && ! ip6tables -C INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1; then
+                ip6tables -I INPUT -p "$transport" --dport "$spec" -j ACCEPT || rc=1
+            fi
+            [ "$rc" -ne 0 ] || save_iptables || rc=1 ;;
+        *) return 1 ;;
+    esac
+    [ "$rc" -eq 0 ] || { err "恢复防火墙规则 ${spec}/${transport} 失败"; return 1; }
+}
+
+# 兼容旧内部调用；没有所有权记录时绝不猜测并删除用户规则。
+add_firewall() { firewall_add "${2:-legacy}" "$1" "$1" "${3:-tcp}"; }
+add_firewall_range() { firewall_add "${3:-legacy}" "$1" "$2" "${4:-tcp}"; }
+del_firewall() { firewall_remove_owned "${2:-legacy}"; }
+del_firewall_range() { firewall_remove_owned "${3:-legacy}"; }
 
 install_deps() {
     local proto="${1:-}"
@@ -865,21 +1340,27 @@ gen_qr() {
 
 state_get() {
     local key="$1" field="$2"
+    [ ! -L "$STATE_FILE" ] || { err "拒绝读取符号链接状态文件: $STATE_FILE"; return 1; }
     [ -f "$STATE_FILE" ] || { echo ""; return; }
     local line
-    line=$(grep "^${key} " "$STATE_FILE" 2>/dev/null) || { echo ""; return; }
+    line=$(awk -v key="$key" '$1 == key { print; exit }' "$STATE_FILE") || return 1
+    [ -n "$line" ] || { echo ""; return; }
     echo "$line" | state_field_from_line "$field" || echo ""
+}
+
+state_get_from_file() {
+    local file="$1" key="$2" field="$3" line
+    [ -f "$file" ] || { echo ""; return 0; }
+    line=$(awk -v key="$key" '$1 == key { print; exit }' "$file") || return 1
+    [ -n "$line" ] || { echo ""; return 0; }
+    printf '%s\n' "$line" | state_field_from_line "$field"
 }
 
 state_set() {
     local key="$1" field="$2" value="$3"
-    mkdir -p "$BASE_DIR"
-    local line=""
-    if [ -f "$STATE_FILE" ]; then
-        line=$(grep "^${key} " "$STATE_FILE" 2>/dev/null || echo "")
-        grep -v "^${key} " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
-        mv "${STATE_FILE}.tmp" "$STATE_FILE"
-    fi
+    state_path_prepare || return 1
+    local line="" tmp
+    [ -f "$STATE_FILE" ] && line=$(awk -v key="$key" '$1 == key { print; exit }' "$STATE_FILE")
     if echo "$line" | grep -q "${field}="; then
         line=$(echo "$line" | awk -v f="$field" -v v="$value" '{ for (i=1; i<=NF; i++) if ($i ~ "^" f "=") $i=f "=" v; print }')
     else
@@ -890,14 +1371,53 @@ state_set() {
         fi
     fi
     line=$(echo "$line" | sed 's/^ *//;s/ *$//')
-    echo "$line" >> "$STATE_FILE"
+    tmp=$(mktemp "$BASE_DIR/.state.XXXXXX") || { err "创建状态临时文件失败"; return 1; }
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    if [ -f "$STATE_FILE" ]; then
+        awk -v key="$key" '$1 != key { print }' "$STATE_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    printf '%s\n' "$line" >> "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$STATE_FILE" || { rm -f "$tmp"; err "原子更新状态文件失败"; return 1; }
+    chmod 600 "$STATE_FILE" || return 1
+    [ "$(id -u)" != 0 ] || chown root:root "$STATE_FILE" || return 1
 }
 
 state_del() {
     local key="$1"
+    state_path_prepare || return 1
     [ -f "$STATE_FILE" ] || return 0
-    grep -v "^${key} " "$STATE_FILE" > "${STATE_FILE}.tmp" 2>/dev/null || true
-    mv "${STATE_FILE}.tmp" "$STATE_FILE"
+    local tmp
+    tmp=$(mktemp "$BASE_DIR/.state.XXXXXX") || { err "创建状态临时文件失败"; return 1; }
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    awk -v key="$key" '$1 != key { print }' "$STATE_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$STATE_FILE" || { rm -f "$tmp"; err "原子更新状态文件失败"; return 1; }
+    chmod 600 "$STATE_FILE" || return 1
+    [ "$(id -u)" != 0 ] || chown root:root "$STATE_FILE" || return 1
+}
+
+state_path_prepare() {
+    assert_base_dir_safe || return 1
+    [ ! -L "$BASE_DIR" ] || { err "拒绝使用符号链接状态目录: $BASE_DIR"; return 1; }
+    mkdir -p "$BASE_DIR" || { err "无法创建状态目录: $BASE_DIR"; return 1; }
+    chmod 755 "$BASE_DIR" || return 1
+    [ "$(id -u)" != 0 ] || chown root:root "$BASE_DIR" || return 1
+    if [ -f "$STATE_FILE" ] && [ ! -L "$STATE_FILE" ]; then
+        chmod 600 "$STATE_FILE" || return 1
+        [ "$(id -u)" != 0 ] || chown root:root "$STATE_FILE" || return 1
+    fi
+    [ ! -L "$STATE_FILE" ] || { err "拒绝写入符号链接状态文件: $STATE_FILE"; return 1; }
+    [ ! -e "$STATE_FILE" ] || [ -f "$STATE_FILE" ] || { err "状态路径不是普通文件: $STATE_FILE"; return 1; }
+}
+
+assert_base_dir_safe() {
+    [ ! -L "$BASE_DIR" ] || { err "拒绝使用符号链接 PD 目录: $BASE_DIR"; return 1; }
+    [ ! -L "$STATE_FILE" ] || { err "拒绝使用符号链接状态文件: $STATE_FILE"; return 1; }
+    [ ! -e "$STATE_FILE" ] || [ -f "$STATE_FILE" ] || { err "状态路径不是普通文件: $STATE_FILE"; return 1; }
+    [ -d "$BASE_DIR" ] || return 0
+    [ -f "$STATE_FILE" ] || [ -f "$BASE_DIR/.pd-proxy-owned" ] \
+        || { [ -f "$BASE_DIR/install.sh" ] && grep -q '^VERSION=' "$BASE_DIR/install.sh" 2>/dev/null; } \
+        || ! find "$BASE_DIR" -mindepth 1 -maxdepth 1 -print -quit | grep -q . \
+        || { err "发现状态文件外的非空同名目录，拒绝覆盖: $BASE_DIR"; return 1; }
 }
 
 state_installed() {
@@ -1008,25 +1528,246 @@ resolve_proto() {
     esac
 }
 
+unit_is_pd_owned() {
+    local unit="$1"
+    [ -f "$unit" ] && [ ! -L "$unit" ] && grep -q '^Description=PD-proxy:' "$unit"
+}
+
+assert_unit_name_available() {
+    local svc="$1" candidate
+    for candidate in "$SYSTEMD_DIR/${svc}.service" "/lib/systemd/system/${svc}.service" "/usr/lib/systemd/system/${svc}.service"; do
+        [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || {
+            err "发现状态文件外的同名 unit，拒绝覆盖: $candidate"
+            return 1
+        }
+    done
+}
+
+assert_install_target_available() {
+    local proto="$1" dir unit
+    dir=$(pdir "$proto")
+    unit="$SYSTEMD_DIR/$(psvc "$proto").service"
+    [ ! -e "$dir" ] && [ ! -L "$dir" ] || { err "发现状态文件外的同名目录，拒绝覆盖: $dir"; return 1; }
+    assert_unit_name_available "$(psvc "$proto")" || return 1
+    if [ "$proto" = snell ]; then
+        [ ! -e /opt/shadowtls ] && [ ! -L /opt/shadowtls ] || { err "发现状态文件外的 /opt/shadowtls，拒绝覆盖"; return 1; }
+        assert_unit_name_available shadowtls-snell || return 1
+    fi
+    if [ "$proto" = hy2 ] && [ "${PD_OPT_HY2_HOP:-0}" -ge 3 ] 2>/dev/null; then
+        assert_unit_name_available pd-hy2-hop || return 1
+        if command -v nft >/dev/null 2>&1 && nft list table inet pd_hy2_hop >/dev/null 2>&1; then
+            err "发现所有权未知的 nft table inet pd_hy2_hop，拒绝覆盖"
+            return 1
+        fi
+    fi
+}
+
+assert_owned_resources_safe() {
+    local proto="$1" dir unit candidate svc
+    dir=$(pdir "$proto")
+    svc=$(psvc "$proto")
+    unit="$SYSTEMD_DIR/${svc}.service"
+    [ ! -L "$dir" ] || { err "协议目录已变为符号链接，拒绝操作: $dir"; return 1; }
+    if [ -e "$dir" ] && [ ! -f "$dir/.pd-proxy-owned" ]; then
+        if state_installed "$(pkey "$proto")" && unit_is_pd_owned "$unit" && [ -x "$(pbin "$proto")" ]; then
+            warn "迁移旧版 $(pname "$proto") 资源所有权标记"
+            printf '%s\n' "PD-proxy owned resource" | atomic_write_file "$dir/.pd-proxy-owned" 600 || return 1
+        else
+            err "协议目录缺少 PD-proxy 所有权标记，拒绝操作: $dir"
+            return 1
+        fi
+    fi
+    [ ! -L "$unit" ] || { err "unit 已变为符号链接，拒绝操作: $unit"; return 1; }
+    [ ! -e "$unit" ] || unit_is_pd_owned "$unit" || { err "unit 所有权不再属于 PD-proxy: $unit"; return 1; }
+    for candidate in "/lib/systemd/system/${svc}.service" "/usr/lib/systemd/system/${svc}.service"; do
+        [ ! -e "$candidate" ] && [ ! -L "$candidate" ] || {
+            err "发现后来出现的同名系统 unit，拒绝继续以免覆盖: $candidate"
+            return 1
+        }
+    done
+    if [ "$proto" = snell ] && { [ -e /opt/shadowtls ] || [ -L /opt/shadowtls ] \
+        || [ -e "$SYSTEMD_DIR/shadowtls-snell.service" ] || [ -L "$SYSTEMD_DIR/shadowtls-snell.service" ]; }; then
+        [ ! -L /opt/shadowtls ] || { err "ShadowTLS 目录已变为符号链接"; return 1; }
+        unit_is_pd_owned "$SYSTEMD_DIR/shadowtls-snell.service" \
+            || { err "ShadowTLS unit 所有权无法确认"; return 1; }
+        if [ -d /opt/shadowtls ] && [ ! -f /opt/shadowtls/.pd-proxy-owned ] \
+            && state_installed snell && [ -x /opt/shadowtls/shadow-tls ]; then
+            warn "迁移旧版 ShadowTLS 资源所有权标记"
+            printf '%s\n' "PD-proxy owned resource" | atomic_write_file /opt/shadowtls/.pd-proxy-owned 600 || return 1
+        fi
+        [ -d /opt/shadowtls ] && [ -f /opt/shadowtls/.pd-proxy-owned ] \
+            || { err "ShadowTLS 目录所有权无法确认"; return 1; }
+    fi
+}
+
+_PD_TXN_DIR=""
+_PD_TXN_PROTO=""
+transaction_begin() {
+    local proto="$1" dir svc path label active enabled
+    local -a tx_services=()
+    [ -z "$_PD_TXN_DIR" ] || { err "不支持嵌套事务"; return 1; }
+    assert_owned_resources_safe "$proto" || return 1
+    mktemp_dir_pd _PD_TXN_DIR
+    _PD_TXN_PROTO="$proto"
+    dir=$(pdir "$proto"); svc=$(psvc "$proto")
+    mkdir -p "$_PD_TXN_DIR/items" || return 1
+    for label in proto_dir shadow_dir proto_unit shadow_unit hop_unit; do
+        path=""
+        case "$label" in
+            proto_dir) path="$dir" ;;
+            shadow_dir) [ "$proto" = snell ] && path=/opt/shadowtls ;;
+            proto_unit) path="$SYSTEMD_DIR/${svc}.service" ;;
+            shadow_unit) [ "$proto" = snell ] && path="$SYSTEMD_DIR/shadowtls-snell.service" ;;
+            hop_unit) [ "$proto" = hy2 ] && path="$SYSTEMD_DIR/pd-hy2-hop.service" ;;
+        esac
+        [ -n "$path" ] || continue
+        if [ -e "$path" ] || [ -L "$path" ]; then
+            [ ! -L "$path" ] || { err "事务拒绝备份符号链接: $path"; return 1; }
+            cp -a "$path" "$_PD_TXN_DIR/items/$label" || { err "事务备份失败: $path"; return 1; }
+            printf '%s\t%s\n' "$label" "$path" >> "$_PD_TXN_DIR/manifest" || return 1
+        fi
+    done
+    if [ -f "$STATE_FILE" ]; then
+        cp -p "$STATE_FILE" "$_PD_TXN_DIR/state" || { err "状态备份失败，已停止"; return 1; }
+    else
+        : > "$_PD_TXN_DIR/no-state" || return 1
+    fi
+    : > "$_PD_TXN_DIR/services" || return 1
+    tx_services=("$(psvc "$proto")")
+    [ "$proto" = snell ] && tx_services+=(shadowtls-snell)
+    [ "$proto" = hy2 ] && tx_services+=(pd-hy2-hop)
+    for svc in "${tx_services[@]}"; do
+        active=0; enabled=0
+        systemctl is-active --quiet "$svc" 2>/dev/null && active=1
+        systemctl is-enabled --quiet "$svc" 2>/dev/null && enabled=1
+        printf '%s %s %s\n' "$svc" "$active" "$enabled" >> "$_PD_TXN_DIR/services" || return 1
+    done
+}
+
+transaction_restore_state() {
+    local tmp
+    state_path_prepare || return 1
+    if [ -f "$_PD_TXN_DIR/state" ]; then
+        tmp=$(mktemp "$BASE_DIR/.state.XXXXXX") || return 1
+        cp -p "$_PD_TXN_DIR/state" "$tmp" || { rm -f "$tmp"; return 1; }
+        mv -f "$tmp" "$STATE_FILE" || { rm -f "$tmp"; return 1; }
+    else
+        rm -f "$STATE_FILE" || return 1
+    fi
+}
+
+transaction_rollback() {
+    local rc=0 label path svc active enabled dir
+    local key cur_fw old_fw cur_owned cur_pending
+    local -a tx_services=() tx_paths=()
+    [ -n "$_PD_TXN_DIR" ] || return 1
+    err "操作失败，正在恢复事务前状态..."
+    key=$(pkey "$_PD_TXN_PROTO")
+    cur_owned=$(state_get "$key" fw_owned 2>/dev/null || true)
+    cur_pending=$(state_get "$key" fw_pending 2>/dev/null || true)
+    cur_fw="$(state_get "$key" fw_backend 2>/dev/null || true)|$(state_get "$key" fw_spec 2>/dev/null || true)|$(state_get "$key" fw_proto 2>/dev/null || true)|${cur_owned}|${cur_pending}"
+    old_fw="$(state_get_from_file "$_PD_TXN_DIR/state" "$key" fw_backend)|$(state_get_from_file "$_PD_TXN_DIR/state" "$key" fw_spec)|$(state_get_from_file "$_PD_TXN_DIR/state" "$key" fw_proto)|$(state_get_from_file "$_PD_TXN_DIR/state" "$key" fw_owned)|$(state_get_from_file "$_PD_TXN_DIR/state" "$key" fw_pending)"
+    if { [ -n "$cur_owned" ] || [ -n "$cur_pending" ]; } && [ "$cur_fw" != "$old_fw" ]; then
+        firewall_remove_owned "$key" || rc=1
+    fi
+    tx_services=("$(psvc "$_PD_TXN_PROTO")")
+    [ "$_PD_TXN_PROTO" = snell ] && tx_services+=(shadowtls-snell)
+    [ "$_PD_TXN_PROTO" = hy2 ] && tx_services+=(pd-hy2-hop)
+    for svc in "${tx_services[@]}"; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            systemctl stop "$svc" >/dev/null 2>&1 || rc=1
+        fi
+    done
+    dir=$(pdir "$_PD_TXN_PROTO")
+    tx_paths=("$dir" "$SYSTEMD_DIR/$(psvc "$_PD_TXN_PROTO").service")
+    [ "$_PD_TXN_PROTO" = snell ] && tx_paths+=(/opt/shadowtls "$SYSTEMD_DIR/shadowtls-snell.service")
+    [ "$_PD_TXN_PROTO" = hy2 ] && tx_paths+=("$SYSTEMD_DIR/pd-hy2-hop.service")
+    for path in "${tx_paths[@]}"; do
+        if [ -L "$path" ]; then
+            err "回滚拒绝删除意外符号链接: $path"; rc=1
+        elif [ -e "$path" ]; then
+            rm -rf -- "$path" || rc=1
+        fi
+    done
+    if [ -f "$_PD_TXN_DIR/manifest" ]; then
+        while IFS=$'\t' read -r label path; do
+            if [ -L "$path" ]; then
+                err "回滚拒绝覆盖意外符号链接: $path"; rc=1; continue
+            fi
+            cp -a "$_PD_TXN_DIR/items/$label" "$path" || rc=1
+        done < "$_PD_TXN_DIR/manifest"
+    fi
+    transaction_restore_state || rc=1
+    systemctl daemon-reload >/dev/null 2>&1 || rc=1
+    firewall_restore_owned "$key" || rc=1
+    while read -r svc active enabled; do
+        if [ "$enabled" = 1 ]; then
+            systemctl enable "$svc" >/dev/null 2>&1 || rc=1
+        elif systemctl is-enabled --quiet "$svc" 2>/dev/null; then
+            systemctl disable "$svc" >/dev/null 2>&1 || rc=1
+        fi
+        if [ "$active" = 1 ]; then
+            systemctl start "$svc" >/dev/null 2>&1 || rc=1
+        elif systemctl is-active --quiet "$svc" 2>/dev/null; then
+            systemctl stop "$svc" >/dev/null 2>&1 || rc=1
+        fi
+    done < "$_PD_TXN_DIR/services"
+    _PD_TXN_DIR=""; _PD_TXN_PROTO=""
+    [ "$rc" -eq 0 ] && info "已恢复事务前状态" || err "回滚不完整，请立即检查本机资源"
+    return "$rc"
+}
+
+transaction_commit() {
+    [ -n "$_PD_TXN_DIR" ] || return 1
+    rm -rf -- "$_PD_TXN_DIR" || return 1
+    _PD_TXN_DIR=""; _PD_TXN_PROTO=""
+}
+
+transaction_discard_unstarted() {
+    [ -z "$_PD_TXN_DIR" ] || rm -rf -- "$_PD_TXN_DIR"
+    _PD_TXN_DIR=""; _PD_TXN_PROTO=""
+}
+
+transaction_run() {
+    local rc had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+    set +e
+    ( set -e; "$@" )
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        transaction_rollback || true
+        [ "$had_errexit" -eq 0 ] || set -e
+        return "$rc"
+    fi
+    transaction_commit || rc=$?
+    [ "$had_errexit" -eq 0 ] || set -e
+    return "$rc"
+}
+
 # ============================================================
 # systemd 辅助
 # ============================================================
 
 write_systemd() {
-    local svc="$1" bin="$2" args="$3"
-    cat > "/etc/systemd/system/${svc}.service" <<EOF
+    local svc="$1" bin="$2" args="$3" mode=644 identity=""
+    if [ "$svc" = anytls ]; then
+        mode=600
+        identity=$'DynamicUser=yes\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes'
+    fi
+    atomic_write_file "$SYSTEMD_DIR/${svc}.service" "$mode" <<EOF
 [Unit]
 Description=PD-proxy: ${svc}
 After=network.target
 
 [Service]
 Type=simple
+${identity}
 ExecStart=${bin} ${args}
 Restart=always
 RestartSec=5
 LimitNOFILE=32768
 NoNewPrivileges=yes
-ProtectSystem=full
+ProtectSystem=strict
 ProtectHome=yes
 RestrictAddressFamilies=AF_INET AF_INET6
 PrivateTmp=yes
@@ -1039,7 +1780,7 @@ EOF
 register_and_start() {
     local svc="$1"
     systemctl daemon-reload
-    systemctl enable "$svc" >/dev/null 2>&1 || warn "systemctl enable $svc 失败"
+    systemctl enable "$svc" >/dev/null || die "systemctl enable $svc 失败"
     systemctl restart "$svc" || die "启动 $svc 失败: journalctl -u $svc -n 20"
 }
 
@@ -1076,7 +1817,7 @@ snell_get_version() {
         | sed -n 's/.*snell-server-v\(5\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\)-linux-.*/\1/p; s/^### v\(5\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
         | grep -v 'b' | head -1 || true)
     if [ -n "$v" ]; then
-        echo "v${v}" > "$cache_file"
+        printf '%s\n' "v${v}" | atomic_write_file "$cache_file" 600
         echo "v${v}"
         return 0
     fi
@@ -1090,7 +1831,7 @@ snell_get_version() {
     warn "无法快速读取 Snell KB/手册，改用下载源探测可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
     v=$(snell_probe_latest 5 || true)
     if [ -n "$v" ]; then
-        echo "$v" > "$cache_file"
+        printf '%s\n' "$v" | atomic_write_file "$cache_file" 600
         echo "$v"
         return 0
     fi
@@ -1114,7 +1855,7 @@ snell_v4_get_version() {
         | sed -n 's/.*snell-server-v\(4\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\)-linux-.*/\1/p; s/^### v\(4\.[0-9][0-9]*\.[0-9][0-9]*[a-z0-9]*\).*/\1/p' \
         | grep -v 'b' | head -1 || true)
     if [ -n "$v" ]; then
-        echo "v${v}" > "$cache_file"
+        printf '%s\n' "v${v}" | atomic_write_file "$cache_file" 600
         echo "v${v}"
         return 0
     fi
@@ -1126,7 +1867,7 @@ snell_v4_get_version() {
     warn "无法快速读取 Snell KB/手册，改用下载源探测 Snell v4 可用版本；这会保证可用并尽量新，但不是严格权威最新版" >&2
     v=$(snell_probe_latest 4 || true)
     if [ -n "$v" ]; then
-        echo "$v" > "$cache_file"
+        printf '%s\n' "$v" | atomic_write_file "$cache_file" 600
         echo "$v"
         return 0
     fi
@@ -1148,13 +1889,12 @@ snell_v4_download() {
     step "下载 Snell v4 $ver ..."
     mkdir -p "$(pdir snell)"
     local tmpzip
-    tmpzip=$(mktemp_pd)
-    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
+    mktemp_pd tmpzip
+    download_https "$url" "$tmpzip" "Snell v4 $ver" \
         || die "Snell v4 下载失败: $url"
-    unzip -o "$tmpzip" -d "$(pdir snell)" >/dev/null \
-        || die "Snell v4 解压失败"
+    extract_zip_binary "$tmpzip" snell-server "$(pbin snell)" "Snell v4" \
+        || die "Snell v4 安全解压失败"
     rm -f "$tmpzip"
-    chmod +x "$(pbin snell)"
     verify_download "$(pbin snell)" "Snell v4" 50000
     info "Snell v4 下载完成"
 }
@@ -1166,33 +1906,34 @@ snell_download() {
     step "下载 Snell $ver ..."
     mkdir -p "$(pdir snell)"
     local tmpzip
-    tmpzip=$(mktemp_pd)
-    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
+    mktemp_pd tmpzip
+    download_https "$url" "$tmpzip" "Snell $ver" \
         || die "Snell 下载失败: $url"
-    unzip -o "$tmpzip" -d "$(pdir snell)" >/dev/null \
-        || die "Snell 解压失败"
+    extract_zip_binary "$tmpzip" snell-server "$(pbin snell)" "Snell" \
+        || die "Snell 安全解压失败"
     rm -f "$tmpzip"
-    chmod +x "$(pbin snell)"
     verify_download "$(pbin snell)" "Snell" 50000
     info "Snell 下载完成"
 }
 
 snell_configure() {
-    local port="$1" psk="$2" listen_addr="${3:-0.0.0.0}"
+    local port="$1" psk="$2" listen_addr="${3:-auto}"
     local ipv6_enabled="false"
-    if [ "$listen_addr" = "0.0.0.0" ] && has_ipv6; then
-        listen_addr="[::]"
-        ipv6_enabled="true"
-    elif has_ipv6; then
+    if [ "$listen_addr" = "auto" ]; then
+        listen_addr="$PD_LISTEN_HOST"
+    fi
+    case "$listen_addr" in
+        *:*) listen_addr="[$listen_addr]"; ipv6_enabled="true" ;;
+    esac
+    if has_ipv6; then
         ipv6_enabled="true"
     fi
-    cat > "$(pdir snell)/snell.conf" <<EOF
+    atomic_write_file "$(pdir snell)/snell.conf" 600 <<EOF
 [snell-server]
 listen = ${listen_addr}:${port}
 psk = ${psk}
 ipv6 = ${ipv6_enabled}
 EOF
-    chmod 600 "$(pdir snell)/snell.conf"
 }
 
 snell_service_args() {
@@ -1200,7 +1941,7 @@ snell_service_args() {
 }
 
 snell_shadowtls_unit_values() {
-    local svc_file="/etc/systemd/system/shadowtls-snell.service"
+    local svc_file="$SYSTEMD_DIR/shadowtls-snell.service"
     [ -f "$svc_file" ] || return 1
     local tls_pass tls_sni tls_proto
     tls_pass=$(unit_password_value "$svc_file" || echo "")
@@ -1216,6 +1957,10 @@ snell_output() {
     local tls_pass="" tls_sni="" tls_proto=""
     local tls_values=""
     tls_values=$(snell_shadowtls_unit_values 2>/dev/null || true)
+    if [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && [ -z "$tls_values" ]; then
+        err "ShadowTLS unit 存在但凭据无法安全读取，拒绝生成 Snell 配置"
+        return 1
+    fi
     if [ -n "$tls_values" ]; then
         tls_pass=$(printf '%s\n' "$tls_values" | sed -n '1p')
         tls_sni=$(printf '%s\n' "$tls_values" | sed -n '2p')
@@ -1224,9 +1969,8 @@ snell_output() {
     fi
     if [ -n "$tls_pass" ]; then
         local host4 host6
-        host4=$(format_proxy_host "$IP")
-        host6=""
-        [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
+        output_hosts snell || return 1
+        host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
         output_header "Snell v4 + ShadowTLS" "$port"
         echo -e "PSK:     ${GREEN}${psk}${RESET}"
         echo -e "TLS密码: ${GREEN}${tls_pass}${RESET}"
@@ -1243,9 +1987,8 @@ snell_output() {
         output_footer
     else
         local host4 host6
-        host4=$(format_proxy_host "$IP")
-        host6=""
-        [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
+        output_hosts snell || return 1
+        host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
         output_header "Snell v5" "$port"
         echo -e "PSK:    ${GREEN}${psk}${RESET}"
         echo ""
@@ -1257,89 +2000,60 @@ snell_output() {
 }
 
 repair_snell_ipv6() {
-    local port psk was_active=false
+    local port psk
     port=$(state_get snell "port")
     psk=$(conf_value "psk" "$(pdir snell)/snell.conf" || echo "")
     [ -n "$port" ] && [ -n "$psk" ] || return 0
+    PD_LISTEN_FAMILY="${PD_LISTEN_FAMILY:-$(state_get snell listen_family 2>/dev/null || echo auto)}"
+    [ -n "$PD_LISTEN_FAMILY" ] || PD_LISTEN_FAMILY=auto
+    prepare_listen_family
 
-    systemctl is-active --quiet snell 2>/dev/null && was_active=true
-
-    if [ -f /etc/systemd/system/shadowtls-snell.service ]; then
-        local svc_file="/etc/systemd/system/shadowtls-snell.service"
-        local bin="/opt/shadowtls/shadow-tls" tls_pass tls_sni tls_proto server_arg listen_host v3_arg="--v3"
+    if [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
+        local svc_file="$SYSTEMD_DIR/shadowtls-snell.service"
+        local bin="/opt/shadowtls/shadow-tls" tls_pass tls_sni server_arg v3_arg="--v3"
         tls_pass=$(unit_password_value "$svc_file" || echo "")
         tls_sni=$(unit_arg_value "--tls" "$svc_file" || echo "")
         server_arg=$(unit_arg_value "--server" "$svc_file" || echo "")
         grep -q -- '--v3' "$svc_file" 2>/dev/null || v3_arg=""
         [ -n "$tls_pass" ] && [ -n "$tls_sni" ] && [ -n "$server_arg" ] || return 0
-        listen_host="0.0.0.0"
-        has_ipv6 && listen_host="[::]"
-        snell_configure "${server_arg##*:}" "$psk" "127.0.0.1"
-        cat > "$svc_file" <<EOF
-[Unit]
-Description=PD-proxy ShadowTLS for Snell
-After=network.target snell.service
-Requires=snell.service
-
-[Service]
-Type=simple
-User=root
-Environment=MONOIO_FORCE_LEGACY_DRIVER=1
-ExecStart=${bin} ${v3_arg} server --listen ${listen_host}:${port} --server ${server_arg} --tls ${tls_sni} --password ${tls_pass}
-Restart=on-failure
-RestartSec=3
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-EOF
-        systemctl daemon-reload 2>/dev/null || true
-        if $was_active; then
-            systemctl restart snell 2>/dev/null || true
-            systemctl restart shadowtls-snell 2>/dev/null || true
-        fi
+        snell_configure "${server_arg##*:}" "$psk" "127.0.0.1" || return 1
+        write_shadowtls_unit "$port" "${server_arg##*:}" "$tls_sni" "$tls_pass" "$v3_arg" "$bin" || return 1
+        systemctl daemon-reload || return 1
     else
-        snell_configure "$port" "$psk"
-        systemctl daemon-reload 2>/dev/null || true
-        $was_active && systemctl restart snell 2>/dev/null || true
+        snell_configure "$port" "$psk" || return 1
+        systemctl daemon-reload || return 1
     fi
 }
 
 repair_vless_ipv6() {
-    local cfg="$(pdir vless)/config.json" tmp svc was_active=false
+    local cfg="$(pdir vless)/config.json"
     [ -f "$cfg" ] || return 0
-    svc=$(psvc vless)
-    systemctl is-active --quiet "$svc" 2>/dev/null && was_active=true
 
+    PD_LISTEN_FAMILY="${PD_LISTEN_FAMILY:-$(state_get vless listen_family 2>/dev/null || echo auto)}"
+    [ -n "$PD_LISTEN_FAMILY" ] || PD_LISTEN_FAMILY=auto
+    prepare_listen_family
     if grep -q '"listen"' "$cfg" 2>/dev/null; then
-        if has_ipv6; then
-            sed -i 's/"listen"[[:space:]]*:[[:space:]]*"[^"]*"/"listen": "::"/' "$cfg" 2>/dev/null || true
-        else
-            sed -i 's/"listen"[[:space:]]*:[[:space:]]*"[^"]*"/"listen": "0.0.0.0"/' "$cfg" 2>/dev/null || true
-        fi
+        sed 's/"listen"[[:space:]]*:[[:space:]]*"[^"]*"/"listen": "'"$PD_LISTEN_HOST"'"/' "$cfg" \
+            | atomic_write_file "$cfg" 600 || return 1
     else
-        tmp=$(mktemp_pd)
-        if has_ipv6; then
-            awk '{print} /"inbounds"[[:space:]]*:[[:space:]]*\[\{/ && !done {print "    \"listen\": \"::\","; done=1}' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
-        else
-            awk '{print} /"inbounds"[[:space:]]*:[[:space:]]*\[\{/ && !done {print "    \"listen\": \"0.0.0.0\","; done=1}' "$cfg" > "$tmp" && mv "$tmp" "$cfg"
-        fi
+        awk -v host="$PD_LISTEN_HOST" '{print} /"inbounds"[[:space:]]*:[[:space:]]*\[\{/ && !done {print "    \"listen\": \"" host "\","; done=1}' "$cfg" \
+            | atomic_write_file "$cfg" 600 || return 1
     fi
-    $was_active && systemctl restart "$svc" 2>/dev/null || true
 }
 
 repair_anytls_ipv6() {
-    local port bin svc args was_active=false
+    local port bin svc args
     port=$(state_get anytls "port")
     [ -n "$port" ] || return 0
     bin=$(pbin anytls)
     svc=$(psvc anytls)
     [ -x "$bin" ] || return 0
-    systemctl is-active --quiet "$svc" 2>/dev/null && was_active=true
+    PD_LISTEN_FAMILY="${PD_LISTEN_FAMILY:-$(state_get anytls listen_family 2>/dev/null || echo auto)}"
+    [ -n "$PD_LISTEN_FAMILY" ] || PD_LISTEN_FAMILY=auto
+    prepare_listen_family
     args=$(anytls_service_args "$port")
-    write_systemd "$svc" "$bin" "$args"
-    systemctl daemon-reload 2>/dev/null || true
-    $was_active && systemctl restart "$svc" 2>/dev/null || true
+    write_systemd "$svc" "$bin" "$args" || return 1
+    systemctl daemon-reload || return 1
 }
 
 # ============================================================
@@ -1352,7 +2066,7 @@ install_shadowtls() {
     bin="$dir/shadow-tls"
 
     local ver
-    ver=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" 2>/dev/null \
+    ver=$(curl_https -fs --retry 3 --max-time 15 "https://api.github.com/repos/ihciah/shadow-tls/releases/latest" 2>/dev/null \
         | json_tag_name || true)
     [ -n "$ver" ] || die "ShadowTLS 版本检测失败"
 
@@ -1375,15 +2089,52 @@ install_shadowtls() {
     [ "$stls_arch" = "arm64" ] && stls_arch="aarch64"
     local url="https://github.com/ihciah/shadow-tls/releases/download/${ver}/shadow-tls-${stls_arch}-unknown-linux-musl"
     mkdir -p "$dir"
+    chmod 755 "$dir"
+    printf '%s\n' "PD-proxy owned resource" | atomic_write_file "$dir/.pd-proxy-owned" 600 \
+        || die "写入 ShadowTLS 所有权标记失败"
     local tmpbin
-    tmpbin=$(mktemp_pd)
-    curl -fSL# --retry 3 --connect-timeout 15 --max-time 120 -o "$tmpbin" "$url" \
+    mktemp_pd tmpbin
+    download_https "$url" "$tmpbin" "ShadowTLS $ver" "ihciah/shadow-tls" "$ver" \
         || { rm -f "$tmpbin"; die "ShadowTLS 下载失败"; }
     mv "$tmpbin" "$bin"
-    chmod +x "$bin"
+    chmod 755 "$bin"
     verify_download "$bin" "ShadowTLS" 1000000
     info "ShadowTLS 下载完成" >&2
     echo "$bin"
+}
+
+write_shadowtls_unit() {
+    local ext_port="$1" int_port="$2" sni="$3" tls_pass="$4" v3_arg="$5" bin="$6" listen
+    listen=$(listen_endpoint "$ext_port")
+    atomic_write_file "$SYSTEMD_DIR/shadowtls-snell.service" 600 <<EOF
+[Unit]
+Description=PD-proxy: ShadowTLS for Snell
+After=network.target snell.service
+Requires=snell.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+Environment=MONOIO_FORCE_LEGACY_DRIVER=1
+ExecStart=${bin} ${v3_arg} server --listen ${listen} --server 127.0.0.1:${int_port} --tls ${sni} --password ${tls_pass}
+Restart=always
+RestartSec=5
+LimitNOFILE=32768
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
 }
 
 snell_shadowtls_configure() {
@@ -1398,32 +2149,13 @@ snell_shadowtls_configure() {
     PD_OPT_SNELL_TLS_PASS="$tls_pass"
     local v3_arg="--v3"
     [ "$tls_version" = "v2" ] && v3_arg=""
-    local listen_host="0.0.0.0"
-    has_ipv6 && listen_host="[::]"
-
     step "配置 ShadowTLS ${tls_version} (SNI: $sni) ..."
     local svc="shadowtls-snell"
     local bin
     bin=$(install_shadowtls)
-    cat > "/etc/systemd/system/${svc}.service" <<EOF
-[Unit]
-Description=PD-proxy: ShadowTLS for Snell
-After=network.target snell.service
-Requires=snell.service
-
-[Service]
-Type=simple
-Environment=MONOIO_FORCE_LEGACY_DRIVER=1
-ExecStart=${bin} ${v3_arg} server --listen ${listen_host}:${ext_port} --server 127.0.0.1:${int_port} --tls ${sni}:443 --password ${tls_pass}
-Restart=always
-RestartSec=5
-LimitNOFILE=32768
-
-[Install]
-WantedBy=multi-user.target
-EOF
+    write_shadowtls_unit "$ext_port" "$int_port" "${sni}:443" "$tls_pass" "$v3_arg" "$bin"
     systemctl daemon-reload
-    systemctl enable "$svc" >/dev/null 2>&1 || true
+    systemctl enable "$svc" >/dev/null || { err "ShadowTLS enable 失败"; return 1; }
     systemctl restart "$svc" || { err "ShadowTLS 启动失败，查看 journalctl -u $svc -n 20"; return 1; }
     info "ShadowTLS ${tls_version} 已启动 (端口 $ext_port → Snell $int_port)"
 }
@@ -1431,7 +2163,7 @@ EOF
 # ---- Hysteria2 ----
 hy2_get_version() {
     local v
-    v=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
+    v=$(curl_https -fs --retry 3 --max-time 15 "https://api.github.com/repos/apernet/hysteria/releases/latest" 2>/dev/null \
         | json_tag_name | sed 's#^app/##' || true)
     [ -n "$v" ] && echo "$v" || die "Hysteria2 版本检测失败，请检查 GitHub 是否可达"
 }
@@ -1442,18 +2174,19 @@ hy2_download() {
     step "下载 Hysteria2 $ver ..."
     mkdir -p "$(pdir hy2)"
     local tmpbin
-    tmpbin=$(mktemp_pd)
-    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpbin" "$url" \
+    mktemp_pd tmpbin
+    download_https "$url" "$tmpbin" "Hysteria2 $ver" "apernet/hysteria" "app/$ver" \
         || { rm -f "$tmpbin"; die "Hysteria2 下载失败: $url"; }
     mv "$tmpbin" "$(pbin hy2)"
-    chmod +x "$(pbin hy2)"
+    chmod 755 "$(pbin hy2)"
     verify_download "$(pbin hy2)" "Hysteria2" 5000000
     info "Hysteria2 下载完成"
 }
 
 hy2_configure() {
     local port="$1" pass="$2"
-    local listen=":${port}"
+    local listen
+    listen=$(listen_endpoint "$port")
     validate_hy2_hop
     if [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
         if ! check_nftables; then
@@ -1477,11 +2210,11 @@ hy2_configure() {
             fi
         done
         # Hysteria2 只监听主端口，额外端口通过 nft redirect 转发到主端口。
-        listen=":${port}"
+        listen=$(listen_endpoint "$port")
         info "端口跳跃: ${port}-${last_port} (${PD_OPT_HY2_HOP} 个端口)"
     fi
-    cat > "$(pdir hy2)/config.yaml" <<EOF
-listen: ${listen}
+    atomic_write_file "$(pdir hy2)/config.yaml" 600 <<EOF
+listen: "${listen}"
 
 tls:
   cert: $(pdir hy2)/cert.crt
@@ -1501,7 +2234,8 @@ EOF
         -keyout "$(pdir hy2)/cert.key" -out "$(pdir hy2)/cert.crt" \
         -days 3650 -nodes -subj "/CN=bing.com" >/dev/null 2>&1 \
         || die "Hysteria2 证书生成失败"
-    chmod 600 "$(pdir hy2)/config.yaml" "$(pdir hy2)/cert.key"
+    chmod 600 "$(pdir hy2)/config.yaml" "$(pdir hy2)/cert.key" "$(pdir hy2)/cert.crt"
+    [ "$(id -u)" != 0 ] || chown root:root "$(pdir hy2)/config.yaml" "$(pdir hy2)/cert.key" "$(pdir hy2)/cert.crt"
 }
 
 hy2_service_args() {
@@ -1511,9 +2245,8 @@ hy2_service_args() {
 hy2_output() {
     local port="$1" pass="$2"
     local host4 host6
-    host4=$(format_proxy_host "$IP")
-    host6=""
-    [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
+    output_hosts hy2 || return 1
+    host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
     output_header "Hysteria2" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
     echo ""
@@ -1538,7 +2271,7 @@ hy2_output() {
 # ---- VLESS Reality ----
 vless_get_version() {
     local v
-    v=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+    v=$(curl_https -fs --retry 3 --max-time 15 "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
         | json_tag_name || true)
     [ -n "$v" ] && echo "$v" || die "Xray 版本检测失败，请检查 GitHub 是否可达"
 }
@@ -1552,13 +2285,12 @@ vless_download() {
     step "下载 Xray-core $ver ..."
     mkdir -p "$(pdir vless)"
     local tmpzip
-    tmpzip=$(mktemp_pd)
-    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
+    mktemp_pd tmpzip
+    download_https "$url" "$tmpzip" "Xray $ver" "XTLS/Xray-core" "$ver" \
         || die "Xray 下载失败: $url"
-    unzip -o "$tmpzip" -d "$(pdir vless)" >/dev/null \
-        || die "Xray 解压失败"
+    extract_zip_binary "$tmpzip" xray "$(pbin vless)" "Xray" \
+        || die "Xray 安全解压失败"
     rm -f "$tmpzip"
-    chmod +x "$(pbin vless)"
     verify_download "$(pbin vless)" "Xray" 5000000
     info "Xray-core 下载完成"
 }
@@ -1591,15 +2323,14 @@ vless_configure() {
     shortid=$(openssl rand -hex 8 2>/dev/null || head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')
     [ -n "$privkey" ] || die "Reality 私钥生成失败"
     [ -n "$pubkey" ] || die "Reality 公钥生成失败"
-    local listen_host="0.0.0.0"
-    has_ipv6 && listen_host="::"
+    local listen_host="$PD_LISTEN_HOST"
 
     # 保存配置信息供输出使用
-    echo "$pubkey" > "$(pdir vless)/.pubkey"
-    echo "$shortid" > "$(pdir vless)/.shortid"
-    echo "$dest" > "$(pdir vless)/.dest"
-    echo "$transport" > "$(pdir vless)/.transport"
-    echo "$fp" > "$(pdir vless)/.fp"
+    printf '%s\n' "$pubkey" | atomic_write_file "$(pdir vless)/.pubkey" 600
+    printf '%s\n' "$shortid" | atomic_write_file "$(pdir vless)/.shortid" 600
+    printf '%s\n' "$dest" | atomic_write_file "$(pdir vless)/.dest" 600
+    printf '%s\n' "$transport" | atomic_write_file "$(pdir vless)/.transport" 600
+    printf '%s\n' "$fp" | atomic_write_file "$(pdir vless)/.fp" 600
 
     # 构建 serverNames JSON 数组（去重）
     local snames_json="[\"$(json_escape "$dest_host")\""
@@ -1613,7 +2344,7 @@ vless_configure() {
     done
     snames_json="${snames_json}]"
 
-    cat > "$(pdir vless)/config.json" <<EOF
+    atomic_write_file "$(pdir vless)/config.json" 600 <<EOF
 {
   "inbounds": [{
     "listen": "$(json_escape "$listen_host")",
@@ -1638,7 +2369,6 @@ vless_configure() {
   "outbounds": [{"protocol": "freedom"}]
 }
 EOF
-    chmod 600 "$(pdir vless)/config.json"
 }
 
 vless_service_args() {
@@ -1648,16 +2378,16 @@ vless_service_args() {
 vless_output() {
     local port="$1" uuid="$2"
     local pubkey shortid dest transport fp
-    pubkey=$(cat "$(pdir vless)/.pubkey" 2>/dev/null || echo "未知")
-    shortid=$(cat "$(pdir vless)/.shortid" 2>/dev/null || echo "未知")
+    pubkey=$(cat "$(pdir vless)/.pubkey" 2>/dev/null || true)
+    shortid=$(cat "$(pdir vless)/.shortid" 2>/dev/null || true)
+    [ -n "$uuid" ] && [ -n "$pubkey" ] && [ -n "$shortid" ] || { err "VLESS 凭据不完整，拒绝生成配置"; return 1; }
     dest=$(cat "$(pdir vless)/.dest" 2>/dev/null || echo "addons.mozilla.org:443")
     transport=$(cat "$(pdir vless)/.transport" 2>/dev/null || echo "tcp")
     fp=$(cat "$(pdir vless)/.fp" 2>/dev/null || echo "chrome")
     local dest_host="${dest%:*}"
     local host4 host6 link link6
-    host4=$(format_proxy_host "$IP")
-    host6=""
-    [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
+    output_hosts vless || return 1
+    host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
     link="vless://${uuid}@${host4}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS"
     [ -n "$host6" ] && link6="vless://${uuid}@${host6}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS-IPv6"
 
@@ -1681,7 +2411,7 @@ vless_output() {
 # ---- AnyTLS ----
 anytls_get_version() {
     local v
-    v=$(curl -fs --retry 3 --max-time 15 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null \
+    v=$(curl_https -fs --retry 3 --max-time 15 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null \
         | json_tag_name || true)
     [ -n "$v" ] && echo "$v" || die "AnyTLS 版本检测失败，请检查 GitHub 是否可达"
 }
@@ -1692,14 +2422,14 @@ anytls_download() {
     local url="https://github.com/anytls/anytls-go/releases/download/${ver}/anytls_${ver_num}_linux_${ARCH}.zip"
     step "下载 AnyTLS $ver ..."
     mkdir -p "$(pdir anytls)"
+    chmod 755 "$(pdir anytls)"
     local tmpzip
-    tmpzip=$(mktemp_pd)
-    curl -fSL# --retry 3 --connect-timeout 15 --max-time 300 -o "$tmpzip" "$url" \
+    mktemp_pd tmpzip
+    download_https "$url" "$tmpzip" "AnyTLS $ver" "anytls/anytls-go" "$ver" \
         || die "AnyTLS 下载失败: $url"
-    unzip -o "$tmpzip" -d "$(pdir anytls)" >/dev/null \
-        || die "AnyTLS 解压失败"
+    extract_zip_binary "$tmpzip" anytls-server "$(pbin anytls)" "AnyTLS" \
+        || die "AnyTLS 安全解压失败"
     rm -f "$tmpzip"
-    chmod +x "$(pbin anytls)"
     verify_download "$(pbin anytls)" "AnyTLS" 1000000
     info "AnyTLS 下载完成"
 }
@@ -1712,10 +2442,13 @@ anytls_configure() {
     [ "$padding" = "standard" ] || warn "当前 anytls-server 未启用预设填充参数，PD_ANYTLS_PADDING=$padding 已忽略"
     [ -z "$sni" ] || validate_hostname "$sni" "PD_ANYTLS_SNI"
 
-    echo "$pass" > "$(pdir anytls)/.password"
-    echo "server-default" > "$(pdir anytls)/.padding"
-    [ -n "$sni" ] && echo "$sni" > "$(pdir anytls)/.sni" || rm -f "$(pdir anytls)/.sni"
-    chmod 600 "$(pdir anytls)/.password"
+    printf '%s\n' "$pass" | atomic_write_file "$(pdir anytls)/.password" 600
+    printf '%s\n' "server-default" | atomic_write_file "$(pdir anytls)/.padding" 600
+    if [ -n "$sni" ]; then
+        printf '%s\n' "$sni" | atomic_write_file "$(pdir anytls)/.sni" 600
+    else
+        rm -f "$(pdir anytls)/.sni"
+    fi
 }
 
 anytls_service_args() {
@@ -1724,9 +2457,9 @@ anytls_service_args() {
     pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "")
     pass=$(systemd_escape_arg "$pass")
 
-    local listen_host="0.0.0.0"
-    has_ipv6 && listen_host="[::]"
-    local args="-l ${listen_host}:${port} -p ${pass}"
+    local listen_host
+    listen_host=$(listen_endpoint "$port")
+    local args="-l ${listen_host} -p ${pass}"
     # anytls-server v0.0.12 无 -sni 参数，SNI 由客户端侧处理
     echo "$args"
 }
@@ -1738,9 +2471,8 @@ anytls_output() {
     sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
 
     local host4 host6 query="" link link6
-    host4=$(format_proxy_host "$IP")
-    host6=""
-    [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
+    output_hosts anytls || return 1
+    host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
     [ -n "$sni" ] && query="?sni=$(url_escape "$sni")&insecure=1"
     link="anytls://${pass}@${host4}:${port}${query}#PD-AnyTLS"
     [ -n "$host6" ] && link6="anytls://${pass}@${host6}:${port}${query}#PD-AnyTLS-IPv6"
@@ -1750,8 +2482,8 @@ anytls_output() {
     [ -n "$sni" ] && echo -e "SNI:    ${DIM}${sni}（客户端侧使用）${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
-    echo -e "${GREEN}anytls, ${host4}, ${port}, password=${pass}${RESET}"
-    [ -n "$host6" ] && echo -e "${GREEN}anytls-ipv6, ${host6}, ${port}, password=${pass}${RESET}"
+    echo -e "${GREEN}Proxy = anytls, ${host4}, ${port}, password=${pass}${RESET}"
+    [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = anytls, ${host6}, ${port}, password=${pass}${RESET}"
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
     gen_qr "$link"
@@ -1766,7 +2498,37 @@ anytls_output() {
 # 统一安装流水线（核心 — 所有协议走同一套流程）
 # ============================================================
 
+switch_snell_mode_impl() {
+    uninstall_protocol_impl snell
+    assert_install_target_available snell
+    install_protocol_impl snell
+}
+
 install_protocol() {
+    local proto="$1" key cur_sts=false want_sts=false
+    assert_base_dir_safe || return 1
+    key=$(pkey "$proto")
+    if state_installed "$key"; then
+        if [ "$proto" = snell ]; then
+            [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && cur_sts=true
+            [ "$PD_OPT_SNELL_MODE" = shadowtls ] && want_sts=true
+            if [ "$cur_sts" != "$want_sts" ]; then
+                warn "检测到 Snell 模式不同，将以事务方式切换..."
+                transaction_begin snell || { transaction_discard_unstarted; return 1; }
+                transaction_run switch_snell_mode_impl
+                return $?
+            fi
+        fi
+        warn "$(pname "$proto") 已安装，执行最新版检查..."
+        upgrade_protocol "$proto"
+        return $?
+    fi
+    assert_install_target_available "$proto" || return 1
+    transaction_begin "$proto" || { transaction_discard_unstarted; return 1; }
+    transaction_run install_protocol_impl "$proto"
+}
+
+install_protocol_impl() {
     local proto="$1"
     local name key dir bin svc
     name=$(pname "$proto")
@@ -1782,31 +2544,10 @@ install_protocol() {
     fi
     title "安装 $display_name"
 
+    prepare_listen_family
+    require_public_endpoint
     install_deps "$proto"; install_qrencode
     check_disk "$(pdisk "$proto")"
-    if state_installed "$key"; then
-        # 模式切换提示
-        if [ "$proto" = "snell" ]; then
-            local cur_sts=false want_sts=false
-            [ -f /etc/systemd/system/shadowtls-snell.service ] && cur_sts=true
-            [ "$PD_OPT_SNELL_MODE" = "shadowtls" ] && want_sts=true
-            if [ "$cur_sts" != "$want_sts" ]; then
-                warn "检测到 Snell 模式不同，自动切换到目标模式..."
-                uninstall_protocol snell
-                install_protocol snell
-                return 0
-            fi
-            repair_snell_ipv6 || warn "Snell IPv6 监听修复失败，请检查配置"
-        elif [ "$proto" = "vless" ]; then
-            repair_vless_ipv6 || warn "VLESS IPv6 监听修复失败，请检查配置"
-        elif [ "$proto" = "anytls" ]; then
-            repair_anytls_ipv6 || warn "AnyTLS IPv6 监听修复失败，请检查配置"
-        fi
-        warn "$name 已安装，执行最新版检查..."
-        upgrade_protocol "$proto"
-        return 0
-    fi
-
     if [ "$proto" = "hy2" ] && [ -n "${PD_OPT_HY2_HOP_RANGE:-}" ]; then
         validate_hy2_hop
     fi
@@ -1849,33 +2590,8 @@ install_protocol() {
         fi
     fi
 
-    # 回滚陷阱（端口已确定后才设置，确保 _rollback_port 被正确展开）
-    local _rollback_port="$port"
-    trap "
-        err '安装失败，正在回滚...'
-        systemctl stop '$svc' 2>/dev/null || true
-        rm -f '/etc/systemd/system/${svc}.service'
-        if [ '$proto' = 'snell' ]; then
-            systemctl stop 'shadowtls-snell' 2>/dev/null || true
-            rm -f '/etc/systemd/system/shadowtls-snell.service'
-            rm -rf '/opt/shadowtls'
-        fi
-        systemctl daemon-reload
-        if [ '$proto' = 'hy2' ] && [ "\${PD_OPT_HY2_HOP:-0}" -ge 3 ] 2>/dev/null; then
-            _pd_rb_end=$((_rollback_port + PD_OPT_HY2_HOP - 1))
-            del_firewall_range '$_rollback_port' "\$_pd_rb_end"
-        else
-            del_firewall '$_rollback_port'
-        fi
-        if [ '$proto' = 'hy2' ]; then
-            clear_hy2_hop_rules
-        fi
-        rm -rf '$dir'
-        state_del '$key'
-        die '安装失败，已回滚，检查上述错误信息'
-    " ERR
-
-    local pass=$(rand_pass)
+    local pass
+    pass=$(rand_pass)
     # VLESS 需要标准 UUID 格式，不能是 base64
     [ "$proto" = "vless" ] && pass=$(gen_uuid)
 
@@ -1903,7 +2619,7 @@ install_protocol() {
         # ShadowTLS 模式：Snell 监听内部端口（50000+），先配 Snell，ShadowTLS 稍后部署
         local snell_int=$(( (RANDOM % 15000) + 50000 ))
         local _sni_attempts=0
-        while ss -tlnp 2>/dev/null | grep -q ":${snell_int} " 2>/dev/null; do
+        while port_in_use "$snell_int"; do
             snell_int=$(( (RANDOM % 15000) + 50000 ))
             _sni_attempts=$((_sni_attempts + 1))
             [ $_sni_attempts -lt 100 ] || die "无法分配 Snell 内部端口（50000-65000）"
@@ -1912,6 +2628,16 @@ install_protocol() {
     else
         "${proto}_configure" "$port" "$pass"
     fi
+    printf '%s\n' "PD-proxy owned resource" | atomic_write_file "$dir/.pd-proxy-owned" 600 \
+        || die "写入资源所有权标记失败"
+
+    # 在最终写 unit 前再次检查状态和系统监听，关闭选端口后的竞争窗口。
+    local final_end="$port"
+    [ "$proto" = hy2 ] && [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null && final_end=$((port + PD_OPT_HY2_HOP - 1))
+    state_port_range_conflict "$port" "$final_end" "$key" && die "最终端口复检发现状态冲突: ${port}-${final_end}"
+    local final_busy
+    final_busy=$(system_port_range_conflict "$port" "$final_end" || true)
+    [ -z "$final_busy" ] || die "最终端口复检发现端口 $final_busy 已被占用"
 
     step "注册服务..."
     if [ "$proto" = "hy2" ] && [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
@@ -1928,59 +2654,75 @@ install_protocol() {
     fi
 
     if [ "$proto" = "hy2" ] && [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
-        add_firewall_range "$port" "$((port + PD_OPT_HY2_HOP - 1))"
+        firewall_add "$key" "$port" "$((port + PD_OPT_HY2_HOP - 1))" udp
         state_set "$key" "hop" "$PD_OPT_HY2_HOP"
         [ -n "${PD_OPT_HY2_HOP_RANGE:-}" ] && state_set "$key" "hop_range" "$PD_OPT_HY2_HOP_RANGE"
     else
-        add_firewall "$port"
+        firewall_add "$key" "$port" "$port" "$(protocol_transport "$proto")"
         if [ "$proto" = "hy2" ]; then
             state_set "$key" "hop" "0"
             state_set "$key" "hop_range" ""
         fi
     fi
-    verify_port "$port" "$svc" || warn "请检查服务状态"
-    # Snell + ShadowTLS: 外部端口由 shadowtls-snell 监听
     if [ "$proto" = "snell" ] && [ "$PD_OPT_SNELL_MODE" = "shadowtls" ]; then
-        if ! systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
-            warn "ShadowTLS 服务未运行，查看 journalctl -u shadowtls-snell -n 20"
-        fi
+        verify_shadowtls_stack "$port" "$snell_int" || die "ShadowTLS 两层传输验证失败"
+    elif [ "$proto" = hy2 ] && [ "$PD_OPT_HY2_HOP" -ge 3 ] 2>/dev/null; then
+        verify_hy2_hop "$port" "$PD_OPT_HY2_HOP" || die "HY2 hop 传输验证失败"
+    else
+        verify_port "$port" "$svc" "$(protocol_transport "$proto")" || die "目标服务传输验证失败"
     fi
 
+    local public_service="$svc"
+    [ "$proto" = snell ] && [ "$PD_OPT_SNELL_MODE" = shadowtls ] && public_service=shadowtls-snell
+    verify_and_record_listen_families "$key" "$port" "$(protocol_transport "$proto")" "$public_service" \
+        || die "监听地址族验证失败"
+
     state_set "$key" "port" "$port"
-    state_set "$key" "status" "installed"
     state_set "$key" "version" "$ver"
+    state_set "$key" "status" "installed"
 
     "${proto}_output" "$port" "$pass"
 
-    # 清除回滚陷阱
-    trap - ERR
 }
 
 uninstall_protocol() {
+    local proto="$1" key
+    key=$(pkey "$proto")
+    if ! state_installed "$key"; then
+        warn "$(pname "$proto") 未安装"
+        return 0
+    fi
+    transaction_begin "$proto" || { transaction_discard_unstarted; return 1; }
+    transaction_run uninstall_protocol_impl "$proto"
+}
+
+uninstall_protocol_impl() {
     local proto="$1"
     local key=$(pkey "$proto")
     local svc=$(psvc "$proto")
 
     info "卸载 $(pname "$proto") ..."
-    if ! state_installed "$key"; then
-        warn "$(pname "$proto") 未安装"
-        return 0
-    fi
+    assert_owned_resources_safe "$proto" || return 1
 
     local port
     port=$(state_get "$key" "port")
 
-    systemctl stop "$svc" 2>/dev/null || true
-    systemctl disable "$svc" 2>/dev/null || true
-    rm -f "/etc/systemd/system/${svc}.service"
+    systemctl is-active --quiet "$svc" 2>/dev/null && systemctl stop "$svc"
+    systemctl is-enabled --quiet "$svc" 2>/dev/null && systemctl disable "$svc" >/dev/null
+    local unit="$SYSTEMD_DIR/${svc}.service"
+    [ ! -e "$unit" ] || { unit_is_pd_owned "$unit" || die "拒绝删除所有权未知的 unit: $unit"; rm -f "$unit"; }
 
     # Snell ShadowTLS 额外清理
     if [ "$proto" = "snell" ]; then
         local tls_svc="shadowtls-snell"
-        systemctl stop "$tls_svc" 2>/dev/null || true
-        systemctl disable "$tls_svc" 2>/dev/null || true
-        rm -f "/etc/systemd/system/${tls_svc}.service"
-        rm -rf /opt/shadowtls
+        local tls_unit="$SYSTEMD_DIR/${tls_svc}.service"
+        systemctl is-active --quiet "$tls_svc" 2>/dev/null && systemctl stop "$tls_svc"
+        systemctl is-enabled --quiet "$tls_svc" 2>/dev/null && systemctl disable "$tls_svc" >/dev/null
+        [ ! -e "$tls_unit" ] || { unit_is_pd_owned "$tls_unit" || die "拒绝删除所有权未知的 unit: $tls_unit"; rm -f "$tls_unit"; }
+        [ ! -L /opt/shadowtls ] || die "拒绝递归删除符号链接 /opt/shadowtls"
+        [ ! -e /opt/shadowtls ] || [ -f /opt/shadowtls/.pd-proxy-owned ] \
+            || die "ShadowTLS 目录缺少所有权标记，拒绝删除"
+        [ ! -e /opt/shadowtls ] || rm -rf /opt/shadowtls
     fi
 
     systemctl daemon-reload
@@ -1992,16 +2734,17 @@ uninstall_protocol() {
         local hop_count
         hop_count=$(state_get "$key" "hop")
         [ -n "$hop_count" ] || hop_count=$(echo "$listen_line" | tr ',' '\n' | wc -l | tr -d ' \n')
-        if [ "$hop_count" -ge 2 ] 2>/dev/null; then
-            del_firewall_range "$port" "$((port + hop_count - 1))" 2>/dev/null || true
+        if [ "$hop_count" -ge 2 ] 2>/dev/null || [ -e "$SYSTEMD_DIR/pd-hy2-hop.service" ] || [ -L "$SYSTEMD_DIR/pd-hy2-hop.service" ]; then
+            firewall_remove_owned "$key"
             clear_hy2_hop_rules
         else
-            [ -n "$port" ] && del_firewall "$port"
+            firewall_remove_owned "$key"
         fi
     else
-        [ -n "$port" ] && del_firewall "$port"
+        firewall_remove_owned "$key"
     fi
-    rm -rf "$(pdir "$proto")"
+    [ ! -L "$(pdir "$proto")" ] || die "拒绝递归删除符号链接: $(pdir "$proto")"
+    [ ! -e "$(pdir "$proto")" ] || rm -rf "$(pdir "$proto")"
     state_del "$key"
     info "$(pname "$proto") 已卸载"
 }
@@ -2011,146 +2754,95 @@ uninstall_protocol() {
 # ============================================================
 
 upgrade_protocol() {
-    local proto="$1"
-    local key=$(pkey "$proto")
-    local name=$(pname "$proto")
-    local svc=$(psvc "$proto")
+    local proto="$1" key name
+    key=$(pkey "$proto"); name=$(pname "$proto")
+    state_installed "$key" || { err "$name 未安装，无法升级"; return 1; }
+    transaction_begin "$proto" || { transaction_discard_unstarted; return 1; }
+    transaction_run upgrade_protocol_impl "$proto"
+}
 
-    if ! state_installed "$key"; then
-        die "$name 未安装，无法升级"
-    fi
-
+upgrade_protocol_impl() {
+    local proto="$1" key name svc bin bin_bak ver="" old_ver port hop transport
+    local was_active=false shadow_active=false shadow_enabled=false hop_active=false hop_enabled=false download_main=true
+    key=$(pkey "$proto"); name=$(pname "$proto"); svc=$(psvc "$proto"); bin=$(pbin "$proto")
+    bin_bak="${bin}.bak"
     title "升级 $name"
-
-    # 检查磁盘空间
     check_disk "$(pdisk "$proto")"
-    local was_active=false
     systemctl is-active --quiet "$svc" 2>/dev/null && was_active=true
-    if [ "$proto" = "snell" ]; then
-        repair_snell_ipv6 || warn "Snell IPv6 监听修复失败，请检查配置"
-    elif [ "$proto" = "vless" ]; then
-        repair_vless_ipv6 || warn "VLESS IPv6 监听修复失败，请检查配置"
-    elif [ "$proto" = "anytls" ]; then
-        repair_anytls_ipv6 || warn "AnyTLS IPv6 监听修复失败，请检查配置"
-    fi
+    systemctl is-active --quiet shadowtls-snell 2>/dev/null && shadow_active=true
+    systemctl is-enabled --quiet shadowtls-snell 2>/dev/null && shadow_enabled=true
+    systemctl is-active --quiet pd-hy2-hop 2>/dev/null && hop_active=true
+    systemctl is-enabled --quiet pd-hy2-hop 2>/dev/null && hop_enabled=true
+    old_ver=$(state_get "$key" version)
 
-    local ver=""
-    if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+    if [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
         step "获取 Snell v4 最新版本..."
-        if ! ver=$(snell_v4_get_version); then
-            die "Snell v4 版本检测失败，已停止升级"
-        fi
-        require_version "$ver" "Snell v4"
-        local old_ver=$(state_get "$key" "version")
-        if [ "$ver" = "$old_ver" ] && [ -n "$ver" ]; then
-            info "Snell v4 已是最新版 ($ver)"
-            install_shadowtls >/dev/null
-            if $was_active; then
-                systemctl restart shadowtls-snell 2>/dev/null || warn "ShadowTLS 启动失败"
-            fi
-            return 0
-        fi
-        info "版本: $old_ver → $ver"
-    elif declare -f "${proto}_get_version" >/dev/null 2>&1; then
+        ver=$(snell_v4_get_version) || die "Snell v4 版本检测失败，已停止升级"
+    else
         step "获取最新版本..."
-        if ! ver=$("${proto}_get_version"); then
-            die "$name 版本检测失败，已停止升级"
-        fi
-        require_version "$ver" "$name"
-        local old_ver=$(state_get "$key" "version")
-        if [ "$ver" = "$old_ver" ] && [ -n "$ver" ]; then
-            info "$name 已是最新版 ($ver)，跳过"
-            return 0
-        fi
-        info "版本: $old_ver → $ver"
+        ver=$("${proto}_get_version") || die "$name 版本检测失败，已停止升级"
     fi
-
-    step "停止服务..."
-    systemctl stop "$svc" 2>/dev/null || true
-
-    # 备份旧二进制，启动失败时可回滚
-    local bin=$(pbin "$proto")
-    local bin_bak="${bin}.bak"
-    if [ -f "$bin" ]; then
-        cp "$bin" "$bin_bak" 2>/dev/null || true
+    require_version "$ver" "$name"
+    [ "$ver" = "$old_ver" ] && download_main=false
+    if ! $download_main && ! { [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; }; then
+        info "$name 已是最新版 ($ver)，跳过"
+        return 0
     fi
+    info "版本: $old_ver → $ver"
 
-    trap "
-        err '升级失败，正在恢复旧服务...'
-        if [ -f '$bin_bak' ]; then
-            mv '$bin_bak' '$bin' 2>/dev/null || true
-            chmod +x '$bin' 2>/dev/null || true
-        fi
-        if $was_active; then
-            systemctl start '$svc' 2>/dev/null || true
-            if [ '$proto' = 'snell' ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
-                systemctl start shadowtls-snell 2>/dev/null || true
-            fi
+    [ -f "$bin" ] && [ ! -L "$bin" ] || die "旧二进制缺失或不是普通文件: $bin"
+    [ ! -e "$bin_bak" ] && [ ! -L "$bin_bak" ] || die "发现陈旧备份，拒绝升级: $bin_bak"
+    cp -p "$bin" "$bin_bak" || die "创建升级备份失败，已停止"
+
+    $shadow_active && systemctl stop shadowtls-snell
+    $was_active && systemctl stop "$svc"
+    if $download_main; then
+        step "下载候选版本..."
+        if [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
+            snell_v4_download "$ver"
         else
-            systemctl stop '$svc' 2>/dev/null || true
-            if [ '$proto' = 'snell' ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
-                systemctl stop shadowtls-snell 2>/dev/null || true
-            fi
-        fi
-        if [ '$proto' = 'hy2' ]; then
-            _pd_hop=\$(state_get '$key' 'hop')
-            _pd_port=\$(state_get '$key' 'port')
-            if $was_active && [ "\${_pd_hop:-0}" -ge 3 ] 2>/dev/null; then
-                setup_hy2_hop_rules "\$_pd_port" "\$_pd_hop" 2>/dev/null || true
-            elif [ "\${_pd_hop:-0}" -ge 3 ] 2>/dev/null; then
-                clear_hy2_hop_rules 2>/dev/null || true
-            fi
-        fi
-        die '升级失败，已尝试恢复旧服务'
-    " ERR
-
-    step "下载新版本..."
-    if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
-        snell_v4_download "$ver"
-    else
-        "${proto}_download" "$ver"
-    fi
-
-    step "验证新版本..."
-    if systemctl start "$svc" 2>/dev/null; then
-        rm -f "$bin_bak"
-    else
-        err "新版本启动失败，正在回滚..."
-        if [ -f "$bin_bak" ]; then
-            mv "$bin_bak" "$bin" 2>/dev/null || true
-            chmod +x "$bin" 2>/dev/null || true
-            systemctl start "$svc" 2>/dev/null && info "已回滚到旧版本" || die "回滚失败: journalctl -u $svc -n 20"
-        else
-            die "启动 $svc 失败且无备份可回滚: journalctl -u $svc -n 20"
+            "${proto}_download" "$ver"
         fi
     fi
-    # Snell + ShadowTLS: Requires= 只传播 stop 不传播 start，需手动拉起
-    if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+
+    systemctl start "$svc" || die "候选版本启动失败: journalctl -u $svc -n 20"
+    port=$(state_get "$key" port)
+    hop=$(state_get "$key" hop)
+    if [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
         install_shadowtls >/dev/null
-        if $was_active; then
-            systemctl restart shadowtls-snell 2>/dev/null || warn "ShadowTLS 启动失败"
-        fi
+        systemctl restart shadowtls-snell || die "ShadowTLS 候选启动失败"
+        local inner_port
+        inner_port=$(conf_value listen "$(pdir snell)/snell.conf" | sed 's/.*://')
+        verify_shadowtls_stack "$port" "$inner_port" || die "ShadowTLS 两层候选验证失败"
+    elif [ "$proto" = hy2 ] && [ "${hop:-0}" -ge 3 ] 2>/dev/null; then
+        setup_hy2_hop_rules "$port" "$hop"
+        verify_hy2_hop "$port" "$hop" || die "HY2 hop 候选验证失败"
+    else
+        transport=$(protocol_transport "$proto")
+        verify_port "$port" "$svc" "$transport" || die "候选版本传输验证失败"
     fi
-    if [ "$proto" = "hy2" ]; then
-        local port hop
-        port=$(state_get "$key" "port")
-        hop=$(state_get "$key" "hop")
-        if [ "${hop:-0}" -ge 3 ] 2>/dev/null; then
-            setup_hy2_hop_rules "$port" "$hop" || warn "HY2 跳跃规则恢复失败"
-        fi
-    fi
+    local public_svc="$svc"
+    [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && public_svc=shadowtls-snell
+    local stored_family
+    stored_family=$(state_get "$key" listen_family 2>/dev/null || true)
+    [ -z "$stored_family" ] || PD_EFFECTIVE_LISTEN_FAMILY="$stored_family"
+    [ -n "${PD_EFFECTIVE_LISTEN_FAMILY:-}" ] || PD_EFFECTIVE_LISTEN_FAMILY=auto
+    verify_and_record_listen_families "$key" "$port" "$(protocol_transport "$proto")" "$public_svc" \
+        || die "候选版本监听地址族验证失败"
 
-    state_set "$key" "version" "$ver"
-    if ! $was_active; then
-        systemctl stop "$svc" 2>/dev/null || true
-        if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
-            systemctl stop shadowtls-snell 2>/dev/null || true
-        fi
-        if [ "$proto" = "hy2" ]; then
-            clear_hy2_hop_rules
-        fi
+    state_set "$key" version "$ver"
+    rm -f "$bin_bak" || die "清理升级备份失败"
+    if ! $was_active; then systemctl stop "$svc" || die "恢复原停止状态失败"; fi
+    if [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && ! $shadow_active; then
+        systemctl stop shadowtls-snell || die "恢复 ShadowTLS 原停止状态失败"
     fi
-    trap - ERR
+    if [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && ! $shadow_enabled; then
+        systemctl disable shadowtls-snell >/dev/null || die "恢复 ShadowTLS 原禁用状态失败"
+    fi
+    if [ "$proto" = hy2 ] && [ "${hop:-0}" -ge 3 ] 2>/dev/null; then
+        if ! $hop_active; then systemctl stop pd-hy2-hop || die "恢复 HY2 hop 原停止状态失败"; fi
+        if ! $hop_enabled; then systemctl disable pd-hy2-hop >/dev/null || die "恢复 HY2 hop 原禁用状态失败"; fi
+    fi
     info "$name 升级完成"
 }
 
@@ -2172,7 +2864,7 @@ restart_service() {
     fi
     systemctl restart "$svc" || die "重启失败: journalctl -u $svc -n 20"
     # Snell + ShadowTLS: Requires= 只传播 stop 不传播 start
-    if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+    if [ "$proto" = "snell" ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
         systemctl restart shadowtls-snell || die "ShadowTLS 重启失败: journalctl -u shadowtls-snell -n 20"
     fi
     if [ "$proto" = "hy2" ]; then
@@ -2183,6 +2875,15 @@ restart_service() {
             setup_hy2_hop_rules "$port" "$hop" || warn "HY2 跳跃规则恢复失败"
         fi
     fi
+    local verify_svc="$svc" verify_port_num
+    verify_port_num=$(state_get "$key" port)
+    [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && verify_svc=shadowtls-snell
+    local stored_family
+    stored_family=$(state_get "$key" listen_family 2>/dev/null || true)
+    [ -z "$stored_family" ] || PD_EFFECTIVE_LISTEN_FAMILY="$stored_family"
+    [ -n "${PD_EFFECTIVE_LISTEN_FAMILY:-}" ] || PD_EFFECTIVE_LISTEN_FAMILY=auto
+    verify_and_record_listen_families "$key" "$verify_port_num" "$(protocol_transport "$proto")" "$verify_svc" \
+        || die "重启后监听地址族验证失败"
     info "$(pname "$proto") 已重启"
 }
 
@@ -2195,7 +2896,7 @@ stop_service() {
         die "$(pname "$proto") 未安装"
     fi
     info "停止 $(pname "$proto") ..."
-    if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+    if [ "$proto" = "snell" ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
         systemctl stop shadowtls-snell 2>/dev/null || true
     fi
     if [ "$proto" = "hy2" ]; then
@@ -2216,7 +2917,7 @@ start_service() {
     info "启动 $(pname "$proto") ..."
     systemctl start "$svc" || die "启动失败: journalctl -u $svc -n 20"
     # Snell + ShadowTLS: Requires= 只传播 stop 不传播 start
-    if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+    if [ "$proto" = "snell" ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
         systemctl start shadowtls-snell || die "ShadowTLS 启动失败: journalctl -u shadowtls-snell -n 20"
     fi
     if [ "$proto" = "hy2" ]; then
@@ -2238,7 +2939,11 @@ show_log() {
     if ! state_installed "$key"; then
         die "$(pname "$proto") 未安装"
     fi
-    journalctl -u "$svc" -n 50 --no-pager 2>/dev/null || warn "无法读取日志"
+    if [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
+        journalctl -u snell -u shadowtls-snell -n 100 --no-pager 2>/dev/null || warn "无法读取 Snell/ShadowTLS 日志"
+    else
+        journalctl -u "$svc" -n 50 --no-pager 2>/dev/null || warn "无法读取日志"
+    fi
 }
 
 show_config_only() {
@@ -2249,16 +2954,21 @@ show_config_only() {
     fi
 
     local port=$(state_get "$key" "port")
+    [[ "$port" =~ ^[0-9]+$ ]] || { err "协议端口状态无效，拒绝生成配置"; return 1; }
     case $proto in
         snell)
             local psk tls_pass tls_sni tls_proto
             psk=$(conf_value "psk" "$(pdir snell)/snell.conf" || echo "")
+            [ -n "$psk" ] || { err "Snell PSK 缺失，拒绝生成配置"; return 1; }
             local host4 host6
-            host4=$(format_proxy_host "$IP")
-            host6=""
-            [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
+            output_hosts snell || return 1
+            host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
             local tls_values=""
             tls_values=$(snell_shadowtls_unit_values 2>/dev/null || true)
+            if [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && [ -z "$tls_values" ]; then
+                err "ShadowTLS 凭据缺失，拒绝生成配置"
+                return 1
+            fi
             if [ -n "$tls_values" ]; then
                 tls_pass=$(printf '%s\n' "$tls_values" | sed -n '1p')
                 tls_sni=$(printf '%s\n' "$tls_values" | sed -n '2p')
@@ -2273,10 +2983,10 @@ show_config_only() {
         hy2)
             local pass hop host4 host6
             pass=$(yaml_value "password" "$(pdir hy2)/config.yaml" || echo "")
+            [ -n "$pass" ] || { err "Hysteria2 密码缺失，拒绝生成配置"; return 1; }
             hop=$(state_get "$key" "hop")
-            host4=$(format_proxy_host "$IP")
-            host6=""
-            [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
+            output_hosts hy2 || return 1
+            host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
             if [ "$hop" -ge 3 ] 2>/dev/null; then
                 local last_port=$((port + hop - 1))
                 echo "Proxy = hysteria2, ${host4}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}"
@@ -2296,23 +3006,24 @@ show_config_only() {
             dest=$(cat "$(pdir vless)/.dest" 2>/dev/null || echo "addons.mozilla.org:443")
             transport=$(cat "$(pdir vless)/.transport" 2>/dev/null || echo "tcp")
             fp=$(cat "$(pdir vless)/.fp" 2>/dev/null || echo "chrome")
+            [ -n "$uuid" ] && [ -n "$pubkey" ] && [ -n "$shortid" ] \
+                || { err "VLESS 凭据不完整，拒绝生成配置"; return 1; }
             dest_host="${dest%:*}"
-            host4=$(format_proxy_host "$IP")
-            host6=""
-            [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
+            output_hosts vless || return 1
+            host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
             echo "# Surge 不支持 VLESS"
             echo "vless://${uuid}@${host4}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS"
             [ -n "$host6" ] && echo "vless://${uuid}@${host6}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS-IPv6" ;;
         anytls)
             local pass padding sni host4 host6
             pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "")
+            [ -n "$pass" ] || { err "AnyTLS 密码缺失，拒绝生成配置"; return 1; }
             padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
             sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
-            host4=$(format_proxy_host "$IP")
-            host6=""
-            [ -n "${IP6:-}" ] && host6=$(format_proxy_host "$IP6")
-            echo "anytls, ${host4}, ${port}, password=${pass}"
-            [ -n "$host6" ] && echo "anytls-ipv6, ${host6}, ${port}, password=${pass}"
+            output_hosts anytls || return 1
+            host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
+            echo "Proxy = anytls, ${host4}, ${port}, password=${pass}"
+            [ -n "$host6" ] && echo "Proxy-IPv6 = anytls, ${host6}, ${port}, password=${pass}"
             echo ""
             local query=""
             [ -n "$sni" ] && query="?sni=$(url_escape "$sni")&insecure=1"
@@ -2334,7 +3045,7 @@ show_status() {
         local key=$(pkey "$proto")
         local name=$(pname "$proto")
         # ShadowTLS 模式适配显示名
-        if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ] && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
+        if [ "$proto" = "snell" ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
             name="Snell v4+STS"
         fi
         if state_installed "$key"; then
@@ -2342,7 +3053,7 @@ show_status() {
             local ver=$(state_get "$key" "version")
             local svc=$(psvc "$proto")
             local st icon
-            if [ "$proto" = "snell" ] && [ -f /etc/systemd/system/shadowtls-snell.service ]; then
+            if [ "$proto" = "snell" ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
                 if systemctl is-active --quiet "$svc" 2>/dev/null && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
                     st="${GREEN}ONLINE ${RESET}"
                     icon="${GREEN}◆${RESET}"
@@ -2388,20 +3099,20 @@ show_config() {
         case $proto in
             snell)
                 local psk
-                psk=$(conf_value "psk" "$(pdir snell)/snell.conf" || echo "未知")
-                snell_output "$port" "$psk" ;;
+                psk=$(conf_value "psk" "$(pdir snell)/snell.conf" || true)
+                [ -n "$psk" ] && snell_output "$port" "$psk" || warn "Snell 凭据缺失，已跳过配置输出" ;;
             hy2)
                 local pass
-                pass=$(yaml_value "password" "$(pdir hy2)/config.yaml" || echo "未知")
-                hy2_output "$port" "$pass" ;;
+                pass=$(yaml_value "password" "$(pdir hy2)/config.yaml" || true)
+                [ -n "$pass" ] && hy2_output "$port" "$pass" || warn "Hysteria2 凭据缺失，已跳过配置输出" ;;
             vless)
                 local uuid
-                uuid=$(json_value "id" "$(pdir vless)/config.json" || echo "未知")
-                vless_output "$port" "$uuid" ;;
+                uuid=$(json_value "id" "$(pdir vless)/config.json" || true)
+                [ -n "$uuid" ] && vless_output "$port" "$uuid" || warn "VLESS 凭据缺失，已跳过配置输出" ;;
             anytls)
                 local pass
-                pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "未知")
-                anytls_output "$port" "$pass" ;;
+                pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || true)
+                [ -n "$pass" ] && anytls_output "$port" "$pass" || warn "AnyTLS 凭据缺失，已跳过配置输出" ;;
         esac
         echo ""
     done
@@ -2451,10 +3162,15 @@ install_speedtest_cli() {
         aarch64|arm64) url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-aarch64.tgz" ;;
         *) warn "speedtest 不支持当前架构: $cpu_arch" >&2; return 1 ;;
     esac
-    tmpdir=$(mktemp -d /tmp/pd-speedtest-XXXXXX)
-    curl -fsSL --connect-timeout 15 --max-time 120 "$url" -o "$tmpdir/speedtest.tgz" || { rm -rf "$tmpdir"; return 1; }
+    mktemp_dir_pd tmpdir
+    download_https "$url" "$tmpdir/speedtest.tgz" "Ookla speedtest CLI 1.2.0" || { rm -rf "$tmpdir"; return 1; }
+    tar -tzf "$tmpdir/speedtest.tgz" | archive_paths_are_safe || { rm -rf "$tmpdir"; return 1; }
     tar -xzf "$tmpdir/speedtest.tgz" -C "$tmpdir" >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 1; }
+    [ -f "$tmpdir/speedtest" ] && [ ! -L "$tmpdir/speedtest" ] || { rm -rf "$tmpdir"; return 1; }
     install -m 0755 "$tmpdir/speedtest" /usr/local/bin/speedtest || { rm -rf "$tmpdir"; return 1; }
+    state_set system speedtest_owned 1 || { rm -f /usr/local/bin/speedtest; return 1; }
+    state_set system speedtest_sha256 "$(sha256_file /usr/local/bin/speedtest)" \
+        || { rm -f /usr/local/bin/speedtest; return 1; }
     rm -rf "$tmpdir"
     return 0
 }
@@ -2563,31 +3279,45 @@ prompt_bbr_region() {
 
 apply_mss_clamp() {
     command -v iptables >/dev/null 2>&1 || return 0
-    iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 \
-        || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+    if iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment PD-proxy:mss -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; then
+        [ "$(state_get system mss_owned 2>/dev/null || true)" = 1 ] \
+            || { err "发现带 PD-proxy 标记但所有权状态缺失的 MSS rule，拒绝接管"; return 1; }
+        return 0
+    fi
+    iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment PD-proxy:mss -j TCPMSS --clamp-mss-to-pmtu \
+        || { err "添加 MSS clamp 规则失败"; return 1; }
+    state_set system mss_owned 1 || {
+        iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment PD-proxy:mss -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 || true
+        return 1
+    }
 }
 
 write_bbr_persist_service() {
-    cat > /usr/local/bin/pd-bbr-apply.sh <<'EOF'
+    if [ -e /usr/local/bin/pd-bbr-apply.sh ] \
+        && { [ "$(state_get system bbr_persist_owned 2>/dev/null || true)" != 1 ] \
+            || ! grep -q '^# PD-proxy owned resource$' /usr/local/bin/pd-bbr-apply.sh 2>/dev/null; }; then
+        err "发现非本脚本所有的 /usr/local/bin/pd-bbr-apply.sh，拒绝覆盖"
+        return 1
+    fi
+    if [ -e "$SYSTEMD_DIR/pd-bbr-apply.service" ] \
+        && { [ "$(state_get system bbr_persist_owned 2>/dev/null || true)" != 1 ] \
+            || ! unit_is_pd_owned "$SYSTEMD_DIR/pd-bbr-apply.service"; }; then
+        err "发现非本脚本所有的 pd-bbr-apply.service，拒绝覆盖"
+        return 1
+    fi
+    atomic_write_file /usr/local/bin/pd-bbr-apply.sh 755 <<'EOF' || return 1
 #!/usr/bin/env bash
+# PD-proxy owned resource
 for d in /sys/class/net/*; do
     [ -e "$d" ] || continue
     dev=$(basename "$d")
     case "$dev" in lo|docker*|veth*|br-*|virbr*|zt*|tailscale*|wg*|tun*|tap*) continue ;; esac
     tc qdisc replace dev "$dev" root fq 2>/dev/null || true
 done
-if command -v iptables >/dev/null 2>&1; then
-    iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1 \
-        || iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-fi
-if [ -f /sys/kernel/mm/transparent_hugepage/enabled ]; then
-    echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-fi
 EOF
-    chmod +x /usr/local/bin/pd-bbr-apply.sh
-    cat > /etc/systemd/system/pd-bbr-apply.service <<'EOF'
+    atomic_write_file "$SYSTEMD_DIR/pd-bbr-apply.service" 644 <<'EOF' || return 1
 [Unit]
-Description=PD-proxy BBR network runtime tuning
+Description=PD-proxy: BBR network runtime tuning
 After=network-online.target
 Wants=network-online.target
 
@@ -2599,34 +3329,18 @@ ExecStart=/usr/local/bin/pd-bbr-apply.sh
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload 2>/dev/null || true
-    systemctl enable pd-bbr-apply.service >/dev/null 2>&1 || true
-}
-
-clean_sysctl_conflicts() {
-    local conf=/etc/sysctl.conf changed=0
-    [ -f "$conf" ] || return
-    [ -f /etc/sysctl.conf.pdproxy.bak ] || cp "$conf" /etc/sysctl.conf.pdproxy.bak 2>/dev/null || true
-    local -a keys=(
-        "net\\.ipv4\\.tcp_congestion_control"
-        "net\\.core\\.default_qdisc"
-        "net\\.core\\.rmem_max"
-        "net\\.core\\.wmem_max"
-        "net\\.ipv4\\.tcp_rmem"
-        "net\\.ipv4\\.tcp_wmem"
-    )
-    local k
-    for k in "${keys[@]}"; do
-        if grep -q "^${k}" "$conf" 2>/dev/null; then
-            sed -i -E "s/^(${k}.*)/#&  # 已迁移到 \/etc\/sysctl.d\/99-pdproxy.conf/" "$conf"
-            changed=1
-        fi
-    done
-    [ "$changed" -eq 1 ] && info "已迁移 sysctl.conf 中的旧 BBR 配置"
+    systemctl daemon-reload || return 1
+    systemctl enable pd-bbr-apply.service >/dev/null || return 1
+    state_set system bbr_persist_owned 1 || {
+        systemctl disable --now pd-bbr-apply.service >/dev/null 2>&1 || true
+        rm -f "$SYSTEMD_DIR/pd-bbr-apply.service" /usr/local/bin/pd-bbr-apply.sh
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        return 1
+    }
 }
 
 apply_tc_fq() {
-    if ! command -v tc >/dev/null 2>&1; then return; fi
+    if ! command -v tc >/dev/null 2>&1; then return 0; fi
     local applied=0 dev
     for dev in $(ls /sys/class/net/ 2>/dev/null); do
         case "$dev" in
@@ -2634,7 +3348,11 @@ apply_tc_fq() {
         esac
         tc qdisc replace dev "$dev" root fq 2>/dev/null && applied=$((applied+1))
     done
-    [ $applied -gt 0 ] && info "已对 ${applied} 个网卡应用 fq 队列算法（即时生效）"
+    if [ "$applied" -gt 0 ]; then
+        state_set system tc_fq_applied 1 || { err "记录 tc fq 运行时变更失败"; return 1; }
+        info "已对 ${applied} 个网卡应用 fq 队列算法（即时生效）"
+    fi
+    return 0
 }
 
 select_xanmod_package() {
@@ -2765,16 +3483,24 @@ ensure_xanmod_swap() {
         return 1
     fi
     if ! grep -q '^/swapfile ' /etc/fstab 2>/dev/null; then
-        if ! echo '/swapfile none swap sw 0 0' >> /etc/fstab; then
+        local fstab_tmp
+        fstab_tmp=$(mktemp /etc/.fstab.pd.XXXXXX) || return 1
+        if ! awk '{ print } END { print "/swapfile none swap sw 0 0" }' /etc/fstab > "$fstab_tmp" \
+            || ! atomic_write_file /etc/fstab 644 < "$fstab_tmp"; then
+            rm -f "$fstab_tmp"
             swapoff /swapfile >/dev/null 2>&1 || true
             rm -f /swapfile
             [ -f "$fstab_bak" ] && cp "$fstab_bak" /etc/fstab 2>/dev/null || true
             warn "写入 /etc/fstab 失败，swap 已回滚，已停止 BBRv3 安装"
             return 1
         fi
+        rm -f "$fstab_tmp"
     fi
     PD_XANMOD_SWAP_CREATED=1
     PD_XANMOD_SWAP_FSTAB_BAK="$fstab_bak"
+    state_set system swap_owned 1 || { rollback_xanmod_swap_if_created; return 1; }
+    state_set system swap_bytes "$(stat -c%s /swapfile 2>/dev/null || echo 0)" || { rollback_xanmod_swap_if_created; return 1; }
+    state_set system swap_fstab_owned 1 || { rollback_xanmod_swap_if_created; return 1; }
     info "swap 已创建并启用：${swap_mb}MB"
 }
 
@@ -2788,6 +3514,8 @@ rollback_xanmod_swap_if_created() {
         sed -i '\#^/swapfile #d' /etc/fstab 2>/dev/null || true
     fi
     PD_XANMOD_SWAP_CREATED=0
+    state_set system swap_owned 0 2>/dev/null || true
+    state_set system swap_fstab_owned 0 2>/dev/null || true
     warn "已回滚本次为 BBRv3 创建的 swap"
 }
 
@@ -2818,17 +3546,16 @@ enable_bbr() {
         [[ "$kernel_minor" =~ ^[0-9]+$ ]] || kernel_minor=0
         if [ "$kernel_major" -lt 4 ] || { [ "$kernel_major" -eq 4 ] && [ "$kernel_minor" -lt 9 ]; }; then
             warn "内核版本过低 ($(uname -r))，BBR 需要 ≥ 4.9"
-            return
+            return 1
         fi
 
         if detect_virt 2>/dev/null | grep -qiE 'openvz|virtuozzo|lxc'; then
             warn "当前虚拟化环境不支持加载内核模块，无法开启 BBR"
-            return
+            return 1
         fi
     fi
 
-    # ④ 清理旧配置
-    clean_sysctl_conflicts
+    # 不改写 /etc/sysctl.conf 或用户的其他 sysctl 文件，只管理自己的独立文件。
 
     # ⑤ 按 vps-tcp-tune 逻辑：自动/手动带宽 + 地区决定缓冲区
     if [ -n "${PD_BBR_BANDWIDTH:-}" ]; then
@@ -2858,8 +3585,15 @@ enable_bbr() {
     # ⑥ 写入独立配置文件
     mkdir -p /etc/sysctl.d
     local sysctl_conf=/etc/sysctl.d/99-pdproxy.conf
-    cat > "$sysctl_conf" << SYSCTL_EOF
-# PD-proxy BBR 优化 ($(date '+%F %T'))
+    if [ -e "$sysctl_conf" ] \
+        && { [ "$(state_get system bbr_sysctl_owned 2>/dev/null || true)" != 1 ] \
+            || ! grep -q '^# PD-proxy owned resource$' "$sysctl_conf" 2>/dev/null; }; then
+        err "$sysctl_conf 已存在且所有权未知，拒绝覆盖"
+        return 1
+    fi
+    atomic_write_file "$sysctl_conf" 644 << SYSCTL_EOF || return 1
+# PD-proxy owned resource
+# BBR 优化 ($(date '+%F %T'))
 # 带宽: ${band} Mbps | 地区: ${region_label} | 缓冲: ${buf_mb} MB
 
 # 拥塞控制
@@ -2909,15 +3643,16 @@ vm.overcommit_memory=1
 vm.vfs_cache_pressure=50
 kernel.sched_autogroup_enabled=0
 SYSCTL_EOF
+    state_set system bbr_sysctl_owned 1 || { rm -f "$sysctl_conf"; return 1; }
 
     # ⑦ 应用：先尝试加载模块，再应用 sysctl，避免 congestion_control=bbr 失败提前退出。
     modprobe tcp_bbr 2>/dev/null || true
-    sysctl -p "$sysctl_conf" >/dev/null 2>&1 || warn "部分内核参数未能立即应用，可能需要重启或内核不支持"
+    sysctl -p "$sysctl_conf" >/dev/null 2>&1 || { err "部分 BBR 内核参数应用失败"; return 1; }
 
     # ⑧ tc fq 即时生效
-    apply_tc_fq
-    apply_mss_clamp
-    write_bbr_persist_service
+    apply_tc_fq || return 1
+    apply_mss_clamp || return 1
+    write_bbr_persist_service || return 1
 
     # ⑨ 验证
     running_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "")
@@ -2925,7 +3660,9 @@ SYSCTL_EOF
         info "BBR 已开启 (${running_cc})"
     else
         warn "BBR 未生效 (当前: ${running_cc})，可能需要重启系统"
+        return 1
     fi
+    return 0
 }
 
 # ---- BBRv3 内核（XanMod）----
@@ -2940,13 +3677,13 @@ enable_bbrv3_kernel() {
     # ② 虚拟化限制
     if detect_virt 2>/dev/null | grep -qiE 'openvz|virtuozzo|lxc'; then
         warn "当前虚拟化环境不支持更换内核（$(detect_virt 2>/dev/null)），跳过"
-        return
+        return 1
     fi
 
     # ③ 架构限制：XanMod x64 系列仅适用于 x86_64/amd64
     case "$(uname -m)" in
         x86_64|amd64) ;;
-        *) warn "XanMod x64 内核仅支持 x86_64/amd64，当前架构: $(uname -m)"; return ;;
+        *) warn "XanMod x64 内核仅支持 x86_64/amd64，当前架构: $(uname -m)"; return 1 ;;
     esac
 
     # ④ 确认
@@ -2954,35 +3691,68 @@ enable_bbrv3_kernel() {
     warn "安装 XanMod 内核后需要重启系统才能生效"
     echo -ne "  是否继续？(y/N): "
     read -r ans || ans=""
-    [ "$ans" != "y" ] && [ "$ans" != "Y" ] && { info "已取消"; return; }
+    [ "$ans" != "y" ] && [ "$ans" != "Y" ] && { info "已取消"; return 0; }
 
     # ⑤ 安装依赖
     step "安装 XanMod BBRv3 内核..."
-    check_xanmod_disk_space || return
-    ensure_xanmod_swap || return
-    apt-get update -qq || { rollback_xanmod_swap_if_created; warn "apt-get update 失败，无法安装 XanMod"; return; }
-    apt-get install -y -qq gnupg lsb-release curl ca-certificates >/dev/null || { rollback_xanmod_swap_if_created; warn "安装 XanMod 依赖失败"; return; }
-    mkdir -p /etc/apt/keyrings
+    check_xanmod_disk_space || return 1
+    ensure_xanmod_swap || return 1
+    apt-get update -qq || { rollback_xanmod_swap_if_created; warn "apt-get update 失败，无法安装 XanMod"; return 1; }
+    apt-get install -y -qq gnupg lsb-release curl ca-certificates >/dev/null || { rollback_xanmod_swap_if_created; warn "安装 XanMod 依赖失败"; return 1; }
+    mkdir -p /etc/apt/keyrings || return 1
 
     local key_tmp
-    key_tmp=$(mktemp_pd)
-    curl -fsSL https://dl.xanmod.org/archive.key -o "$key_tmp" || { rollback_xanmod_swap_if_created; warn "下载 XanMod GPG key 失败"; return; }
-    rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg
-    gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg "$key_tmp" 2>/dev/null || { rollback_xanmod_swap_if_created; warn "导入 XanMod GPG key 失败"; return; }
+    mktemp_pd key_tmp
+    curl_https -fsSL https://dl.xanmod.org/archive.key -o "$key_tmp" || { rollback_xanmod_swap_if_created; warn "下载 XanMod GPG key 失败"; return 1; }
+    if [ -n "${PD_XANMOD_KEY_SHA256:-}" ]; then
+        verify_expected_sha256 "$key_tmp" "$PD_XANMOD_KEY_SHA256" "XanMod archive.key" \
+            || { rollback_xanmod_swap_if_created; return 1; }
+    elif [ "${PD_STRICT_CHECKSUM:-0}" = 1 ]; then
+        rollback_xanmod_swap_if_created
+        err "XanMod archive.key 未设置 PD_XANMOD_KEY_SHA256；严格模式拒绝导入"
+        return 1
+    else
+        warn "XanMod archive.key 仅由 HTTPS 获取，未固定独立摘要；可设置 PD_XANMOD_KEY_SHA256"
+    fi
+    if [ -e /etc/apt/keyrings/xanmod-archive-keyring.gpg ]; then
+        local old_key_sha current_key_sha
+        old_key_sha=$(state_get system xanmod_key_sha256 2>/dev/null || true)
+        current_key_sha=$(sha256_file /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null || true)
+        if [ "$(state_get system xanmod_key_owned 2>/dev/null || true)" != 1 ] \
+            || [ -z "$old_key_sha" ] || [ "$old_key_sha" != "$current_key_sha" ]; then
+            warn "XanMod keyring 已存在但所有权/摘要无法确认，拒绝覆盖"
+            rollback_xanmod_swap_if_created
+            return 1
+        fi
+    fi
+    rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg || return 1
+    gpg --dearmor -o /etc/apt/keyrings/xanmod-archive-keyring.gpg "$key_tmp" 2>/dev/null || { rollback_xanmod_swap_if_created; warn "导入 XanMod GPG key 失败"; return 1; }
+    state_set system xanmod_key_owned 1 || { rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg; return 1; }
+    state_set system xanmod_key_sha256 "$(sha256_file /etc/apt/keyrings/xanmod-archive-keyring.gpg)" \
+        || { rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg; return 1; }
     local codename
     codename=$(lsb_release -sc 2>/dev/null || sed -n 's/^VERSION_CODENAME=//p' /etc/os-release 2>/dev/null | head -1 || true)
-    [ -n "$codename" ] || { rollback_xanmod_swap_if_created; warn "无法识别系统代号，无法添加 XanMod 源"; return; }
+    [ -n "$codename" ] || { rollback_xanmod_swap_if_created; warn "无法识别系统代号，无法添加 XanMod 源"; return 1; }
     if ! xanmod_supported_codename "$codename"; then
         warn "XanMod 官方源暂不支持当前系统代号: $codename"
         warn "支持: bookworm/trixie/forky/sid/noble/plucky/questing/resolute 以及 Linux Mint faye/gigi/wilma/xia/zara/zena"
         warn "已取消 BBRv3 内核安装；可继续使用 pd --bbr 开启普通 BBR"
         rollback_xanmod_swap_if_created
-        return
+        return 1
     fi
-    echo "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org ${codename} main" \
-        > /etc/apt/sources.list.d/xanmod-release.list
+    if [ -e /etc/apt/sources.list.d/xanmod-release.list ] \
+        && { [ "$(state_get system xanmod_repo_owned 2>/dev/null || true)" != 1 ] \
+            || ! grep -q '^# PD-proxy owned resource$' /etc/apt/sources.list.d/xanmod-release.list 2>/dev/null; }; then
+            warn "XanMod 源已存在且所有权未知，拒绝覆盖"
+            rollback_xanmod_swap_if_created
+            return 1
+    fi
+    printf '%s\n' "# PD-proxy owned resource" "deb [signed-by=/etc/apt/keyrings/xanmod-archive-keyring.gpg] https://deb.xanmod.org ${codename} main" \
+        | atomic_write_file /etc/apt/sources.list.d/xanmod-release.list 644 || return 1
+    state_set system xanmod_repo_owned 1 || { rm -f /etc/apt/sources.list.d/xanmod-release.list; return 1; }
+    state_set system xanmod_key_owned 1 || return 1
 
-    apt-get update -qq || { rm -f /etc/apt/sources.list.d/xanmod-release.list; rollback_xanmod_swap_if_created; warn "刷新 XanMod APT 源失败，已移除 XanMod 源"; return; }
+    apt-get update -qq || { rm -f /etc/apt/sources.list.d/xanmod-release.list; rollback_xanmod_swap_if_created; warn "刷新 XanMod APT 源失败，已移除 XanMod 源"; return 1; }
     local xanmod_pkg="" candidate
     while IFS= read -r candidate; do
         [ -n "$candidate" ] || continue
@@ -2996,7 +3766,7 @@ enable_bbrv3_kernel() {
         rm -f /etc/apt/sources.list.d/xanmod-release.list
         warn "当前 XanMod 源没有适合此 CPU/系统的内核包，已移除 XanMod 源"
         rollback_xanmod_swap_if_created
-        return
+        return 1
     fi
     info "选择内核包: $xanmod_pkg"
     if ! apt-get install -y -qq "$xanmod_pkg" 2>/dev/null; then
@@ -3004,7 +3774,7 @@ enable_bbrv3_kernel() {
         rollback_xanmod_swap_if_created
         warn "XanMod 内核安装失败，已移除 XanMod 源并尝试修复 APT 状态"
         warn "如果日志出现 No space left on device，请清理磁盘后重试：apt-get clean && apt-get autoremove --purge"
-        return
+        return 1
     fi
     update-grub 2>/dev/null || true
 
@@ -3013,7 +3783,7 @@ enable_bbrv3_kernel() {
     warn "需要重启才能生效，重启后执行 pd --bbr 即可开启 BBRv3"
     echo -ne "  是否现在重启？(y/N): "
     read -r ans || ans=""
-    [ "$ans" != "y" ] && [ "$ans" != "Y" ] && { info "请稍后手动重启"; return; }
+    [ "$ans" != "y" ] && [ "$ans" != "Y" ] && { info "请稍后手动重启"; return 0; }
     reboot
 }
 
@@ -3021,8 +3791,47 @@ enable_bbrv3_kernel() {
 # 自安装（pd 命令）
 # ============================================================
 
+fetch_self_update() {
+    local dest="$1"
+    validate_https_url "$SCRIPT_URL" || return 1
+    if [ "$SCRIPT_URL" != "$DEFAULT_SCRIPT_URL" ] && [ -z "${PD_SCRIPT_SHA256:-}" ]; then
+        err "自定义 PD_SCRIPT_URL 必须同时设置 PD_SCRIPT_SHA256，拒绝静默信任"
+        return 1
+    fi
+    curl_https -fsSL --retry 3 --connect-timeout 15 --max-time 120 "$SCRIPT_URL" -o "$dest" || return 1
+    if [ -n "${PD_SCRIPT_SHA256:-}" ]; then
+        verify_expected_sha256 "$dest" "$PD_SCRIPT_SHA256" "PD-proxy 自更新脚本" || return 1
+    elif [ "${PD_STRICT_CHECKSUM:-0}" = 1 ]; then
+        err "自更新脚本没有 PD_SCRIPT_SHA256；严格模式拒绝继续"
+        return 1
+    else
+        warn "官方 raw 自更新脚本没有独立摘要；已完成 HTTPS 与 bash -n 校验。可设置 PD_SCRIPT_SHA256 固定内容"
+    fi
+}
+
+atomic_install_script() {
+    local source="$1" target="$BASE_DIR/install.sh" tmp
+    [ ! -L "$target" ] || { err "拒绝覆盖符号链接脚本: $target"; return 1; }
+    tmp=$(mktemp "$BASE_DIR/.install.sh.XXXXXX") || return 1
+    cp "$source" "$tmp" || { rm -f "$tmp"; return 1; }
+    chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
+    [ "$(id -u)" != 0 ] || chown root:root "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+}
+
 self_install() {
-    mkdir -p "$BASE_DIR"
+    assert_base_dir_safe || return 1
+    mkdir -p "$BASE_DIR" || return 1
+    chmod 755 "$BASE_DIR" || return 1
+    [ "$(id -u)" != 0 ] || chown root:root "$BASE_DIR" || return 1
+    printf '%s\n' "PD-proxy owned resource" | atomic_write_file "$BASE_DIR/.pd-proxy-owned" 600 || return 1
+    if [ -L "$INSTALLED_BIN" ]; then
+        [ "$(readlink "$INSTALLED_BIN")" = "$BASE_DIR/install.sh" ] \
+            || { err "pd 入口指向未知目标，拒绝覆盖: $INSTALLED_BIN"; return 1; }
+    elif [ -e "$INSTALLED_BIN" ]; then
+        err "pd 入口已存在且非本脚本符号链接，拒绝覆盖: $INSTALLED_BIN"
+        return 1
+    fi
     # 直接运行修复版时，优先安装当前脚本，避免后续 pd 命令回退到 GitHub 原版。
     local source_path="${BASH_SOURCE[0]}"
     local source_is_file=false
@@ -3036,8 +3845,8 @@ self_install() {
     if [ "${PD_UPDATE:-}" = "1" ]; then
         if $install_from_url; then
             local tmp_pd
-            tmp_pd=$(mktemp_pd)
-            curl -fsSL "$SCRIPT_URL" -o "$tmp_pd" || {
+            mktemp_pd tmp_pd
+            fetch_self_update "$tmp_pd" || {
                 rm -f "$tmp_pd"
                 warn "无法从 SCRIPT_URL 同步脚本: $SCRIPT_URL"
                 return 1
@@ -3054,15 +3863,13 @@ self_install() {
                 warn "远端脚本版本 $remote_ver 低于当前 $VERSION，已拒绝降级"
                 return 1
             fi
-            mv "$tmp_pd" "$BASE_DIR/install.sh"
-            chmod +x "$BASE_DIR/install.sh"
+            atomic_install_script "$tmp_pd" || return 1
         elif $source_is_file; then
             local src_path dst_path
             src_path=$(readlink -f "$source_path" 2>/dev/null || echo "$source_path")
             dst_path=$(readlink -f "$BASE_DIR/install.sh" 2>/dev/null || echo "")
             if [ "$src_path" != "$dst_path" ]; then
-                cp "$source_path" "$BASE_DIR/install.sh"
-                chmod +x "$BASE_DIR/install.sh"
+                atomic_install_script "$source_path" || return 1
             fi
         elif [ ! -f "$BASE_DIR/install.sh" ]; then
             warn "找不到当前脚本文件，无法刷新 /opt/pd/install.sh"
@@ -3073,13 +3880,12 @@ self_install() {
         src_path=$(readlink -f "$source_path" 2>/dev/null || echo "$source_path")
         dst_path=$(readlink -f "$BASE_DIR/install.sh" 2>/dev/null || echo "")
         if [ "$src_path" != "$dst_path" ]; then
-            cp "$source_path" "$BASE_DIR/install.sh"
-            chmod +x "$BASE_DIR/install.sh"
+            atomic_install_script "$source_path" || return 1
         fi
     elif $install_from_url; then
         local tmp_pd
-        tmp_pd=$(mktemp_pd)
-        curl -fsSL "$SCRIPT_URL" -o "$tmp_pd" || {
+        mktemp_pd tmp_pd
+        fetch_self_update "$tmp_pd" || {
             rm -f "$tmp_pd"
             warn "无法从 SCRIPT_URL 同步脚本: $SCRIPT_URL"
             return 1
@@ -3096,37 +3902,171 @@ self_install() {
             warn "远端脚本版本 $remote_ver 低于当前 $VERSION，已拒绝降级"
             return 1
         fi
-        mv "$tmp_pd" "$BASE_DIR/install.sh"
-        chmod +x "$BASE_DIR/install.sh"
+        atomic_install_script "$tmp_pd" || return 1
     elif [ ! -f "$BASE_DIR/install.sh" ]; then
             warn "当前脚本不是文件，无法持久化 pd 命令；请设置 PD_SCRIPT_URL 或下载后运行"
             return 1
     fi
-    ln -sf "$BASE_DIR/install.sh" "$INSTALLED_BIN" 2>/dev/null || true
+    chmod 755 "$BASE_DIR/install.sh" || return 1
+    [ "$(id -u)" != 0 ] || chown root:root "$BASE_DIR/install.sh" || return 1
+    [ -L "$INSTALLED_BIN" ] || ln -s "$BASE_DIR/install.sh" "$INSTALLED_BIN" || return 1
 }
 
 # ============================================================
 # 卸载全部
 # ============================================================
 
+cleanup_managed_system_resources() {
+    local rc=0 owned expected actual bytes tmp unit script
+    if [ "$(state_get system bbr_sysctl_owned 2>/dev/null || true)" = 1 ]; then
+        if [ -f /etc/sysctl.d/99-pdproxy.conf ] && grep -q '^# PD-proxy owned resource$' /etc/sysctl.d/99-pdproxy.conf; then
+            rm -f /etc/sysctl.d/99-pdproxy.conf || rc=1
+            warn "已删除本脚本的 BBR sysctl 文件；当前运行时参数保持到重启或管理员重新加载 sysctl"
+        else
+            warn "BBR sysctl 文件已变化或缺失，无法安全自动恢复，已保留"
+        fi
+    elif [ -e /etc/sysctl.d/99-pdproxy.conf ]; then
+        warn "未记录 /etc/sysctl.d/99-pdproxy.conf 所有权，已保留"
+    fi
+    if [ "$(state_get system tc_fq_applied 2>/dev/null || true)" = 1 ]; then
+        warn "tc fq 属于运行时变更且安装前 qdisc 未知，无法安全自动恢复；当前设置保留到重启或管理员调整"
+    fi
+
+    unit="$SYSTEMD_DIR/pd-bbr-apply.service"; script=/usr/local/bin/pd-bbr-apply.sh
+    if [ "$(state_get system bbr_persist_owned 2>/dev/null || true)" = 1 ]; then
+        if unit_is_pd_owned "$unit" && grep -q '^# PD-proxy owned resource$' "$script" 2>/dev/null; then
+            systemctl disable --now pd-bbr-apply.service >/dev/null 2>&1 || true
+            rm -f "$unit" "$script" || rc=1
+            systemctl daemon-reload >/dev/null 2>&1 || rc=1
+        else
+            warn "BBR 持久化 unit/脚本已变化，无法确认所有权，已保留"
+        fi
+    elif [ -e "$unit" ] || [ -e "$script" ]; then
+        warn "未记录 BBR 持久化资源所有权，已保留"
+    fi
+
+    if [ "$(state_get system mss_owned 2>/dev/null || true)" = 1 ]; then
+        if command -v iptables >/dev/null 2>&1; then
+            if iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment PD-proxy:mss -j TCPMSS --clamp-mss-to-pmtu >/dev/null 2>&1; then
+                iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -m comment --comment PD-proxy:mss -j TCPMSS --clamp-mss-to-pmtu || rc=1
+            else
+                warn "未找到带 PD-proxy 标记的 MSS rule；未标记规则所有权不可证明，已保留"
+            fi
+        else
+            warn "缺少 iptables，无法安全清理本脚本的 MSS rule；已保留"
+        fi
+    fi
+
+    if [ "$(state_get system speedtest_owned 2>/dev/null || true)" = 1 ]; then
+        expected=$(state_get system speedtest_sha256 2>/dev/null || true)
+        actual=$(sha256_file /usr/local/bin/speedtest 2>/dev/null || true)
+        if [ -n "$expected" ] && [ "$actual" = "$expected" ]; then
+            rm -f /usr/local/bin/speedtest || rc=1
+        else
+            warn "speedtest 二进制已变化，无法确认仍是本脚本安装的版本，已保留"
+        fi
+    fi
+
+    if [ "$(state_get system swap_owned 2>/dev/null || true)" = 1 ]; then
+        expected=$(state_get system swap_bytes 2>/dev/null || true)
+        bytes=$(stat -c%s /swapfile 2>/dev/null || echo "")
+        if [ -f /swapfile ] && [ -n "$expected" ] && [ "$bytes" = "$expected" ] \
+            && [ "$(grep -c '^/swapfile none swap sw 0 0$' /etc/fstab 2>/dev/null || true)" = 1 ]; then
+            swapoff /swapfile >/dev/null 2>&1 || rc=1
+            if [ "$rc" = 0 ]; then
+                tmp=$(mktemp /etc/.fstab.pd.XXXXXX) || return 1
+                awk '$0 != "/swapfile none swap sw 0 0" { print }' /etc/fstab > "$tmp" || { rm -f "$tmp"; return 1; }
+                atomic_write_file /etc/fstab 644 < "$tmp" || rc=1
+                rm -f "$tmp"
+                [ "$rc" != 0 ] || rm -f /swapfile || rc=1
+            fi
+        else
+            warn "swapfile 大小或 fstab 记录已变化，无法安全自动恢复，已保留"
+        fi
+    elif [ -e /swapfile ]; then
+        warn "/swapfile 并非状态中记录的本脚本资源，已保留"
+    fi
+
+    if [ "$(state_get system xanmod_repo_owned 2>/dev/null || true)" = 1 ]; then
+        if grep -q '^# PD-proxy owned resource$' /etc/apt/sources.list.d/xanmod-release.list 2>/dev/null; then
+            rm -f /etc/apt/sources.list.d/xanmod-release.list || rc=1
+        else
+            warn "XanMod 源文件已变化，已保留"
+        fi
+    fi
+    if [ "$(state_get system xanmod_key_owned 2>/dev/null || true)" = 1 ]; then
+        expected=$(state_get system xanmod_key_sha256 2>/dev/null || true)
+        actual=$(sha256_file /etc/apt/keyrings/xanmod-archive-keyring.gpg 2>/dev/null || true)
+        if [ -n "$expected" ] && [ "$actual" = "$expected" ]; then
+            rm -f /etc/apt/keyrings/xanmod-archive-keyring.gpg || rc=1
+        else
+            warn "XanMod keyring 已变化，已保留"
+        fi
+    fi
+    if dpkg-query -W 'linux-xanmod*' >/dev/null 2>&1; then
+        warn "XanMod 内核包不会由 remove-all 自动删除；自动删除当前/启动内核不安全"
+    fi
+    [ ! -e /etc/sysctl.conf.pdproxy.bak ] || warn "历史 /etc/sysctl.conf.pdproxy.bak 所有权不可证明，已保留"
+    return "$rc"
+}
+
 remove_all() {
-    echo -e "${RED}⚠ 即将卸载所有代理协议和 PD-proxy${RESET}"
+    echo -e "${RED}⚠ 即将卸载本脚本记录的代理协议、入口和可确认所有权的系统资源${RESET}"
     if [ "${PD_YES:-}" = "1" ] || [ "${1:-}" = "--yes" ]; then
         info "自动确认 (--yes)"
     else
         echo -n "确认？输入 yes: "
         read -r confirm || confirm=""
-        [ "$confirm" = "yes" ] || { info "已取消"; return; }
+        [ "$confirm" = "yes" ] || { info "已取消"; return 0; }
     fi
 
+    local proto failed=0 target entry
     for proto in $ALL_PROTOS; do
-        uninstall_protocol "$proto" 2>/dev/null || true
+        if state_installed "$(pkey "$proto")"; then
+            if ! uninstall_protocol "$proto"; then
+                err "$(pname "$proto") 卸载失败；保留 PD-proxy 状态和入口以便重试"
+                failed=1
+            fi
+        elif [ -e "$(pdir "$proto")" ] || [ -L "$(pdir "$proto")" ] \
+            || [ -e "$SYSTEMD_DIR/$(psvc "$proto").service" ] || [ -L "$SYSTEMD_DIR/$(psvc "$proto").service" ]; then
+            err "发现状态外的 $(pname "$proto") 资源，拒绝猜测所有权或删除"
+            failed=1
+        fi
     done
-    rm -f "$INSTALLED_BIN"
-    rm -f /usr/local/bin/pd-update
-    rm -rf "$BASE_DIR"
-    info "全部已卸载。再见 👋"
-    exit 0
+    if ! state_installed snell && { [ -e /opt/shadowtls ] || [ -L /opt/shadowtls ] \
+        || [ -e "$SYSTEMD_DIR/shadowtls-snell.service" ] || [ -L "$SYSTEMD_DIR/shadowtls-snell.service" ]; }; then
+        err "发现状态外的 ShadowTLS 资源，拒绝删除"
+        failed=1
+    fi
+    if ! state_installed hy2 && { [ -e "$SYSTEMD_DIR/pd-hy2-hop.service" ] || [ -L "$SYSTEMD_DIR/pd-hy2-hop.service" ]; }; then
+        err "发现状态外的 HY2 hop unit，拒绝删除"
+        failed=1
+    fi
+    [ "$failed" -eq 0 ] || return 1
+    cleanup_managed_system_resources || return 1
+
+    if [ -L "$INSTALLED_BIN" ]; then
+        target=$(readlink "$INSTALLED_BIN")
+        [ "$target" = "$BASE_DIR/install.sh" ] || { err "拒绝删除目标未知的 pd 符号链接: $INSTALLED_BIN -> $target"; return 1; }
+        rm -f "$INSTALLED_BIN" || return 1
+    elif [ -e "$INSTALLED_BIN" ]; then
+        err "拒绝删除非本脚本所有的入口: $INSTALLED_BIN"
+        return 1
+    fi
+
+    [ ! -L "$BASE_DIR" ] || { err "拒绝删除符号链接状态目录: $BASE_DIR"; return 1; }
+    if [ -d "$BASE_DIR" ]; then
+        for entry in "$BASE_DIR"/* "$BASE_DIR"/.[!.]* "$BASE_DIR"/..?*; do
+            [ -e "$entry" ] || continue
+            case "$(basename "$entry")" in
+                state|install.sh|export.conf|.pd-proxy-owned|.snell-version-*|.snell-v4-version-*) rm -f "$entry" || return 1 ;;
+                *) err "状态目录含未知资源，拒绝递归删除: $entry"; return 1 ;;
+            esac
+        done
+        rmdir "$BASE_DIR" || { err "状态目录非空，已保留: $BASE_DIR"; return 1; }
+    fi
+    info "PD-proxy 管理且所有权可确认的资源已卸载；上述保留项需管理员复核"
+    return 0
 }
 
 # ============================================================
@@ -3135,7 +4075,7 @@ remove_all() {
 
 # 交互式协议选择
 pick_proto() {
-    local action="$1" func="$2"
+    local action="$1" func="$2" mode="${3:-read}"
     echo ""
     echo "选择要${action}的协议:"
     local -a _picks=()
@@ -3151,12 +4091,19 @@ pick_proto() {
     [ "$pick" -ge 1 ] 2>/dev/null || { warn "无效选择"; return; }
     local target="${_picks[$((pick - 1))]:-}"
     [ -n "$target" ] || { warn "无效选择"; return; }
-    "$func" "$target"
+    if [ "$mode" = write ]; then
+        run_write_locked "$func" "$target"
+    else
+        "$func" "$target"
+    fi
 }
 
 run_export() {
     detect_os; detect_arch; get_ip
     mkdir -p "$BASE_DIR"
+    local tmp
+    tmp=$(mktemp "$BASE_DIR/.export.XXXXXX") || return 1
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
     {
         echo "# PD-proxy 导出 — $(date)"
         for p in $ALL_PROTOS; do
@@ -3166,19 +4113,186 @@ run_export() {
                 show_config_only "$p"
             fi
         done
-    } > /opt/pd/export.conf
-    chmod 600 /opt/pd/export.conf
-    info "配置已导出到 /opt/pd/export.conf"
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
+    atomic_write_file "$BASE_DIR/export.conf" 600 < "$tmp" || { rm -f "$tmp"; return 1; }
+    rm -f "$tmp"
+    info "配置已导出到 $BASE_DIR/export.conf"
+}
+
+declare -a _DOCTOR_IDS=() _DOCTOR_STATUS=() _DOCTOR_MESSAGES=()
+_DOCTOR_FAILED=0
+
+doctor_add() {
+    local id="$1" status="$2" message="$3"
+    _DOCTOR_IDS+=("$id")
+    _DOCTOR_STATUS+=("$status")
+    _DOCTOR_MESSAGES+=("$message")
+    [ "$status" != fail ] || _DOCTOR_FAILED=1
+}
+
+doctor_firewall() {
+    local key="$1" backend spec transport owned
+    backend=$(state_get "$key" fw_backend 2>/dev/null || true)
+    spec=$(state_get "$key" fw_spec 2>/dev/null || true)
+    transport=$(state_get "$key" fw_proto 2>/dev/null || true)
+    owned=$(state_get "$key" fw_owned 2>/dev/null || true)
+    case "$backend" in
+        none) doctor_add "${key}.firewall" warn "未检测到本机防火墙后端，请检查云防火墙 ${spec}/${transport}" ;;
+        ufw)
+            if command -v ufw >/dev/null 2>&1 && ufw_rule_exists "${spec}/${transport}"; then
+                doctor_add "${key}.firewall" ok "ufw 规则存在（owned=${owned:-no}）"
+            else
+                doctor_add "${key}.firewall" fail "状态记录的 ufw 规则不存在"
+            fi ;;
+        iptables)
+            if command -v iptables >/dev/null 2>&1 && iptables -C INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1; then
+                doctor_add "${key}.firewall" ok "iptables 规则存在（owned=${owned:-no}）"
+            else
+                doctor_add "${key}.firewall" fail "状态记录的 iptables 规则不存在"
+            fi ;;
+        *) doctor_add "${key}.firewall" warn "缺少可核验的防火墙状态" ;;
+    esac
+}
+
+doctor_protocol() {
+    local proto="$1" key svc public_svc dir bin port transport active=0 recorded4 recorded6 actual4=0 actual6=0
+    key=$(pkey "$proto"); svc=$(psvc "$proto"); dir=$(pdir "$proto"); bin=$(pbin "$proto")
+    public_svc="$svc"
+    state_installed "$key" || return 0
+    if [ -d "$dir" ] && [ -x "$bin" ] && unit_is_pd_owned "$SYSTEMD_DIR/${svc}.service"; then
+        doctor_add "${key}.state" ok "状态、目录、二进制和 unit 一致"
+    else
+        doctor_add "${key}.state" fail "installed 状态与目录/二进制/unit 不一致"
+    fi
+    systemctl is-active --quiet "$svc" 2>/dev/null && active=1
+    [ "$active" = 1 ] && doctor_add "${key}.service" ok "$svc 正在运行" \
+        || doctor_add "${key}.service" fail "$svc 未运行"
+    port=$(state_get "$key" port 2>/dev/null || true)
+    transport=$(protocol_transport "$proto")
+    [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && public_svc=shadowtls-snell
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$active" = 1 ] && service_port_listening "$port" "$transport" "$public_svc"; then
+        doctor_add "${key}.listen" ok "$port/$transport 由 $public_svc 监听"
+    else
+        doctor_add "${key}.listen" fail "端口状态无效或未由 $public_svc 监听"
+    fi
+    recorded4=$(state_get "$key" listen_ipv4 2>/dev/null || true)
+    recorded6=$(state_get "$key" listen_ipv6 2>/dev/null || true)
+    [ "$active" = 1 ] && service_port_family_listening "$port" "$transport" "$public_svc" ipv4 && actual4=1
+    [ "$active" = 1 ] && service_port_family_listening "$port" "$transport" "$public_svc" ipv6 && actual6=1
+    if [ -n "$recorded4$recorded6" ] && [ "${recorded4:-0}" = "$actual4" ] && [ "${recorded6:-0}" = "$actual6" ]; then
+        doctor_add "${key}.family" ok "监听族与状态一致（IPv4=$actual4 IPv6=$actual6）"
+    else
+        doctor_add "${key}.family" warn "监听族状态缺失或不一致（记录 IPv4=${recorded4:-?} IPv6=${recorded6:-?}；实际 IPv4=$actual4 IPv6=$actual6）"
+    fi
+    doctor_firewall "$key"
+    if [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
+        local inner_addr inner_port
+        inner_addr=$(unit_arg_value --server "$SYSTEMD_DIR/shadowtls-snell.service" 2>/dev/null || true)
+        inner_port=${inner_addr##*:}
+        if systemctl is-active --quiet shadowtls-snell 2>/dev/null \
+            && service_port_listening "$port" tcp shadowtls-snell \
+            && [[ "$inner_port" =~ ^[0-9]+$ ]] && service_port_listening "$inner_port" tcp snell; then
+            doctor_add shadowtls.layer ok "Snell 与 ShadowTLS 外层均运行"
+        else
+            doctor_add shadowtls.layer fail "Snell 内层或 ShadowTLS 外层未运行/监听"
+        fi
+    fi
+    if [ "$proto" = hy2 ]; then
+        local hop end
+        hop=$(state_get hy2 hop 2>/dev/null || true)
+        if [ "${hop:-0}" -ge 3 ] 2>/dev/null; then
+            end=$((port + hop - 1))
+            if systemctl is-active --quiet pd-hy2-hop 2>/dev/null && command -v nft >/dev/null 2>&1 \
+                && nft list table inet pd_hy2_hop 2>/dev/null | tr '\n' ' ' | grep -Eq "udp dport ${port}-${end} redirect to :${port}([ ;]|$)"; then
+                doctor_add hy2.hop ok "HY2 hop unit 与 nft 范围一致"
+            else
+                doctor_add hy2.hop fail "HY2 hop unit/nft 与状态不一致"
+            fi
+        fi
+    fi
+}
+
+doctor_run() {
+    local json="${1:-0}" os_id="unknown" arch_raw systemd_state="" i comma
+    _DOCTOR_IDS=(); _DOCTOR_STATUS=(); _DOCTOR_MESSAGES=(); _DOCTOR_FAILED=0
+    if [ "$(id -u)" = 0 ]; then
+        doctor_add privileges ok "root 可读取受限状态、unit 和 socket 进程信息"
+    else
+        doctor_add privileges warn "非 root 运行；受限状态、journal 和 socket 进程信息可能不可见"
+    fi
+    [ -r /etc/os-release ] && os_id=$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"' | head -1)
+    case "$os_id" in debian|ubuntu) doctor_add os ok "支持的系统: $os_id" ;; *) doctor_add os fail "不支持的系统: $os_id" ;; esac
+    arch_raw=$(uname -m 2>/dev/null || echo unknown)
+    case "$arch_raw" in x86_64|amd64|aarch64|arm64) doctor_add arch ok "支持的架构: $arch_raw" ;; *) doctor_add arch fail "不支持的架构: $arch_raw" ;; esac
+    if command -v systemctl >/dev/null 2>&1; then
+        systemd_state=$(systemctl is-system-running 2>/dev/null || true)
+        case "$systemd_state" in running|degraded) doctor_add systemd ok "systemd: $systemd_state" ;; *) doctor_add systemd fail "systemd 不可用: ${systemd_state:-unknown}" ;; esac
+    else
+        doctor_add systemd fail "缺少 systemctl"
+    fi
+    get_ip
+    if [ -n "${PUBLIC_HOST:-}" ] || [ -n "${IP:-}" ] || [ -n "${IP6:-}" ]; then
+        doctor_add public_ip ok "公网端点可用（host=${PUBLIC_HOST:-none} IPv4=${IP:-none} IPv6=${IP6:-none}）"
+    else
+        doctor_add public_ip warn "未得到一致的公网地址；配置输出将被拒绝"
+    fi
+    for i in $ALL_PROTOS; do doctor_protocol "$i"; done
+    if [ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)" = bbr ]; then
+        doctor_add bbr ok "BBR 正在运行"
+    else
+        doctor_add bbr warn "BBR 未运行"
+    fi
+    if [ "$json" = 1 ]; then
+        printf '{"version":"%s","ok":%s,"checks":[' "$VERSION" "$([ "$_DOCTOR_FAILED" = 0 ] && echo true || echo false)"
+        comma=""
+        for ((i=0; i<${#_DOCTOR_IDS[@]}; i++)); do
+            printf '%s{"id":"%s","status":"%s","message":"%s"}' "$comma" \
+                "$(json_escape "${_DOCTOR_IDS[$i]}")" "${_DOCTOR_STATUS[$i]}" "$(json_escape "${_DOCTOR_MESSAGES[$i]}")"
+            comma=,
+        done
+        printf ']}\n'
+    else
+        echo "PD-proxy doctor v$VERSION（只读）"
+        for ((i=0; i<${#_DOCTOR_IDS[@]}; i++)); do
+            printf '%-5s %-20s %s\n' "${_DOCTOR_STATUS[$i]}" "${_DOCTOR_IDS[$i]}" "${_DOCTOR_MESSAGES[$i]}"
+        done
+    fi
+    [ "$_DOCTOR_FAILED" = 0 ]
 }
 
 # 注册协议表
 register_protocols
+
+# 回归测试只加载定义，不执行 CLI、root 检查或菜单。
+if [ "${PD_TEST_MODE:-0}" = "1" ]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # ============================================================
 # CLI 派发（统一入口 — 协议名归一化一处完成）
 # ============================================================
 
 # 写操作需要 root，读操作不需要
+
+validate_cli_arity() {
+    local action="${1:-}"
+    case "$action" in
+        --install|-i|--uninstall|-r|--upgrade|-u|--restart|--stop|--start|--log|-l|--config|-c)
+            [ "$#" -eq 2 ] || cli_usage_error "$action 需要且只接受一个协议参数" ;;
+        --config-all|--show|--status|-s|--export|--bbr|--bbrv3|--update)
+            [ "$#" -eq 1 ] || cli_usage_error "$action 不接受额外参数" ;;
+        --doctor)
+            [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ "${2:-}" = --json ]; } \
+                || cli_usage_error "--doctor 仅接受可选的 --json" ;;
+        --remove-all)
+            [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ "${2:-}" = --yes ]; } \
+                || cli_usage_error "--remove-all 仅接受可选的 --yes" ;;
+        "") [ "$#" -eq 0 ] || cli_usage_error "意外参数" ;;
+        *) cli_usage_error "未知参数: $action" ;;
+    esac
+}
+
+validate_cli_arity "$@"
 
 # 一行式协议派发：resolve_proto 归一化 → 调用目标函数
 cli_dispatch() {
@@ -3187,7 +4301,7 @@ cli_dispatch() {
         install)
             [ -z "$proto" ] && die "用法: pd --install <snell|hy2|vless|anytls>"
             check_root; detect_os; detect_arch; get_ip; get_mem
-            self_install || warn "pd 更新失败，使用缓存版本"
+            run_write_locked self_install || warn "pd 更新失败，使用缓存版本"
             proto=$(resolve_proto "$proto") || die "未知协议: $proto，可选: snell hy2 vless anytls"
             # CLI 路径：无环境变量时重置为默认值，防止交互菜单污染
             [ -z "${PD_SNELL_MODE:-}" ] && PD_OPT_SNELL_MODE="standard"
@@ -3199,32 +4313,32 @@ cli_dispatch() {
             [ -z "${PD_VLESS_FP:-}" ] && PD_OPT_VLESS_FP="chrome"
             [ -z "${PD_ANYTLS_PADDING:-}" ] && PD_OPT_ANYTLS_PADDING="standard"
             [ -z "${PD_ANYTLS_SNI:-}" ] && PD_OPT_ANYTLS_SNI=""
-            install_protocol "$proto" ;;
+            run_write_locked install_protocol "$proto" ;;
         uninstall)
             [ -z "$proto" ] && die "用法: pd --uninstall <snell|hy2|vless|anytls>"
             check_root; detect_os
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
-            uninstall_protocol "$proto" ;;
+            run_write_locked uninstall_protocol "$proto" ;;
         upgrade)
             [ -z "$proto" ] && die "用法: pd --upgrade <snell|hy2|vless|anytls>"
             check_root; detect_os; detect_arch; get_ip
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
-            upgrade_protocol "$proto" ;;
+            run_write_locked upgrade_protocol "$proto" ;;
         restart)
             [ -z "$proto" ] && die "用法: pd --restart <snell|hy2|vless|anytls>"
             check_root
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
-            restart_service "$proto" ;;
+            run_write_locked restart_service "$proto" ;;
         stop)
             [ -z "$proto" ] && die "用法: pd --stop <snell|hy2|vless|anytls>"
             check_root
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
-            stop_service "$proto" ;;
+            run_write_locked stop_service "$proto" ;;
         start)
             [ -z "$proto" ] && die "用法: pd --start <snell|hy2|vless|anytls>"
             check_root
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
-            start_service "$proto" ;;
+            run_write_locked start_service "$proto" ;;
         log)
             [ -z "$proto" ] && die "用法: pd --log <snell|hy2|vless|anytls>"
             proto=$(resolve_proto "$proto") || die "未知协议: $proto"
@@ -3238,18 +4352,18 @@ cli_dispatch() {
 }
 
 case "${1:-}" in
-    --install|-i)  cli_dispatch install  "${2:-}" ; exit 0 ;;
+    --install|-i)  cli_dispatch install  "${2:-}" ; exit $? ;;
     --uninstall|-r)
         case "${2:-}" in
-            all|--all) check_root; remove_all; exit 0 ;;
+            all|--all) check_root; run_write_locked remove_all; exit $? ;;
         esac
         cli_dispatch uninstall "${2:-}" ; exit 0 ;;
-    --upgrade|-u)  cli_dispatch upgrade  "${2:-}" ; exit 0 ;;
-    --restart)     cli_dispatch restart  "${2:-}" ; exit 0 ;;
-    --stop)        cli_dispatch stop     "${2:-}" ; exit 0 ;;
-    --start)       cli_dispatch start    "${2:-}" ; exit 0 ;;
-    --log|-l)      cli_dispatch log      "${2:-}" ; exit 0 ;;
-    --config|-c)   cli_dispatch config   "${2:-}" ; exit 0 ;;
+    --upgrade|-u)  cli_dispatch upgrade  "${2:-}" ; exit $? ;;
+    --restart)     cli_dispatch restart  "${2:-}" ; exit $? ;;
+    --stop)        cli_dispatch stop     "${2:-}" ; exit $? ;;
+    --start)       cli_dispatch start    "${2:-}" ; exit $? ;;
+    --log|-l)      cli_dispatch log      "${2:-}" ; exit $? ;;
+    --config|-c)   cli_dispatch config   "${2:-}" ; exit $? ;;
     --config-all)
         check_root; detect_os; detect_arch; get_ip
         for p in $ALL_PROTOS; do
@@ -3263,17 +4377,20 @@ case "${1:-}" in
         check_root; detect_os; detect_arch; get_ip; get_mem; show_config; exit 0 ;;
     --status|-s)
         detect_os; detect_arch; get_ip; get_mem; show_status; exit 0 ;;
+    --doctor)
+        if [ "${2:-}" = --json ]; then doctor_run 1; else doctor_run 0; fi
+        exit $? ;;
     --export)
-        check_root; run_export; exit 0 ;;
+        check_root; run_write_locked run_export; exit $? ;;
     --bbr)
-        check_root; detect_os; enable_bbr; exit 0 ;;
+        check_root; detect_os; run_write_locked enable_bbr; exit $? ;;
     --bbrv3)
-        check_root; detect_os; detect_arch; enable_bbrv3_kernel; exit 0 ;;
+        check_root; detect_os; detect_arch; run_write_locked enable_bbrv3_kernel; exit $? ;;
     --update)
-        check_root; PD_UPDATE=1 self_install
+        check_root; PD_UPDATE=1 run_write_locked self_install
         info "PD-proxy 修复版已更新"; exit 0 ;;
     --remove-all)
-        check_root; [ "${2:-}" = "--yes" ] && PD_YES=1; remove_all; exit 0 ;;
+        check_root; [ "${2:-}" = "--yes" ] && PD_YES=1; run_write_locked remove_all; exit $? ;;
 esac
 
 # ============================================================
@@ -3331,7 +4448,7 @@ menu_snell_config() {
         esac
     done
     prompt_protocol_port snell || return 1
-    install_protocol snell
+    run_write_locked install_protocol snell
     return 0
 }
 
@@ -3364,7 +4481,7 @@ menu_hy2_config() {
             *) warn "无效选择" ;;
         esac
     done
-    install_protocol hy2
+    run_write_locked install_protocol hy2
     return 0
 }
 
@@ -3408,7 +4525,7 @@ menu_vless_config() {
         prompt_protocol_port vless || return 1
         break
     done
-    install_protocol vless
+    run_write_locked install_protocol vless
     return 0
 }
 
@@ -3433,7 +4550,7 @@ menu_anytls_config() {
         prompt_protocol_port anytls || return 1
         break
     done
-    install_protocol anytls
+    run_write_locked install_protocol anytls
     return 0
 }
 
@@ -3473,12 +4590,12 @@ menu_manage() {
     echo -ne "  ${MAGENTA}▸${RESET} 选择: "
     read -r cc
     case "$cc" in
-        1) pick_proto "升级" upgrade_protocol ;;
-        2) pick_proto "重启" restart_service ;;
-        3) pick_proto "停止" stop_service ;;
-        4) pick_proto "启动" start_service ;;
+        1) pick_proto "升级" upgrade_protocol write ;;
+        2) pick_proto "重启" restart_service write ;;
+        3) pick_proto "停止" stop_service write ;;
+        4) pick_proto "启动" start_service write ;;
         5) pick_proto "日志" show_log ;;
-        6) pick_proto "卸载" uninstall_protocol ;;
+        6) pick_proto "卸载" uninstall_protocol write ;;
         [Bb]) return 1 ;;
         [Qq]) info "再见 👋"; exit 0 ;;
         *) warn "无效选择" ;;
@@ -3500,7 +4617,7 @@ menu_view() {
     case "$cc" in
         1) pick_proto "配置" show_config_only ;;
         2) show_config ;;
-        3) run_export ;;
+        3) run_write_locked run_export ;;
         [Bb]) return 1 ;;
         [Qq]) info "再见 👋"; exit 0 ;;
         *) warn "无效选择" ;;
@@ -3521,10 +4638,10 @@ menu_system() {
     echo -ne "  ${MAGENTA}▸${RESET} 选择: "
     read -r cc
     case "$cc" in
-        1) enable_bbrv3_kernel ;;
+        1) run_write_locked enable_bbrv3_kernel ;;
         2) warn "XanMod 内核卸载功能暂未集成；如需回退，请先保留云厂商默认内核并手动 apt purge 对应 linux-xanmod 包" ;;
-        3) enable_bbr ;;
-        4) remove_all ;;
+        3) run_write_locked enable_bbr ;;
+        4) run_write_locked remove_all ;;
         [Bb]) return 1 ;;
         [Qq]) info "再见 👋"; exit 0 ;;
         *) warn "无效选择" ;;
@@ -3538,7 +4655,7 @@ menu_system() {
 
 check_root
 detect_os; detect_arch; get_ip; get_mem
-self_install || warn "pd 更新失败，使用缓存版本"
+run_write_locked self_install || warn "pd 更新失败，使用缓存版本"
 
 while true; do
     show_status
