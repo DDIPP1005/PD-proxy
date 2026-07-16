@@ -302,11 +302,13 @@ write_lock_acquire() {
 }
 
 write_lock_release() {
+    local rc=0
     [ "$_PD_LOCK_DEPTH" -gt 0 ] || return 0
     _PD_LOCK_DEPTH=$((_PD_LOCK_DEPTH - 1))
     [ "$_PD_LOCK_DEPTH" -eq 0 ] || return 0
-    flock -u 200 || return 1
-    exec 200>&-
+    flock -u 200 || rc=$?
+    exec 200>&- || { [ "$rc" -ne 0 ] && return "$rc"; return 1; }
+    return "$rc"
 }
 
 run_write_locked() {
@@ -939,10 +941,13 @@ bindv6only_confirmed_value() {
     case "$value" in 0|1) printf '%s\n' "$value" ;; *) return 1 ;; esac
 }
 
-# Print 1/0 when the family can be reliably confirmed as listening/not
-# listening.  Return nonzero when process/socket visibility is insufficient.
-service_port_family_probe() {
-    local port="$1" transport="$2" service="$3" family="$4" flag family_flag pid bindonly sockets
+# Print 1/0 when the family can be confirmed as listening/not listening.
+# In strict mode an IPv6 wildcard does not prove whether its socket accepts
+# IPv4: IPV6_V6ONLY is per-socket and may override net.ipv6.bindv6only.
+_service_port_family_probe() {
+    local mode="$1" port="$2" transport="$3" service="$4" family="$5"
+    local flag family_flag pid bindonly sockets
+    case "$mode" in strict|compat) ;; *) return 2 ;; esac
     case "$transport" in tcp) flag=-ltnp ;; udp) flag=-lunp ;; *) return 2 ;; esac
     case "$family" in ipv4) family_flag=-4 ;; ipv6) family_flag=-6 ;; *) return 2 ;; esac
     pid=$(systemctl show -p MainPID --value "$service" 2>/dev/null) || return 2
@@ -964,8 +969,7 @@ service_port_family_probe() {
         printf '0\n'
         return 0
     fi
-    # An IPv6 wildcard socket also accepts IPv4 when bindv6only=0.  The -6
-    # filter makes ambiguous ss output such as *:443 unambiguously IPv6 here.
+    # The -6 filter makes ambiguous ss output such as *:443 unambiguously IPv6.
     sockets=$(ss -H -6 "$flag" 2>/dev/null) || return 2
     if printf '%s\n' "$sockets" | awk -v port="$port" -v pid="$pid" '
         {
@@ -976,6 +980,9 @@ service_port_family_probe() {
         }
         END { exit found ? 0 : 1 }
     '; then
+        [ "$mode" = compat ] || return 2
+        # Compatibility heuristic for post-install verification only.  The
+        # global default cannot prove this socket's IPV6_V6ONLY setting.
         bindonly=$(bindv6only_confirmed_value) || return 2
         [ "$bindonly" = 0 ] && printf '1\n' || printf '0\n'
     else
@@ -983,9 +990,17 @@ service_port_family_probe() {
     fi
 }
 
+service_port_family_probe() {
+    _service_port_family_probe strict "$@"
+}
+
+service_port_family_compat_probe() {
+    _service_port_family_probe compat "$@"
+}
+
 service_port_family_listening() {
     local actual
-    actual=$(service_port_family_probe "$@") || return $?
+    actual=$(service_port_family_compat_probe "$@") || return $?
     [ "$actual" = 1 ]
 }
 

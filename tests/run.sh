@@ -456,10 +456,15 @@ test_run_write_locked_isolates_errexit_and_releases() {
 
 test_run_write_locked_reports_release_failure() {
     local rc e_was_preserved
-    write_lock_acquire() { _PD_LOCK_DEPTH=1; }
-    write_lock_release() { _PD_LOCK_DEPTH=0; return 37; }
+    LOCK_FILE="$TEST_ROOT/release-failure.lock"
+    _PD_LOCK_DEPTH=0
+    flock() {
+        [ "${1:-}" != -u ] || return 37
+        return 0
+    }
     locked_success() { return 0; }
     locked_failure_code() { return 23; }
+    fd_200_is_closed() { ! { : >&200; } 2>/dev/null; }
 
     set +e
     run_write_locked locked_success >/dev/null 2>&1
@@ -469,6 +474,7 @@ test_run_write_locked_reports_release_failure() {
     [ "$rc" -eq 37 ]
     [ "$e_was_preserved" -eq 1 ]
     [ "$_PD_LOCK_DEPTH" -eq 0 ]
+    fd_200_is_closed
 
     set +e
     run_write_locked locked_failure_code >/dev/null 2>&1
@@ -476,6 +482,7 @@ test_run_write_locked_reports_release_failure() {
     set -e
     [ "$rc" -eq 23 ]
     [ "$_PD_LOCK_DEPTH" -eq 0 ]
+    fd_200_is_closed
 }
 
 test_anytls_surge_output() {
@@ -772,6 +779,7 @@ test_doctor_confirmed_family_drift_fails_json() {
         case "${1:-}" in
             is-active) return 0 ;;
             is-system-running) echo running ;;
+            show) echo 4242 ;;
             *) return 1 ;;
         esac
     }
@@ -779,8 +787,8 @@ test_doctor_confirmed_family_drift_fails_json() {
     state_get() {
         case "$2" in
             port) echo 443 ;;
-            listen_ipv4) echo 1 ;;
-            listen_ipv6) echo 0 ;;
+            listen_ipv4) echo 0 ;;
+            listen_ipv6) echo 1 ;;
         esac
     }
     pkey() { echo anytls; }
@@ -789,7 +797,13 @@ test_doctor_confirmed_family_drift_fails_json() {
     pbin() { echo "$TEST_DOCTOR_DIR/anytls-server"; }
     unit_is_pd_owned() { return 0; }
     service_port_listening() { return 0; }
-    service_port_family_probe() { [ "$4" = ipv4 ] && echo 0 || echo 1; }
+    ss() {
+        case " $* " in
+            *' -4 '*) printf '%s\n' 'LISTEN 0 128 0.0.0.0:443 0.0.0.0:* users:(("anytls",pid=4242,fd=3))' ;;
+            *' -6 '*) : ;;
+            *) return 1 ;;
+        esac
+    }
     doctor_firewall() { doctor_add anytls.firewall warn "mock firewall"; }
     get_ip() { IP=203.0.113.1; IP6=""; PUBLIC_HOST=""; }
 
@@ -800,6 +814,58 @@ test_doctor_confirmed_family_drift_fails_json() {
     [ "$rc" -ne 0 ]
     grep -q '"ok":false' <<< "$output"
     grep -q '"id":"anytls.family","status":"fail"' <<< "$output"
+}
+
+test_doctor_ipv6_wildcard_ipv4_is_unknown() {
+    local dir="$TEST_ROOT/doctor-wildcard" family_status="" family_message=""
+    local bindonly_read="$TEST_ROOT/doctor-wildcard-bindonly-read"
+    TEST_DOCTOR_DIR="$dir"
+    mkdir -p "$dir" "$SYSTEMD_DIR"
+    printf '#!/bin/sh\n' > "$dir/anytls-server"
+    chmod +x "$dir/anytls-server"
+    printf '[Unit]\nDescription=PD-proxy: AnyTLS\n' > "$SYSTEMD_DIR/anytls.service"
+
+    id() { [ "${1:-}" = -u ] && echo 0 || return 1; }
+    systemctl() {
+        case "${1:-}" in
+            is-active) return 0 ;;
+            show) echo 4242 ;;
+            *) return 1 ;;
+        esac
+    }
+    state_installed() { return 0; }
+    state_get() {
+        case "$2" in
+            port) echo 443 ;;
+            listen_ipv4|listen_ipv6) echo 1 ;;
+        esac
+    }
+    pkey() { echo anytls; }
+    psvc() { echo anytls; }
+    pdir() { echo "$TEST_DOCTOR_DIR"; }
+    pbin() { echo "$TEST_DOCTOR_DIR/anytls-server"; }
+    unit_is_pd_owned() { return 0; }
+    service_port_listening() { return 0; }
+    ss() {
+        case " $* " in
+            *' -4 '*) : ;;
+            *' -6 '*) printf '%s\n' 'LISTEN 0 128 [::]:443 [::]:* users:(("anytls",pid=4242,fd=3))' ;;
+            *) return 1 ;;
+        esac
+    }
+    bindv6only_confirmed_value() { : > "$bindonly_read"; echo 1; }
+    doctor_firewall() { :; }
+    doctor_add() {
+        if [ "$1" = anytls.family ]; then
+            family_status=$2
+            family_message=$3
+        fi
+    }
+
+    doctor_protocol anytls
+    [ "$family_status" = warn ]
+    grep -q '无法可靠确认' <<< "$family_message"
+    [ ! -e "$bindonly_read" ]
 }
 
 test_doctor_unconfirmed_family_probe_warns() {
@@ -1120,6 +1186,7 @@ run_test "service listeners use ss address-family filters" test_service_listener
 run_test "verified address families are persisted" test_verified_families_are_recorded_and_enforced
 run_test "doctor checks every owned iptables family" test_doctor_checks_each_owned_iptables_family
 run_test "doctor JSON fails on confirmed listen-family drift" test_doctor_confirmed_family_drift_fails_json
+run_test "doctor treats IPv6 wildcard IPv4 reachability as unknown" test_doctor_ipv6_wildcard_ipv4_is_unknown
 run_test "doctor warns when listen families cannot be confirmed" test_doctor_unconfirmed_family_probe_warns
 run_test "Snell logs include both ShadowTLS layers" test_shadowtls_log_reads_both_units
 run_test "stop failures never report a stopped service" test_stop_service_failure_paths
