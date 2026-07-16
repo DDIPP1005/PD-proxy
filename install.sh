@@ -312,8 +312,12 @@ write_lock_release() {
 }
 
 run_write_locked() {
-    local rc release_rc=0 had_errexit=0 ignored tmp_start=${#_PD_TMPFILES[@]}
+    local rc release_rc=0 had_errexit=0 ignored cleanup_trap tmp_start=${#_PD_TMPFILES[@]}
     [[ $- == *e* ]] && had_errexit=1
+    case "$tmp_start" in
+        ''|*[!0-9]*) err "无效的临时文件清理起点"; return 1 ;;
+    esac
+    printf -v cleanup_trap 'cleanup_tmpfiles_from %q' "$tmp_start"
 
     # Keep the operation out of the caller's conditional/errexit context.
     # Bash disables errexit throughout a function called from if/||, and a
@@ -325,7 +329,7 @@ run_write_locked() {
     if [ "$rc" -eq 0 ]; then
         {
             ignored=$(
-                trap 'cleanup_tmpfiles_from "$tmp_start"' EXIT
+                trap "$cleanup_trap" EXIT
                 set -e
                 "$@" >&3
             )

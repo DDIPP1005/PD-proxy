@@ -454,6 +454,50 @@ test_run_write_locked_isolates_errexit_and_releases() {
     [ "$(wc -l < "$releases" | tr -d ' ')" -eq 2 ]
 }
 
+test_run_write_locked_captures_tmp_cleanup_start() {
+    local tmp_root="$TEST_ROOT/write-lock-tmp" paths="$TEST_ROOT/write-lock-tmp-paths"
+    local trap_snapshot="$TEST_ROOT/write-lock-exit-trap" preserved created_file created_dir rc
+    mkdir -p "$tmp_root"
+    TMPDIR="$tmp_root"
+    export TMPDIR
+    _PD_LOCK_DEPTH=0
+    write_lock_acquire() { _PD_LOCK_DEPTH=$((_PD_LOCK_DEPTH + 1)); }
+    write_lock_release() { _PD_LOCK_DEPTH=$((_PD_LOCK_DEPTH - 1)); }
+    locked_make_tmpfiles() {
+        local f d
+        mktemp_pd f
+        mktemp_dir_pd d
+        printf '%s\n%s\n' "$f" "$d" > "$paths"
+        trap -p EXIT > "$trap_snapshot"
+    }
+    locked_make_tmpfiles_then_fail() {
+        locked_make_tmpfiles
+        return 23
+    }
+
+    mktemp_pd preserved
+    run_write_locked locked_make_tmpfiles
+    created_file=$(sed -n '1p' "$paths")
+    created_dir=$(sed -n '2p' "$paths")
+    [ -f "$preserved" ]
+    [ ! -e "$created_file" ]
+    [ ! -e "$created_dir" ]
+    grep -F 'cleanup_tmpfiles_from' "$trap_snapshot" >/dev/null
+    if grep -F '$tmp_start' "$trap_snapshot" >/dev/null; then return 1; fi
+
+    set +e
+    run_write_locked locked_make_tmpfiles_then_fail
+    rc=$?
+    set -e
+    [ "$rc" -eq 23 ]
+    created_file=$(sed -n '1p' "$paths")
+    created_dir=$(sed -n '2p' "$paths")
+    [ -f "$preserved" ]
+    [ ! -e "$created_file" ]
+    [ ! -e "$created_dir" ]
+    [ "$_PD_LOCK_DEPTH" -eq 0 ]
+}
+
 test_run_write_locked_reports_release_failure() {
     local rc e_was_preserved
     LOCK_FILE="$TEST_ROOT/release-failure.lock"
@@ -1172,6 +1216,7 @@ run_test "foreign same-name resources are preserved" test_unknown_resource_prote
 run_test "atomic state writer rejects symlinks" test_state_symlink_rejected
 run_test "write lock rejects symlink paths" test_lock_symlink_rejected
 run_test "write lock isolates errexit and preserves caller state" test_run_write_locked_isolates_errexit_and_releases
+run_test "write lock captures scoped temp cleanup before EXIT" test_run_write_locked_captures_tmp_cleanup_start
 run_test "write lock reports release failure after a successful operation" test_run_write_locked_reports_release_failure
 run_test "AnyTLS emits Surge Proxy = anytls" test_anytls_surge_output
 run_test "IPv6-only protocol outputs always use a bracketed primary host" test_ipv6_only_protocol_outputs
