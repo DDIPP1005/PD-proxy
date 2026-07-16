@@ -422,6 +422,62 @@ test_lock_symlink_rejected() {
     [ -L "$link" ]
 }
 
+test_run_write_locked_isolates_errexit_and_releases() {
+    local marker="$TEST_ROOT/locked-after-false" releases="$TEST_ROOT/lock-releases" rc e_was_preserved
+    write_lock_acquire() { _PD_LOCK_DEPTH=1; }
+    write_lock_release() { _PD_LOCK_DEPTH=0; printf 'released\n' >> "$releases"; }
+    locked_failure() {
+        false
+        : > "$marker"
+    }
+
+    set -e
+    if run_write_locked locked_failure; then
+        return 1
+    else
+        rc=$?
+    fi
+    [ "$rc" -ne 0 ]
+    [[ $- == *e* ]]
+    [ ! -e "$marker" ]
+    [ "$_PD_LOCK_DEPTH" -eq 0 ]
+
+    set +e
+    run_write_locked locked_failure
+    rc=$?
+    [[ $- == *e* ]] && e_was_preserved=0 || e_was_preserved=1
+    set -e
+    [ "$rc" -ne 0 ]
+    [ "$e_was_preserved" -eq 1 ]
+    [ ! -e "$marker" ]
+    [ "$_PD_LOCK_DEPTH" -eq 0 ]
+    [ "$(wc -l < "$releases" | tr -d ' ')" -eq 2 ]
+}
+
+test_run_write_locked_reports_release_failure() {
+    local rc e_was_preserved
+    write_lock_acquire() { _PD_LOCK_DEPTH=1; }
+    write_lock_release() { _PD_LOCK_DEPTH=0; return 37; }
+    locked_success() { return 0; }
+    locked_failure_code() { return 23; }
+
+    set +e
+    run_write_locked locked_success >/dev/null 2>&1
+    rc=$?
+    [[ $- == *e* ]] && e_was_preserved=0 || e_was_preserved=1
+    set -e
+    [ "$rc" -eq 37 ]
+    [ "$e_was_preserved" -eq 1 ]
+    [ "$_PD_LOCK_DEPTH" -eq 0 ]
+
+    set +e
+    run_write_locked locked_failure_code >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -eq 23 ]
+    [ "$_PD_LOCK_DEPTH" -eq 0 ]
+}
+
 test_anytls_surge_output() {
     local dir="$TEST_ROOT/anytls-output" output
     pdir() { echo "$dir"; }
@@ -600,6 +656,7 @@ test_service_listener_uses_ss_family_filters() {
         echo 4242
     }
     bindv6only_value() { echo "$TEST_BINDONLY"; }
+    bindv6only_confirmed_value() { echo "$TEST_BINDONLY"; }
     ss() {
         case " $* " in
             *' -4 '*) [ -z "$TEST_SS4" ] || printf '%s\n' "$TEST_SS4" ;;
@@ -697,6 +754,90 @@ test_doctor_checks_each_owned_iptables_family() {
     doctor_firewall anytls
     [ "$status" = ok ]
     grep -q 'legacy-ipv4' <<< "$message"
+}
+
+test_doctor_confirmed_family_drift_fails_json() {
+    local dir="$TEST_ROOT/doctor-drift" output rc
+    local ALL_PROTOS=anytls
+    TEST_DOCTOR_DIR="$dir"
+    mkdir -p "$dir" "$SYSTEMD_DIR"
+    printf '#!/bin/sh\n' > "$dir/anytls-server"
+    chmod +x "$dir/anytls-server"
+    printf '[Unit]\nDescription=PD-proxy: AnyTLS\n' > "$SYSTEMD_DIR/anytls.service"
+
+    id() { [ "${1:-}" = -u ] && echo 0 || return 1; }
+    uname() { [ "${1:-}" = -m ] && echo x86_64 || command uname "$@"; }
+    sysctl() { [ "${1:-}" = -n ] && echo bbr || return 1; }
+    systemctl() {
+        case "${1:-}" in
+            is-active) return 0 ;;
+            is-system-running) echo running ;;
+            *) return 1 ;;
+        esac
+    }
+    state_installed() { [ "$1" = anytls ]; }
+    state_get() {
+        case "$2" in
+            port) echo 443 ;;
+            listen_ipv4) echo 1 ;;
+            listen_ipv6) echo 0 ;;
+        esac
+    }
+    pkey() { echo anytls; }
+    psvc() { echo anytls; }
+    pdir() { echo "$TEST_DOCTOR_DIR"; }
+    pbin() { echo "$TEST_DOCTOR_DIR/anytls-server"; }
+    unit_is_pd_owned() { return 0; }
+    service_port_listening() { return 0; }
+    service_port_family_probe() { [ "$4" = ipv4 ] && echo 0 || echo 1; }
+    doctor_firewall() { doctor_add anytls.firewall warn "mock firewall"; }
+    get_ip() { IP=203.0.113.1; IP6=""; PUBLIC_HOST=""; }
+
+    set +e
+    output=$(doctor_run 1)
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ]
+    grep -q '"ok":false' <<< "$output"
+    grep -q '"id":"anytls.family","status":"fail"' <<< "$output"
+}
+
+test_doctor_unconfirmed_family_probe_warns() {
+    local dir="$TEST_ROOT/doctor-unconfirmed" family_status="" family_message=""
+    TEST_DOCTOR_DIR="$dir"
+    mkdir -p "$dir" "$SYSTEMD_DIR"
+    printf '#!/bin/sh\n' > "$dir/anytls-server"
+    chmod +x "$dir/anytls-server"
+    printf '[Unit]\nDescription=PD-proxy: AnyTLS\n' > "$SYSTEMD_DIR/anytls.service"
+
+    id() { [ "${1:-}" = -u ] && echo 0 || return 1; }
+    systemctl() { [ "${1:-}" = is-active ]; }
+    state_installed() { return 0; }
+    state_get() {
+        case "$2" in
+            port) echo 443 ;;
+            listen_ipv4) echo 1 ;;
+            listen_ipv6) echo 0 ;;
+        esac
+    }
+    pkey() { echo anytls; }
+    psvc() { echo anytls; }
+    pdir() { echo "$TEST_DOCTOR_DIR"; }
+    pbin() { echo "$TEST_DOCTOR_DIR/anytls-server"; }
+    unit_is_pd_owned() { return 0; }
+    service_port_listening() { return 0; }
+    service_port_family_probe() { return 2; }
+    doctor_firewall() { :; }
+    doctor_add() {
+        if [ "$1" = anytls.family ]; then
+            family_status=$2
+            family_message=$3
+        fi
+    }
+
+    doctor_protocol anytls
+    [ "$family_status" = warn ]
+    grep -q '无法可靠确认' <<< "$family_message"
 }
 
 test_shadowtls_log_reads_both_units() {
@@ -964,6 +1105,8 @@ run_test "backup creation failure stops upgrade before service stop" test_upgrad
 run_test "foreign same-name resources are preserved" test_unknown_resource_protection
 run_test "atomic state writer rejects symlinks" test_state_symlink_rejected
 run_test "write lock rejects symlink paths" test_lock_symlink_rejected
+run_test "write lock isolates errexit and preserves caller state" test_run_write_locked_isolates_errexit_and_releases
+run_test "write lock reports release failure after a successful operation" test_run_write_locked_reports_release_failure
 run_test "AnyTLS emits Surge Proxy = anytls" test_anytls_surge_output
 run_test "IPv6-only protocol outputs always use a bracketed primary host" test_ipv6_only_protocol_outputs
 run_test "dual-stack output keeps one primary and one IPv6 addition" test_dual_stack_output_is_not_duplicated
@@ -976,6 +1119,8 @@ run_test "listen-family auto handles bindv6only" test_listen_family_respects_bin
 run_test "service listeners use ss address-family filters" test_service_listener_uses_ss_family_filters
 run_test "verified address families are persisted" test_verified_families_are_recorded_and_enforced
 run_test "doctor checks every owned iptables family" test_doctor_checks_each_owned_iptables_family
+run_test "doctor JSON fails on confirmed listen-family drift" test_doctor_confirmed_family_drift_fails_json
+run_test "doctor warns when listen families cannot be confirmed" test_doctor_unconfirmed_family_probe_warns
 run_test "Snell logs include both ShadowTLS layers" test_shadowtls_log_reads_both_units
 run_test "stop failures never report a stopped service" test_stop_service_failure_paths
 run_test "start verification failures never report a started service" test_start_service_failure_paths

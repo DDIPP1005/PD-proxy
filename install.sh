@@ -310,13 +310,34 @@ write_lock_release() {
 }
 
 run_write_locked() {
-    local rc
-    write_lock_acquire
+    local rc release_rc=0 had_errexit=0 ignored tmp_start=${#_PD_TMPFILES[@]}
+    [[ $- == *e* ]] && had_errexit=1
+
+    # Keep the operation out of the caller's conditional/errexit context.
+    # Bash disables errexit throughout a function called from if/||, and a
+    # plain subshell inherits that suppression.  A command substitution is a
+    # fresh execution context; fd 3 preserves the operation's normal stdout.
     set +e
-    "$@"
+    write_lock_acquire
     rc=$?
-    set -e
-    write_lock_release || { err "释放写锁失败"; [ "$rc" -ne 0 ] || rc=1; }
+    if [ "$rc" -eq 0 ]; then
+        {
+            ignored=$(
+                trap 'cleanup_tmpfiles_from "$tmp_start"' EXIT
+                set -e
+                "$@" >&3
+            )
+            rc=$?
+        } 3>&1
+
+        write_lock_release
+        release_rc=$?
+        if [ "$release_rc" -ne 0 ]; then
+            err "释放写锁失败"
+            [ "$rc" -ne 0 ] || rc=$release_rc
+        fi
+    fi
+    [ "$had_errexit" -eq 0 ] || set -e
     return "$rc"
 }
 
@@ -906,13 +927,28 @@ service_port_listening() {
     '
 }
 
-service_port_family_listening() {
-    local port="$1" transport="$2" service="$3" family="$4" flag family_flag pid bindonly
+bindv6only_confirmed_value() {
+    local value
+    if value=$(sysctl -n net.ipv6.bindv6only 2>/dev/null); then
+        :
+    elif value=$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null); then
+        :
+    else
+        return 1
+    fi
+    case "$value" in 0|1) printf '%s\n' "$value" ;; *) return 1 ;; esac
+}
+
+# Print 1/0 when the family can be reliably confirmed as listening/not
+# listening.  Return nonzero when process/socket visibility is insufficient.
+service_port_family_probe() {
+    local port="$1" transport="$2" service="$3" family="$4" flag family_flag pid bindonly sockets
     case "$transport" in tcp) flag=-ltnp ;; udp) flag=-lunp ;; *) return 2 ;; esac
     case "$family" in ipv4) family_flag=-4 ;; ipv6) family_flag=-6 ;; *) return 2 ;; esac
-    pid=$(systemctl show -p MainPID --value "$service" 2>/dev/null) || return 1
-    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-    if ss -H "$family_flag" "$flag" 2>/dev/null | awk -v port="$port" -v pid="$pid" '
+    pid=$(systemctl show -p MainPID --value "$service" 2>/dev/null) || return 2
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 2
+    sockets=$(ss -H "$family_flag" "$flag" 2>/dev/null) || return 2
+    if printf '%s\n' "$sockets" | awk -v port="$port" -v pid="$pid" '
         {
             addr=$4
             marker="pid=" pid "([,)]|$)"
@@ -921,14 +957,17 @@ service_port_family_listening() {
         }
         END { exit found ? 0 : 1 }
     '; then
+        printf '1\n'
         return 0
     fi
-    [ "$family" = ipv4 ] || return 1
-    bindonly=$(bindv6only_value)
-    [ "$bindonly" = 0 ] || return 1
+    if [ "$family" != ipv4 ]; then
+        printf '0\n'
+        return 0
+    fi
     # An IPv6 wildcard socket also accepts IPv4 when bindv6only=0.  The -6
     # filter makes ambiguous ss output such as *:443 unambiguously IPv6 here.
-    ss -H -6 "$flag" 2>/dev/null | awk -v port="$port" -v pid="$pid" '
+    sockets=$(ss -H -6 "$flag" 2>/dev/null) || return 2
+    if printf '%s\n' "$sockets" | awk -v port="$port" -v pid="$pid" '
         {
             addr=$4
             marker="pid=" pid "([,)]|$)"
@@ -936,7 +975,18 @@ service_port_family_listening() {
             if (addr ~ /^\[::\]:/ || addr ~ /^:::/ || addr ~ /^\*:/) found=1
         }
         END { exit found ? 0 : 1 }
-    '
+    '; then
+        bindonly=$(bindv6only_confirmed_value) || return 2
+        [ "$bindonly" = 0 ] && printf '1\n' || printf '0\n'
+    else
+        printf '0\n'
+    fi
+}
+
+service_port_family_listening() {
+    local actual
+    actual=$(service_port_family_probe "$@") || return $?
+    [ "$actual" = 1 ]
 }
 
 verify_and_record_listen_families() {
@@ -4377,7 +4427,8 @@ doctor_firewall() {
 }
 
 doctor_protocol() {
-    local proto="$1" key svc public_svc dir bin port transport active=0 recorded4 recorded6 actual4=0 actual6=0
+    local proto="$1" key svc public_svc dir bin port transport active=0 port_valid=0 listening=0
+    local recorded4 recorded6 actual4=0 actual6=0 probe4 probe6 family_confirmed=0
     key=$(pkey "$proto"); svc=$(psvc "$proto"); dir=$(pdir "$proto"); bin=$(pbin "$proto")
     public_svc="$svc"
     state_installed "$key" || return 0
@@ -4392,19 +4443,35 @@ doctor_protocol() {
     port=$(state_get "$key" port 2>/dev/null || true)
     transport=$(protocol_transport "$proto")
     [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && public_svc=shadowtls-snell
-    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$active" = 1 ] && service_port_listening "$port" "$transport" "$public_svc"; then
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+        port_valid=1
+    fi
+    if [ "$port_valid" = 1 ] && [ "$active" = 1 ] && service_port_listening "$port" "$transport" "$public_svc"; then
+        listening=1
         doctor_add "${key}.listen" ok "$port/$transport 由 $public_svc 监听"
     else
         doctor_add "${key}.listen" fail "端口状态无效或未由 $public_svc 监听"
     fi
     recorded4=$(state_get "$key" listen_ipv4 2>/dev/null || true)
     recorded6=$(state_get "$key" listen_ipv6 2>/dev/null || true)
-    [ "$active" = 1 ] && service_port_family_listening "$port" "$transport" "$public_svc" ipv4 && actual4=1
-    [ "$active" = 1 ] && service_port_family_listening "$port" "$transport" "$public_svc" ipv6 && actual6=1
-    if [ -n "$recorded4$recorded6" ] && [ "${recorded4:-0}" = "$actual4" ] && [ "${recorded6:-0}" = "$actual6" ]; then
-        doctor_add "${key}.family" ok "监听族与状态一致（IPv4=$actual4 IPv6=$actual6）"
+    if [ "$(id -u)" = 0 ] && [ "$active" = 1 ] && [ "$port_valid" = 1 ] && [ "$listening" = 1 ]; then
+        if probe4=$(service_port_family_probe "$port" "$transport" "$public_svc" ipv4) \
+            && probe6=$(service_port_family_probe "$port" "$transport" "$public_svc" ipv6); then
+            actual4=$probe4
+            actual6=$probe6
+            family_confirmed=1
+        fi
+    fi
+    if [[ "$recorded4" =~ ^[01]$ ]] && [[ "$recorded6" =~ ^[01]$ ]]; then
+        if [ "$family_confirmed" = 0 ]; then
+            doctor_add "${key}.family" warn "无法可靠确认监听族（记录 IPv4=${recorded4} IPv6=${recorded6}）"
+        elif [ "$recorded4" = "$actual4" ] && [ "$recorded6" = "$actual6" ]; then
+            doctor_add "${key}.family" ok "监听族与状态一致（IPv4=${actual4} IPv6=${actual6}）"
+        else
+            doctor_add "${key}.family" fail "监听族与状态不一致（记录 IPv4=${recorded4} IPv6=${recorded6}；实际 IPv4=${actual4} IPv6=${actual6}）"
+        fi
     else
-        doctor_add "${key}.family" warn "监听族状态缺失或不一致（记录 IPv4=${recorded4:-?} IPv6=${recorded6:-?}；实际 IPv4=$actual4 IPv6=$actual6）"
+        doctor_add "${key}.family" warn "监听族状态缺失或无效（记录 IPv4=${recorded4:-?} IPv6=${recorded6:-?}）"
     fi
     doctor_firewall "$key"
     if [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
