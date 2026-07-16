@@ -236,6 +236,119 @@ test_anytls_surge_output() {
     grep -q '^Proxy = anytls, 203\.0\.113\.10, 443, password=secret$' <<< "$output"
 }
 
+test_ipv6_only_protocol_outputs() {
+    local dir="$TEST_ROOT/ipv6-outputs" ipv6="2001:db8::42"
+    local snell_standard snell_shadow hy2_single hy2_hop vless anytls all_output
+    mkdir -p "$dir/snell" "$dir/hy2" "$dir/vless" "$dir/anytls" "$dir/systemd"
+    printf public-key > "$dir/vless/.pubkey"
+    printf short-id > "$dir/vless/.shortid"
+    printf 'addons.mozilla.org:443' > "$dir/vless/.dest"
+    printf tcp > "$dir/vless/.transport"
+    printf chrome > "$dir/vless/.fp"
+    printf standard > "$dir/anytls/.padding"
+
+    pdir() { echo "$dir/$1"; }
+    output_header() { :; }
+    output_footer() { :; }
+    gen_qr() { printf 'QR: %s\n' "$1"; }
+    state_get() {
+        case "$2" in
+            listen_ipv4) echo 0 ;;
+            listen_ipv6) echo 1 ;;
+            hop) echo "${TEST_HY2_HOP:-0}" ;;
+            *) echo "" ;;
+        esac
+    }
+    snell_shadowtls_unit_values() {
+        [ "${TEST_SNELL_SHADOW:-0}" = 1 ] || return 1
+        printf 'tls-secret\ntls.example.com:443\n3\n'
+    }
+
+    PUBLIC_HOST=""; IP=""; IP6="$ipv6"
+    SYSTEMD_DIR="$dir/systemd"
+
+    snell_standard=$(snell_output 443 snell-secret)
+    TEST_SNELL_SHADOW=1
+    printf '[Unit]\nDescription=PD-proxy: ShadowTLS\n' > "$SYSTEMD_DIR/shadowtls-snell.service"
+    snell_shadow=$(snell_output 444 snell-secret)
+
+    TEST_HY2_HOP=0
+    hy2_single=$(hy2_output 8443 hy2-secret)
+    TEST_HY2_HOP=3
+    hy2_hop=$(hy2_output 9443 hy2-secret)
+    vless=$(vless_output 10443 00000000-0000-0000-0000-000000000001)
+    anytls=$(anytls_output 11443 anytls-secret)
+
+    all_output=$(printf '%s\n%s\n%s\n%s\n%s\n%s\n' \
+        "$snell_standard" "$snell_shadow" "$hy2_single" "$hy2_hop" "$vless" "$anytls")
+
+    ! grep -Eq '@:[0-9]' <<< "$all_output"
+    ! grep -Eq ',[[:space:]]*,[[:space:]]*[0-9]' <<< "$all_output"
+    ! grep -q -- '-IPv6' <<< "$all_output"
+
+    grep -Fq "Proxy = snell, [$ipv6], 443, psk=snell-secret, version=5" <<< "$snell_standard"
+    grep -Fq "Proxy = snell, [$ipv6], 444, psk=snell-secret, version=4" <<< "$snell_shadow"
+    grep -Fq "Proxy = hysteria2, [$ipv6], 8443, password=hy2-secret" <<< "$hy2_single"
+    grep -Fq "QR: hysteria2://hy2-secret@[$ipv6]:8443?" <<< "$hy2_single"
+    grep -Fq "Proxy = hysteria2, [$ipv6], 9443-9445, password=hy2-secret" <<< "$hy2_hop"
+    grep -Fq "QR: hysteria2://hy2-secret@[$ipv6]:9443?" <<< "$hy2_hop"
+    grep -Fq "QR: vless://00000000-0000-0000-0000-000000000001@[$ipv6]:10443?" <<< "$vless"
+    grep -Fq "vless://00000000-0000-0000-0000-000000000001@[$ipv6]:10443?" <<< "$vless"
+    grep -Fq "Proxy = anytls, [$ipv6], 11443, password=anytls-secret" <<< "$anytls"
+    grep -Fq "QR: anytls://anytls-secret@[$ipv6]:11443" <<< "$anytls"
+    grep -Fq "anytls://anytls-secret@[$ipv6]:11443" <<< "$anytls"
+}
+
+test_dual_stack_output_is_not_duplicated() {
+    local dir="$TEST_ROOT/dual-output" output
+    mkdir -p "$dir"
+    printf standard > "$dir/.padding"
+    pdir() { echo "$dir"; }
+    state_get() {
+        case "$2" in listen_ipv4|listen_ipv6) echo 1 ;; *) echo 0 ;; esac
+    }
+    output_header() { :; }; output_footer() { :; }; gen_qr() { :; }
+    PUBLIC_HOST=""; IP=203.0.113.10; IP6=2001:db8::10
+    output=$(anytls_output 443 secret)
+    [ "$(grep -c '^Proxy = anytls, 203\.0\.113\.10, 443' <<< "$output")" -eq 1 ]
+    [ "$(grep -c '^Proxy-IPv6 = anytls, \[2001:db8::10\], 443' <<< "$output")" -eq 1 ]
+    [ "$(grep -c '^anytls://secret@203\.0\.113\.10:443' <<< "$output")" -eq 1 ]
+    [ "$(grep -c '^anytls://secret@\[2001:db8::10\]:443' <<< "$output")" -eq 1 ]
+}
+
+test_uninstall_failure_exit_is_preserved() {
+    local script="$TEST_ROOT/uninstall-cli.sh" output rc
+    awk '
+        /^check_root\(\) \{/ {
+            print "check_root() { :; }"
+            skip=1
+            next
+        }
+        /^detect_os\(\) \{/ {
+            print "detect_os() { :; }"
+            skip=1
+            next
+        }
+        /^run_write_locked\(\) \{/ {
+            print "run_write_locked() { return 23; }"
+            skip=1
+            next
+        }
+        skip {
+            if ($0 == "}") skip=0
+            next
+        }
+        { print }
+    ' "$TEST_SCRIPT" > "$script"
+    chmod +x "$script"
+    set +e
+    output=$(PD_TEST_MODE=0 "$script" --uninstall anytls 2>&1)
+    rc=$?
+    set -e
+    [ "$rc" -eq 23 ]
+    [ -z "$output" ]
+}
+
 test_ip_https_consensus_and_overrides() {
     local calls="$TEST_ROOT/ip-calls" output rc
     curl_https() {
@@ -404,6 +517,9 @@ run_test "foreign same-name resources are preserved" test_unknown_resource_prote
 run_test "atomic state writer rejects symlinks" test_state_symlink_rejected
 run_test "write lock rejects symlink paths" test_lock_symlink_rejected
 run_test "AnyTLS emits Surge Proxy = anytls" test_anytls_surge_output
+run_test "IPv6-only protocol outputs always use a bracketed primary host" test_ipv6_only_protocol_outputs
+run_test "dual-stack output keeps one primary and one IPv6 addition" test_dual_stack_output_is_not_duplicated
+run_test "uninstall CLI preserves a failing operation exit code" test_uninstall_failure_exit_is_preserved
 run_test "unknown CLI parameters have a reserved rejection test" test_unknown_cli_parameter_framework
 run_test "public IP discovery is HTTPS-consistent and supports overrides" test_ip_https_consensus_and_overrides
 run_test "unknown public endpoints never generate configuration" test_no_unknown_endpoint_output

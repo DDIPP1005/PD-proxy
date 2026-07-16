@@ -485,10 +485,21 @@ output_hosts() {
         err "没有与实际监听地址族匹配的已验证公网地址，拒绝生成配置"
         return 1
     }
-    if [ -z "$OUTPUT_HOST4" ]; then
-        OUTPUT_HOST4="$OUTPUT_HOST6"
+}
+
+select_output_hosts() {
+    local key="$1"
+    output_hosts "$key" || return 1
+    if [ -z "${OUTPUT_HOST4:-}" ]; then
+        OUTPUT_HOST4="${OUTPUT_HOST6:-}"
+        OUTPUT_HOST6=""
+    elif [ "${OUTPUT_HOST6:-}" = "$OUTPUT_HOST4" ]; then
         OUTPUT_HOST6=""
     fi
+    [ -n "${OUTPUT_HOST4:-}" ] || {
+        err "没有可用的主输出地址，拒绝生成配置"
+        return 1
+    }
 }
 
 format_proxy_host() {
@@ -1969,7 +1980,7 @@ snell_output() {
     fi
     if [ -n "$tls_pass" ]; then
         local host4 host6
-        output_hosts snell || return 1
+        select_output_hosts snell || return 1
         host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
         output_header "Snell v4 + ShadowTLS" "$port"
         echo -e "PSK:     ${GREEN}${psk}${RESET}"
@@ -1987,7 +1998,7 @@ snell_output() {
         output_footer
     else
         local host4 host6
-        output_hosts snell || return 1
+        select_output_hosts snell || return 1
         host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
         output_header "Snell v5" "$port"
         echo -e "PSK:    ${GREEN}${psk}${RESET}"
@@ -2245,7 +2256,7 @@ hy2_service_args() {
 hy2_output() {
     local port="$1" pass="$2"
     local host4 host6
-    output_hosts hy2 || return 1
+    select_output_hosts hy2 || return 1
     host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
     output_header "Hysteria2" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
@@ -2386,7 +2397,7 @@ vless_output() {
     fp=$(cat "$(pdir vless)/.fp" 2>/dev/null || echo "chrome")
     local dest_host="${dest%:*}"
     local host4 host6 link link6
-    output_hosts vless || return 1
+    select_output_hosts vless || return 1
     host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
     link="vless://${uuid}@${host4}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS"
     [ -n "$host6" ] && link6="vless://${uuid}@${host6}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS-IPv6"
@@ -2471,7 +2482,7 @@ anytls_output() {
     sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
 
     local host4 host6 query="" link link6
-    output_hosts anytls || return 1
+    select_output_hosts anytls || return 1
     host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
     [ -n "$sni" ] && query="?sni=$(url_escape "$sni")&insecure=1"
     link="anytls://${pass}@${host4}:${port}${query}#PD-AnyTLS"
@@ -2961,7 +2972,7 @@ show_config_only() {
             psk=$(conf_value "psk" "$(pdir snell)/snell.conf" || echo "")
             [ -n "$psk" ] || { err "Snell PSK 缺失，拒绝生成配置"; return 1; }
             local host4 host6
-            output_hosts snell || return 1
+            select_output_hosts snell || return 1
             host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
             local tls_values=""
             tls_values=$(snell_shadowtls_unit_values 2>/dev/null || true)
@@ -2985,7 +2996,7 @@ show_config_only() {
             pass=$(yaml_value "password" "$(pdir hy2)/config.yaml" || echo "")
             [ -n "$pass" ] || { err "Hysteria2 密码缺失，拒绝生成配置"; return 1; }
             hop=$(state_get "$key" "hop")
-            output_hosts hy2 || return 1
+            select_output_hosts hy2 || return 1
             host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
             if [ "$hop" -ge 3 ] 2>/dev/null; then
                 local last_port=$((port + hop - 1))
@@ -3009,7 +3020,7 @@ show_config_only() {
             [ -n "$uuid" ] && [ -n "$pubkey" ] && [ -n "$shortid" ] \
                 || { err "VLESS 凭据不完整，拒绝生成配置"; return 1; }
             dest_host="${dest%:*}"
-            output_hosts vless || return 1
+            select_output_hosts vless || return 1
             host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
             echo "# Surge 不支持 VLESS"
             echo "vless://${uuid}@${host4}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS"
@@ -3020,7 +3031,7 @@ show_config_only() {
             [ -n "$pass" ] || { err "AnyTLS 密码缺失，拒绝生成配置"; return 1; }
             padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
             sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
-            output_hosts anytls || return 1
+            select_output_hosts anytls || return 1
             host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
             echo "Proxy = anytls, ${host4}, ${port}, password=${pass}"
             [ -n "$host6" ] && echo "Proxy-IPv6 = anytls, ${host6}, ${port}, password=${pass}"
@@ -4357,7 +4368,7 @@ case "${1:-}" in
         case "${2:-}" in
             all|--all) check_root; run_write_locked remove_all; exit $? ;;
         esac
-        cli_dispatch uninstall "${2:-}" ; exit 0 ;;
+        cli_dispatch uninstall "${2:-}" ; exit $? ;;
     --upgrade|-u)  cli_dispatch upgrade  "${2:-}" ; exit $? ;;
     --restart)     cli_dispatch restart  "${2:-}" ; exit $? ;;
     --stop)        cli_dispatch stop     "${2:-}" ; exit $? ;;
