@@ -412,6 +412,142 @@ test_shadowtls_log_reads_both_units() {
     grep -q -- '-u snell -u shadowtls-snell' "$calls"
 }
 
+test_stop_service_failure_paths() {
+    local output rc TEST_STOP_FAIL="" TEST_ACTIVE_SERVICE="" TEST_CLEAR_FAIL=0
+    mkdir -p "$SYSTEMD_DIR"
+    printf '[Unit]\nDescription=PD-proxy: ShadowTLS\n' > "$SYSTEMD_DIR/shadowtls-snell.service"
+    pkey() { echo "$1"; }
+    psvc() { [ "$1" = hy2 ] && echo hysteria2 || echo "$1"; }
+    pname() { [ "$1" = snell ] && echo Snell || echo Hysteria2; }
+    state_installed() { return 0; }
+    clear_hy2_hop_rules() { [ "$TEST_CLEAR_FAIL" -eq 0 ]; }
+    systemctl() {
+        case "${1:-}" in
+            stop) [ "${2:-}" != "$TEST_STOP_FAIL" ] ;;
+            is-active) [ "${3:-}" = "$TEST_ACTIVE_SERVICE" ] ;;
+            *) return 0 ;;
+        esac
+    }
+    assert_stop_failure() {
+        local proto="$1" success="$2"
+        set +e
+        output=$(stop_service "$proto" 2>&1)
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] && ! grep -Fq "$success" <<< "$output"
+    }
+
+    TEST_STOP_FAIL=shadowtls-snell
+    assert_stop_failure snell 'Snell 已停止'
+    TEST_STOP_FAIL=snell
+    assert_stop_failure snell 'Snell 已停止'
+    TEST_STOP_FAIL=""; TEST_ACTIVE_SERVICE=snell
+    assert_stop_failure snell 'Snell 已停止'
+    TEST_ACTIVE_SERVICE=""; TEST_CLEAR_FAIL=1
+    assert_stop_failure hy2 'Hysteria2 已停止'
+}
+
+test_start_service_failure_paths() {
+    local output rc calls="$TEST_ROOT/start-service-calls"
+    local TEST_SETUP_FAIL=0 TEST_HOP_FAIL=0 TEST_PORT_FAIL=0 TEST_STACK_FAIL=0 TEST_FAMILY_FAIL=0
+    mkdir -p "$SYSTEMD_DIR"
+    printf '[Unit]\nDescription=PD-proxy: ShadowTLS\n' > "$SYSTEMD_DIR/shadowtls-snell.service"
+    pkey() { echo "$1"; }
+    psvc() { [ "$1" = hy2 ] && echo hysteria2 || echo "$1"; }
+    pname() { case "$1" in snell) echo Snell ;; hy2) echo Hysteria2 ;; *) echo AnyTLS ;; esac; }
+    pdir() { echo "$TEST_ROOT/$1"; }
+    state_installed() { return 0; }
+    state_get() {
+        case "$2" in
+            port) [ "$1" = snell ] && echo 443 || echo 30000 ;;
+            hop) [ "$1" = hy2 ] && echo 3 || echo 0 ;;
+            listen_family) echo auto ;;
+        esac
+    }
+    conf_value() { echo 127.0.0.1:53000; }
+    systemctl() { [ "${1:-}" = start ]; }
+    setup_hy2_hop_rules() { printf 'setup\n' >> "$calls"; [ "$TEST_SETUP_FAIL" -eq 0 ]; }
+    verify_hy2_hop() { printf 'hop\n' >> "$calls"; [ "$TEST_HOP_FAIL" -eq 0 ]; }
+    verify_port() { printf 'port %s %s %s\n' "$1" "$2" "$3" >> "$calls"; [ "$TEST_PORT_FAIL" -eq 0 ]; }
+    verify_shadowtls_stack() { printf 'stack %s %s\n' "$1" "$2" >> "$calls"; [ "$TEST_STACK_FAIL" -eq 0 ]; }
+    verify_and_record_listen_families() { printf 'family\n' >> "$calls"; [ "$TEST_FAMILY_FAIL" -eq 0 ]; }
+    assert_start_failure() {
+        local proto="$1" success="$2"
+        set +e
+        output=$(start_service "$proto" 2>&1)
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] && ! grep -Fq "$success" <<< "$output"
+    }
+
+    TEST_SETUP_FAIL=1
+    assert_start_failure hy2 'Hysteria2 已启动'
+    ! grep -q '^hop$' "$calls"
+    : > "$calls"; TEST_SETUP_FAIL=0; TEST_HOP_FAIL=1
+    assert_start_failure hy2 'Hysteria2 已启动'
+    grep -q '^hop$' "$calls"
+    : > "$calls"; TEST_HOP_FAIL=0; TEST_STACK_FAIL=1
+    assert_start_failure snell 'Snell 已启动'
+    grep -q '^stack 443 53000$' "$calls"
+    : > "$calls"; TEST_STACK_FAIL=0; TEST_PORT_FAIL=1
+    assert_start_failure anytls 'AnyTLS 已启动'
+    grep -q '^port 30000 anytls tcp$' "$calls"
+    : > "$calls"; TEST_PORT_FAIL=0; TEST_FAMILY_FAIL=1
+    assert_start_failure anytls 'AnyTLS 已启动'
+    grep -q '^family$' "$calls"
+}
+
+test_restart_service_failure_paths() {
+    local output rc calls="$TEST_ROOT/restart-service-calls" repair="$TEST_ROOT/restart-repair-called"
+    local TEST_SETUP_FAIL=0 TEST_HOP_FAIL=0 TEST_STACK_FAIL=0 TEST_FAMILY_FAIL=0
+    mkdir -p "$SYSTEMD_DIR"
+    printf '[Unit]\nDescription=PD-proxy: ShadowTLS\n' > "$SYSTEMD_DIR/shadowtls-snell.service"
+    pkey() { echo "$1"; }
+    psvc() { [ "$1" = hy2 ] && echo hysteria2 || echo "$1"; }
+    pname() { case "$1" in snell) echo Snell ;; hy2) echo Hysteria2 ;; *) echo AnyTLS ;; esac; }
+    pdir() { echo "$TEST_ROOT/$1"; }
+    state_installed() { return 0; }
+    state_get() {
+        case "$2" in
+            port) [ "$1" = snell ] && echo 443 || echo 30000 ;;
+            hop) [ "$1" = hy2 ] && echo 3 || echo 0 ;;
+            listen_family) echo auto ;;
+        esac
+    }
+    conf_value() { echo 127.0.0.1:53000; }
+    systemctl() { [ "${1:-}" = restart ]; }
+    setup_hy2_hop_rules() { printf 'setup\n' >> "$calls"; [ "$TEST_SETUP_FAIL" -eq 0 ]; }
+    verify_hy2_hop() { printf 'hop\n' >> "$calls"; [ "$TEST_HOP_FAIL" -eq 0 ]; }
+    verify_port() { return 0; }
+    verify_shadowtls_stack() { printf 'stack %s %s\n' "$1" "$2" >> "$calls"; [ "$TEST_STACK_FAIL" -eq 0 ]; }
+    verify_and_record_listen_families() { printf 'family\n' >> "$calls"; [ "$TEST_FAMILY_FAIL" -eq 0 ]; }
+    repair_snell_ipv6() { : > "$repair"; }
+    repair_vless_ipv6() { : > "$repair"; }
+    repair_anytls_ipv6() { : > "$repair"; }
+    assert_restart_failure() {
+        local proto="$1" success="$2"
+        set +e
+        output=$(restart_service "$proto" 2>&1)
+        rc=$?
+        set -e
+        [ "$rc" -ne 0 ] && ! grep -Fq "$success" <<< "$output"
+    }
+
+    TEST_SETUP_FAIL=1
+    assert_restart_failure hy2 'Hysteria2 已重启'
+    ! grep -q '^hop$' "$calls"
+    : > "$calls"; TEST_SETUP_FAIL=0; TEST_HOP_FAIL=1
+    assert_restart_failure hy2 'Hysteria2 已重启'
+    grep -q '^hop$' "$calls"
+    : > "$calls"; TEST_HOP_FAIL=0; TEST_STACK_FAIL=1
+    assert_restart_failure snell 'Snell 已重启'
+    grep -q '^stack 443 53000$' "$calls"
+    : > "$calls"; TEST_STACK_FAIL=0; TEST_FAMILY_FAIL=1
+    assert_restart_failure anytls 'AnyTLS 已重启'
+    grep -q '^family$' "$calls"
+    [ ! -e "$repair" ]
+}
+
 test_checksum_strict_mode_rejects_missing_digest() {
     local f="$TEST_ROOT/no-digest"
     printf data > "$f"
@@ -527,6 +663,9 @@ run_test "extra CLI arguments exit 2 before privileged work" test_cli_arity_is_e
 run_test "listen-family auto handles bindv6only" test_listen_family_respects_bindv6only
 run_test "verified address families are persisted" test_verified_families_are_recorded_and_enforced
 run_test "Snell logs include both ShadowTLS layers" test_shadowtls_log_reads_both_units
+run_test "stop failures never report a stopped service" test_stop_service_failure_paths
+run_test "start verification failures never report a started service" test_start_service_failure_paths
+run_test "restart verification failures never report a restarted service" test_restart_service_failure_paths
 run_test "strict checksum mode rejects unavailable digests" test_checksum_strict_mode_rejects_missing_digest
 run_test "archive traversal paths are rejected" test_archive_traversal_is_rejected
 run_test "custom update URLs require a pinned SHA-256" test_custom_update_requires_sha256

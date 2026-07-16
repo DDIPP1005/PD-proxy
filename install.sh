@@ -1145,6 +1145,39 @@ verify_shadowtls_stack() {
     verify_port "$ext_port" shadowtls-snell tcp || return 1
 }
 
+verify_running_protocol() {
+    local proto="$1" key svc port transport public_svc stored_family inner_port hop
+    key=$(pkey "$proto")
+    svc=$(psvc "$proto")
+    port=$(state_get "$key" port) || return 1
+    [ -n "$port" ] || { err "$(pname "$proto") 端口状态缺失"; return 1; }
+
+    if [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
+        inner_port=$(conf_value listen "$(pdir snell)/snell.conf" | sed 's/.*://')
+        [ -n "$inner_port" ] || { err "Snell 内层监听端口缺失"; return 1; }
+        verify_shadowtls_stack "$port" "$inner_port" || return 1
+        public_svc=shadowtls-snell
+    elif [ "$proto" = hy2 ]; then
+        hop=$(state_get "$key" hop 2>/dev/null || true)
+        if [ "${hop:-0}" -ge 3 ] 2>/dev/null; then
+            verify_hy2_hop "$port" "$hop" || return 1
+        else
+            verify_port "$port" "$svc" udp || return 1
+        fi
+        public_svc="$svc"
+    else
+        transport=$(protocol_transport "$proto") || return 1
+        verify_port "$port" "$svc" "$transport" || return 1
+        public_svc="$svc"
+    fi
+
+    transport=$(protocol_transport "$proto") || return 1
+    stored_family=$(state_get "$key" listen_family 2>/dev/null || true)
+    [ -z "$stored_family" ] || PD_EFFECTIVE_LISTEN_FAMILY="$stored_family"
+    [ -n "${PD_EFFECTIVE_LISTEN_FAMILY:-}" ] || PD_EFFECTIVE_LISTEN_FAMILY=auto
+    verify_and_record_listen_families "$key" "$port" "$transport" "$public_svc"
+}
+
 save_iptables() {
     local tmp
     if command -v netfilter-persistent >/dev/null 2>&1; then
@@ -2866,13 +2899,6 @@ restart_service() {
         die "$(pname "$proto") 未安装"
     fi
     info "重启 $(pname "$proto") ..."
-    if [ "$proto" = "snell" ]; then
-        repair_snell_ipv6 || warn "Snell IPv6 监听修复失败，请检查配置"
-    elif [ "$proto" = "vless" ]; then
-        repair_vless_ipv6 || warn "VLESS IPv6 监听修复失败，请检查配置"
-    elif [ "$proto" = "anytls" ]; then
-        repair_anytls_ipv6 || warn "AnyTLS IPv6 监听修复失败，请检查配置"
-    fi
     systemctl restart "$svc" || die "重启失败: journalctl -u $svc -n 20"
     # Snell + ShadowTLS: Requires= 只传播 stop 不传播 start
     if [ "$proto" = "snell" ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
@@ -2883,18 +2909,10 @@ restart_service() {
         port=$(state_get "$key" "port")
         hop=$(state_get "$key" "hop")
         if [ "${hop:-0}" -ge 3 ] 2>/dev/null; then
-            setup_hy2_hop_rules "$port" "$hop" || warn "HY2 跳跃规则恢复失败"
+            setup_hy2_hop_rules "$port" "$hop" || die "HY2 跳跃规则恢复失败"
         fi
     fi
-    local verify_svc="$svc" verify_port_num
-    verify_port_num=$(state_get "$key" port)
-    [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && verify_svc=shadowtls-snell
-    local stored_family
-    stored_family=$(state_get "$key" listen_family 2>/dev/null || true)
-    [ -z "$stored_family" ] || PD_EFFECTIVE_LISTEN_FAMILY="$stored_family"
-    [ -n "${PD_EFFECTIVE_LISTEN_FAMILY:-}" ] || PD_EFFECTIVE_LISTEN_FAMILY=auto
-    verify_and_record_listen_families "$key" "$verify_port_num" "$(protocol_transport "$proto")" "$verify_svc" \
-        || die "重启后监听地址族验证失败"
+    verify_running_protocol "$proto" || die "重启后服务验证失败"
     info "$(pname "$proto") 已重启"
 }
 
@@ -2902,18 +2920,33 @@ stop_service() {
     local proto="$1"
     local key=$(pkey "$proto")
     local svc=$(psvc "$proto")
+    local failed=0 shadowtls=false
 
     if ! state_installed "$key"; then
         die "$(pname "$proto") 未安装"
     fi
     info "停止 $(pname "$proto") ..."
     if [ "$proto" = "snell" ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
-        systemctl stop shadowtls-snell 2>/dev/null || true
+        shadowtls=true
+        systemctl stop shadowtls-snell || { err "ShadowTLS 停止失败"; failed=1; }
     fi
     if [ "$proto" = "hy2" ]; then
-        clear_hy2_hop_rules
+        clear_hy2_hop_rules || failed=1
     fi
-    systemctl stop "$svc" || warn "停止失败"
+    systemctl stop "$svc" || { err "$(pname "$proto") 停止失败"; failed=1; }
+    if systemctl is-active --quiet "$svc" 2>/dev/null; then
+        err "服务 $svc 停止后仍处于 active 状态"
+        failed=1
+    fi
+    if $shadowtls && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
+        err "服务 shadowtls-snell 停止后仍处于 active 状态"
+        failed=1
+    fi
+    if [ "$proto" = hy2 ] && systemctl is-active --quiet pd-hy2-hop 2>/dev/null; then
+        err "服务 pd-hy2-hop 停止后仍处于 active 状态"
+        failed=1
+    fi
+    [ "$failed" -eq 0 ] || return 1
     info "$(pname "$proto") 已停止"
 }
 
@@ -2936,9 +2969,10 @@ start_service() {
         port=$(state_get "$key" "port")
         hop=$(state_get "$key" "hop")
         if [ "${hop:-0}" -ge 3 ] 2>/dev/null; then
-            setup_hy2_hop_rules "$port" "$hop" || warn "HY2 跳跃规则恢复失败"
+            setup_hy2_hop_rules "$port" "$hop" || die "HY2 跳跃规则恢复失败"
         fi
     fi
+    verify_running_protocol "$proto" || die "启动后服务验证失败"
     info "$(pname "$proto") 已启动"
 }
 
