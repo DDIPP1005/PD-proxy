@@ -28,8 +28,9 @@ source "$TEST_SCRIPT"
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || _PD_TMPFILES+=("")
 test_cleanup() {
     local rc=$?
-    cleanup_tmpfiles || true
-    rm -rf "$TEST_ROOT" || true
+    set +e
+    cleanup_tmpfiles
+    rm -rf "$TEST_ROOT"
     exit "$rc"
 }
 trap test_cleanup EXIT
@@ -39,9 +40,34 @@ failures=0
 
 pass() { echo "ok - $1"; passes=$((passes + 1)); }
 fail() { echo "not ok - $1" >&2; failures=$((failures + 1)); }
+run_test_subshell() {
+    local fn="$1"
+    (
+        set -e
+        "$fn"
+    )
+}
 run_test() {
-    local name="$1" fn="$2"
-    if ( "$fn" ); then pass "$name"; else fail "$name"; fi
+    local name="$1" fn="$2" rc had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+    set +e
+    run_test_subshell "$fn"
+    rc=$?
+    [ "$had_errexit" -eq 0 ] || set -e
+    if [ "$rc" -eq 0 ]; then pass "$name"; else fail "$name"; fi
+}
+
+test_framework_errexit_self_check() {
+    framework_false_then_true() {
+        false
+        true
+    }
+    local rc
+    set +e
+    run_test_subshell framework_false_then_true
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ]
 }
 
 test_transaction_control_flow() {
@@ -55,7 +81,8 @@ test_transaction_control_flow() {
     transaction_run fails_with_die >/dev/null 2>&1
     local rc=$?
     set -e
-    [ "$rc" -ne 0 ] && [ -f "$marker" ]
+    [ "$rc" -ne 0 ]
+    [ -f "$marker" ]
 }
 
 test_no_err_rollback_trap() {
@@ -65,7 +92,176 @@ test_no_err_rollback_trap() {
 test_mktemp_tracking() {
     local before=${#_PD_TMPFILES[@]} temp_file
     mktemp_pd temp_file
-    [ -f "$temp_file" ] && [ "${#_PD_TMPFILES[@]}" -eq $((before + 1)) ]
+    [ -f "$temp_file" ]
+    [ "${#_PD_TMPFILES[@]}" -eq $((before + 1)) ]
+}
+
+test_transaction_tmpfiles_are_scoped_and_cleaned() {
+    local tmp_root="$TEST_ROOT/transaction-tmp" snapshot rc
+    mkdir -p "$tmp_root"
+    TMPDIR="$tmp_root"
+    export TMPDIR
+
+    txn_make_success() {
+        local f d
+        mktemp_pd f
+        mktemp_dir_pd d
+        [ -f "$f" ]
+        [ -d "$d" ]
+    }
+    txn_make_failure() {
+        local f d
+        mktemp_pd f
+        mktemp_dir_pd d
+        [ -f "$f" ]
+        [ -d "$d" ]
+        return 23
+    }
+    transaction_commit() {
+        [ -d "$_PD_TXN_DIR" ] || return 1
+        rm -rf -- "$_PD_TXN_DIR"
+        _PD_TXN_DIR=""; _PD_TXN_PROTO=""
+    }
+    transaction_rollback() {
+        [ -d "$_PD_TXN_DIR" ] || return 1
+        rm -rf -- "$_PD_TXN_DIR"
+        _PD_TXN_DIR=""; _PD_TXN_PROTO=""
+    }
+
+    mktemp_dir_pd snapshot
+    _PD_TXN_DIR="$snapshot"; _PD_TXN_PROTO=anytls
+    transaction_run txn_make_success
+    if find "$tmp_root" -maxdepth 1 \( -name 'pd-*' -o -name 'pd-dir-*' \) -print -quit | grep -q .; then
+        return 1
+    fi
+
+    mktemp_dir_pd snapshot
+    _PD_TXN_DIR="$snapshot"; _PD_TXN_PROTO=anytls
+    set +e
+    transaction_run txn_make_failure
+    rc=$?
+    set -e
+    [ "$rc" -eq 23 ]
+    if find "$tmp_root" -maxdepth 1 \( -name 'pd-*' -o -name 'pd-dir-*' \) -print -quit | grep -q .; then
+        return 1
+    fi
+}
+
+test_extract_zip_binary_cleans_all_paths() {
+    local tmp_root="$TEST_ROOT/extract-tmp" archive="$TEST_ROOT/fake.zip" target="$TEST_ROOT/extracted" rc
+    mkdir -p "$tmp_root"
+    : > "$archive"
+    TMPDIR="$tmp_root"
+    export TMPDIR
+    TEST_UNZIP_FAIL=1
+    unzip() {
+        if [ "${1:-}" = -Z1 ]; then
+            echo demo-bin
+            return 0
+        fi
+        [ "$TEST_UNZIP_FAIL" = 0 ] || return 1
+        local dest="${4:-}"
+        printf binary > "$dest/demo-bin"
+    }
+    set +e
+    extract_zip_binary "$archive" demo-bin "$target" demo
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ]
+    if find "$tmp_root" -maxdepth 1 -name 'pd-dir-*' -print -quit | grep -q .; then return 1; fi
+
+    TEST_UNZIP_FAIL=0
+    extract_zip_binary "$archive" demo-bin "$target" demo
+    [ -x "$target" ]
+    if find "$tmp_root" -maxdepth 1 -name 'pd-dir-*' -print -quit | grep -q .; then return 1; fi
+}
+
+test_speedtest_target_ownership_and_atomic_rollback() {
+    local root="$TEST_ROOT/speedtest" target="$TEST_ROOT/speedtest/bin/speedtest" rc old_digest
+    mkdir -p "$root/bin" "$root/state"
+    SPEEDTEST_BIN="$target"
+    BASE_DIR="$root/state"
+    STATE_FILE="$BASE_DIR/state"
+    PATH=/usr/bin:/bin
+
+    download_https() { : > "$2"; }
+    tar() {
+        if [ "${1:-}" = -tzf ]; then
+            echo speedtest
+            return 0
+        fi
+        local dest="" previous="" arg
+        for arg in "$@"; do
+            if [ "$previous" = -C ]; then dest="$arg"; fi
+            previous="$arg"
+        done
+        [ -n "$dest" ] || return 1
+        printf '#!/bin/sh\necho new-speedtest\n' > "$dest/speedtest"
+    }
+
+    printf foreign > "$target"
+    chmod 0644 "$target"
+    set +e
+    install_speedtest_cli >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ]
+    [ "$(cat "$target")" = foreign ]
+
+    rm -f "$target"
+    ln -s "$root/missing" "$target"
+    set +e
+    install_speedtest_cli >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ]
+    [ -L "$target" ]
+
+    rm -f "$target"
+    printf owned-old > "$target"
+    chmod 0644 "$target"
+    old_digest=$(sha256_file "$target")
+    state_set_fields system "speedtest_owned=1" "speedtest_sha256=$old_digest"
+    install_speedtest_cli
+    [ -x "$target" ]
+    grep -q new-speedtest "$target"
+    [ "$(state_get system speedtest_owned)" = 1 ]
+    [ "$(state_get system speedtest_sha256)" = "$(sha256_file "$target")" ]
+
+    printf rollback-old > "$target"
+    chmod 0644 "$target"
+    old_digest=$(sha256_file "$target")
+    state_set_fields system "speedtest_owned=1" "speedtest_sha256=$old_digest"
+    state_set_fields() { return 1; }
+    set +e
+    install_speedtest_cli >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -ne 0 ]
+    [ "$(cat "$target")" = rollback-old ]
+}
+
+test_systemd_dollar_credentials_round_trip() {
+    local raw='pre$VAR-${HOME}-$$-post' escaped unit dir="$TEST_ROOT/dollar-systemd"
+    mkdir -p "$dir/anytls"
+    SYSTEMD_DIR="$dir"
+    PD_LISTEN_HOST=0.0.0.0
+    escaped=$(systemd_escape_arg "$raw")
+    [ "$escaped" = 'pre$$VAR-$${HOME}-$$$$-post' ]
+    [ "$(systemd_unescape_arg "$escaped")" = "$raw" ]
+    if systemd_unescape_arg '$VAR' >/dev/null 2>&1; then return 1; fi
+
+    write_shadowtls_unit 443 53000 example.com:443 "$raw" --v3 /opt/shadowtls/shadow-tls
+    unit="$SYSTEMD_DIR/shadowtls-snell.service"
+    grep -Fq -- '--password pre$$VAR-$${HOME}-$$$$-post' "$unit"
+    [ "$(unit_password_value "$unit")" = "$raw" ]
+
+    pdir() { echo "$dir/anytls"; }
+    printf '%s\n' "$raw" > "$dir/anytls/.password"
+    write_systemd anytls /opt/anytls/anytls-server "$(anytls_service_args 8443)"
+    unit="$SYSTEMD_DIR/anytls.service"
+    grep -Fq -- '-p pre$$VAR-$${HOME}-$$$$-post' "$unit"
+    [ "$(unit_arg_value -p "$unit")" = "$raw" ]
 }
 
 test_multiline_port_matching_and_recheck() {
@@ -85,7 +281,8 @@ MOCK
     port_in_use() { return 1; }
     local picked
     picked=$(PATH="$mock:$PATH" rand_port)
-    [ "$picked" = 23457 ] && state_port_range_conflict 23456 23456 ""
+    [ "$picked" = 23457 ]
+    state_port_range_conflict 23456 23456 ""
 }
 
 test_transport_specific_verification() {
@@ -359,10 +556,13 @@ test_ip_https_consensus_and_overrides() {
     output=$(fetch_public_ip 4 valid_ipv4 2>/dev/null)
     rc=$?
     set -e
-    [ "$rc" -ne 0 ] && [ -z "$output" ]
+    [ "$rc" -ne 0 ]
+    [ -z "$output" ]
     ! grep -Ev -- 'https://' "$calls" | grep -q .
     PD_PUBLIC_HOST=proxy.example.com PD_PUBLIC_IPV4=203.0.113.7 PD_PUBLIC_IPV6=2001:db8::7 get_ip
-    [ "$PUBLIC_HOST" = proxy.example.com ] && [ "$IP" = 203.0.113.7 ] && [ "$IP6" = 2001:db8::7 ]
+    [ "$PUBLIC_HOST" = proxy.example.com ]
+    [ "$IP" = 203.0.113.7 ]
+    [ "$IP6" = 2001:db8::7 ]
 }
 
 test_no_unknown_endpoint_output() {
@@ -377,7 +577,8 @@ test_cli_arity_is_exit_2() {
     output=$(PD_TEST_MODE=0 "$TEST_SCRIPT" --install anytls extra 2>&1)
     rc=$?
     set -e
-    [ "$rc" -eq 2 ] && grep -q '不接受\|需要且只接受' <<< "$output"
+    [ "$rc" -eq 2 ]
+    grep -q '不接受\|需要且只接受' <<< "$output"
 }
 
 test_listen_family_respects_bindv6only() {
@@ -385,9 +586,67 @@ test_listen_family_respects_bindv6only() {
     bindv6only_value() { echo 1; }
     unset PD_LISTEN_FAMILY
     prepare_listen_family
-    [ "$PD_EFFECTIVE_LISTEN_FAMILY" = ipv4 ] && [ "$PD_LISTEN_HOST" = 0.0.0.0 ]
+    [ "$PD_EFFECTIVE_LISTEN_FAMILY" = ipv4 ]
+    [ "$PD_LISTEN_HOST" = 0.0.0.0 ]
     PD_LISTEN_FAMILY=dual prepare_listen_family >/dev/null
-    [ "$PD_EFFECTIVE_LISTEN_FAMILY" = dual ] && [ "$PD_LISTEN_HOST" = :: ]
+    [ "$PD_EFFECTIVE_LISTEN_FAMILY" = dual ]
+    [ "$PD_LISTEN_HOST" = :: ]
+}
+
+test_service_listener_uses_ss_family_filters() {
+    local TEST_SS4="" TEST_SS6="" TEST_BINDONLY=1 rc
+    systemctl() {
+        [ "${1:-}" = show ] || return 1
+        echo 4242
+    }
+    bindv6only_value() { echo "$TEST_BINDONLY"; }
+    ss() {
+        case " $* " in
+            *' -4 '*) [ -z "$TEST_SS4" ] || printf '%s\n' "$TEST_SS4" ;;
+            *' -6 '*) [ -z "$TEST_SS6" ] || printf '%s\n' "$TEST_SS6" ;;
+            *) return 1 ;;
+        esac
+    }
+    family_is() {
+        local expected="$1" family="$2" got
+        set +e
+        service_port_family_listening 443 tcp demo "$family"
+        got=$?
+        set -e
+        if [ "$expected" = yes ]; then
+            [ "$got" -eq 0 ]
+        else
+            [ "$got" -ne 0 ]
+        fi
+    }
+
+    TEST_SS4='LISTEN 0 128 0.0.0.0:443 0.0.0.0:* users:(("demo",pid=4242,fd=3))'
+    TEST_SS6=""; TEST_BINDONLY=1
+    family_is yes ipv4
+    family_is no ipv6
+
+    TEST_SS4=""
+    TEST_SS6='LISTEN 0 128 [::]:443 [::]:* users:(("demo",pid=4242,fd=3))'
+    TEST_BINDONLY=1
+    family_is no ipv4
+    family_is yes ipv6
+    TEST_BINDONLY=0
+    family_is yes ipv4
+    family_is yes ipv6
+
+    TEST_SS6='LISTEN 0 128 *:443 *:* users:(("demo",pid=4242,fd=3))'
+    family_is yes ipv4
+    family_is yes ipv6
+
+    TEST_SS6='LISTEN 0 128 [2001:db8::1]:443 [::]:* users:(("demo",pid=4242,fd=3))'
+    family_is no ipv4
+    family_is yes ipv6
+
+    TEST_SS4='LISTEN 0 128 0.0.0.0:443 0.0.0.0:* users:(("demo",pid=4242,fd=3))'
+    TEST_SS6='LISTEN 0 128 [::]:443 [::]:* users:(("demo",pid=4242,fd=3))'
+    TEST_BINDONLY=1
+    family_is yes ipv4
+    family_is yes ipv6
 }
 
 test_verified_families_are_recorded_and_enforced() {
@@ -399,6 +658,45 @@ test_verified_families_are_recorded_and_enforced() {
     grep -q '^listen_ipv4=1$' "$recorded" || { sed -n '1,20p' "$recorded" >&2; return 1; }
     grep -q '^listen_ipv6=1$' "$recorded" || { sed -n '1,20p' "$recorded" >&2; return 1; }
     return 0
+}
+
+test_doctor_checks_each_owned_iptables_family() {
+    local TEST_OWNED=iptables4,iptables6 TEST_IP4_RC=0 TEST_IP6_RC=1 status message
+    state_get() {
+        case "$2" in
+            fw_backend) echo iptables ;;
+            fw_spec) echo 443 ;;
+            fw_proto) echo tcp ;;
+            fw_owned) echo "$TEST_OWNED" ;;
+        esac
+    }
+    command() {
+        if [ "${1:-}" = -v ]; then
+            case "${2:-}" in iptables|ip6tables) return 0 ;; esac
+        fi
+        builtin command "$@"
+    }
+    iptables() { return "$TEST_IP4_RC"; }
+    ip6tables() { return "$TEST_IP6_RC"; }
+    doctor_add() { status="$2"; message="$3"; }
+
+    doctor_firewall anytls
+    [ "$status" = fail ]
+    grep -q 'iptables6' <<< "$message"
+
+    TEST_OWNED=iptables4
+    TEST_IP4_RC=0
+    TEST_IP6_RC=1
+    status=""; message=""
+    doctor_firewall anytls
+    [ "$status" = ok ]
+
+    TEST_OWNED=""
+    TEST_IP4_RC=0
+    status=""; message=""
+    doctor_firewall anytls
+    [ "$status" = ok ]
+    grep -q 'legacy-ipv4' <<< "$message"
 }
 
 test_shadowtls_log_reads_both_units() {
@@ -434,7 +732,8 @@ test_stop_service_failure_paths() {
         output=$(stop_service "$proto" 2>&1)
         rc=$?
         set -e
-        [ "$rc" -ne 0 ] && ! grep -Fq "$success" <<< "$output"
+        [ "$rc" -ne 0 ]
+        ! grep -Fq "$success" <<< "$output"
     }
 
     TEST_STOP_FAIL=shadowtls-snell
@@ -477,7 +776,8 @@ test_start_service_failure_paths() {
         output=$(start_service "$proto" 2>&1)
         rc=$?
         set -e
-        [ "$rc" -ne 0 ] && ! grep -Fq "$success" <<< "$output"
+        [ "$rc" -ne 0 ]
+        ! grep -Fq "$success" <<< "$output"
     }
 
     TEST_SETUP_FAIL=1
@@ -530,7 +830,8 @@ test_restart_service_failure_paths() {
         output=$(restart_service "$proto" 2>&1)
         rc=$?
         set -e
-        [ "$rc" -ne 0 ] && ! grep -Fq "$success" <<< "$output"
+        [ "$rc" -ne 0 ]
+        ! grep -Fq "$success" <<< "$output"
     }
 
     TEST_SETUP_FAIL=1
@@ -589,7 +890,10 @@ test_bbr_unsupported_is_nonzero() {
 
 test_mss_rule_has_ownership_marker() {
     local log="$TEST_ROOT/mss-log" state="$TEST_ROOT/mss-state"
-    command() { [ "${1:-}" = -v ] && [ "${2:-}" = iptables ]; }
+    command() {
+        [ "${1:-}" = -v ]
+        [ "${2:-}" = iptables ]
+    }
     iptables() {
         printf '%s\n' "$*" >> "$log"
         [ "${3:-}" != -C ]
@@ -625,7 +929,9 @@ test_doctor_json_is_read_only() {
     output=$(doctor_run 1)
     rc=$?
     set -e
-    [ -n "$output" ] && grep -q '^{' <<< "$output" && grep -q '"checks"' <<< "$output"
+    [ -n "$output" ]
+    grep -q '^{' <<< "$output"
+    grep -q '"checks"' <<< "$output"
     [ ! -e "$marker" ]
     [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]
 }
@@ -636,12 +942,18 @@ test_unknown_cli_parameter_framework() {
     output=$(PD_TEST_MODE=0 "$TEST_SCRIPT" --future-reserved-flag 2>&1)
     rc=$?
     set -e
-    [ "$rc" -eq 2 ] && grep -q '未知参数: --future-reserved-flag' <<< "$output"
+    [ "$rc" -eq 2 ]
+    grep -q '未知参数: --future-reserved-flag' <<< "$output"
 }
 
+run_test "test runner preserves errexit after an earlier failed assertion" test_framework_errexit_self_check
 run_test "explicit transaction rollback survives die/exit" test_transaction_control_flow
 run_test "no ERR rollback trap is installed" test_no_err_rollback_trap
 run_test "mktemp tracking remains in the caller shell" test_mktemp_tracking
+run_test "transaction subshell tempfiles are scoped and cleaned" test_transaction_tmpfiles_are_scoped_and_cleaned
+run_test "zip extraction cleans temp directories on every path" test_extract_zip_binary_cleans_all_paths
+run_test "speedtest install protects ownership and rolls back atomically" test_speedtest_target_ownership_and_atomic_rollback
+run_test "systemd dollar credentials round-trip literally" test_systemd_dollar_credentials_round_trip
 run_test "multiline installed ports are matched exactly and rechecked" test_multiline_port_matching_and_recheck
 run_test "verify_port enforces the requested transport" test_transport_specific_verification
 run_test "ShadowTLS layers and HY2 hop are strictly verified" test_layered_transport_verification
@@ -661,7 +973,9 @@ run_test "public IP discovery is HTTPS-consistent and supports overrides" test_i
 run_test "unknown public endpoints never generate configuration" test_no_unknown_endpoint_output
 run_test "extra CLI arguments exit 2 before privileged work" test_cli_arity_is_exit_2
 run_test "listen-family auto handles bindv6only" test_listen_family_respects_bindv6only
+run_test "service listeners use ss address-family filters" test_service_listener_uses_ss_family_filters
 run_test "verified address families are persisted" test_verified_families_are_recorded_and_enforced
+run_test "doctor checks every owned iptables family" test_doctor_checks_each_owned_iptables_family
 run_test "Snell logs include both ShadowTLS layers" test_shadowtls_log_reads_both_units
 run_test "stop failures never report a stopped service" test_stop_service_failure_paths
 run_test "start verification failures never report a started service" test_start_service_failure_paths

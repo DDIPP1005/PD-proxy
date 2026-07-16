@@ -90,6 +90,7 @@ STATE_FILE="${PD_STATE_FILE:-$BASE_DIR/state}"
 INSTALLED_BIN="${PD_INSTALLED_BIN:-/usr/local/bin/pd}"
 SYSTEMD_DIR="${PD_SYSTEMD_DIR:-/etc/systemd/system}"
 LOCK_FILE="${PD_LOCK_FILE:-/run/lock/pd-proxy.lock}"
+SPEEDTEST_BIN="${PD_SPEEDTEST_BIN:-/usr/local/bin/speedtest}"
 
 # 日志函数必须在锁之前定义；锁失败路径也会使用 die。
 info()  { echo -e "${GREEN}[✓]${RESET} $*"; }
@@ -129,23 +130,30 @@ PD_OPT_INSTALL_QR="${PD_INSTALL_QR:-0}"                  # 1=安装 qrencode 生
 # 临时文件追踪（只清理自己创建的，不误删其他进程的文件）
 declare -a _PD_TMPFILES=()
 mktemp_pd() {
-    local out_var="${1:-}" f
+    local out_var="${1:-}" _pd_created_file
     [ -n "$out_var" ] || die "mktemp_pd 需要接收变量名"
-    f=$(mktemp "${TMPDIR:-/tmp}/pd-XXXXXX") || die "创建临时文件失败"
-    _PD_TMPFILES+=("$f")
-    printf -v "$out_var" '%s' "$f"
+    _pd_created_file=$(mktemp "${TMPDIR:-/tmp}/pd-XXXXXX") || die "创建临时文件失败"
+    _PD_TMPFILES+=("$_pd_created_file")
+    printf -v "$out_var" '%s' "$_pd_created_file"
 }
 mktemp_dir_pd() {
-    local out_var="${1:-}" d
+    local out_var="${1:-}" _pd_created_dir
     [ -n "$out_var" ] || die "mktemp_dir_pd 需要接收变量名"
-    d=$(mktemp -d "${TMPDIR:-/tmp}/pd-dir-XXXXXX") || die "创建临时目录失败"
-    _PD_TMPFILES+=("$d")
-    printf -v "$out_var" '%s' "$d"
+    _pd_created_dir=$(mktemp -d "${TMPDIR:-/tmp}/pd-dir-XXXXXX") || die "创建临时目录失败"
+    _PD_TMPFILES+=("$_pd_created_dir")
+    printf -v "$out_var" '%s' "$_pd_created_dir"
 }
 cleanup_tmpfiles() {
-    local f
-    for f in "${_PD_TMPFILES[@]}"; do
-        [ -n "$f" ] && rm -rf -- "$f"
+    cleanup_tmpfiles_from 0
+}
+cleanup_tmpfiles_from() {
+    local start="${1:-0}" i f
+    for ((i=start; i<${#_PD_TMPFILES[@]}; i++)); do
+        f="${_PD_TMPFILES[$i]:-}"
+        if [ -n "$f" ]; then
+            rm -rf -- "$f"
+            _PD_TMPFILES[$i]=""
+        fi
     done
     return 0
 }
@@ -250,17 +258,27 @@ archive_paths_are_safe() {
 }
 
 extract_zip_binary() {
-    local archive="$1" expected="$2" target="$3" label="$4" tmpdir source
+    local archive="$1" expected="$2" target="$3" label="$4" tmpdir source rc=0
+    local tmp_start=${#_PD_TMPFILES[@]}
     unzip -Z1 "$archive" | archive_paths_are_safe || return 1
     mktemp_dir_pd tmpdir
-    unzip -q "$archive" -d "$tmpdir" || return 1
-    if find "$tmpdir" -type l -print -quit | grep -q .; then
+    if ! unzip -q "$archive" -d "$tmpdir"; then
+        rc=1
+    elif find "$tmpdir" -type l -print -quit | grep -q .; then
         err "$label 压缩包包含符号链接，拒绝安装"
-        return 1
+        rc=1
+    else
+        source=$(find "$tmpdir" -type f -name "$expected" -print -quit) || rc=1
+        if [ "$rc" -eq 0 ] && [ -z "$source" ]; then
+            err "$label 压缩包缺少 $expected"
+            rc=1
+        fi
+        if [ "$rc" -eq 0 ]; then
+            install -m 0755 "$source" "$target" || rc=1
+        fi
     fi
-    source=$(find "$tmpdir" -type f -name "$expected" -print -quit)
-    [ -n "$source" ] || { err "$label 压缩包缺少 $expected"; return 1; }
-    install -m 0755 "$source" "$target"
+    cleanup_tmpfiles_from "$tmp_start"
+    return "$rc"
 }
 
 # 写锁只在变更动作执行期间持有。/run/lock 由 root 管理，且拒绝符号链接。
@@ -797,7 +815,10 @@ json_value() {
 
 unit_arg_value() {
     local arg="$1" file="$2"
-    tr ' ' '\n' < "$file" 2>/dev/null | awk -v arg="$arg" '$0 == arg { getline; print; exit }'
+    local value
+    value=$(tr ' ' '\n' < "$file" 2>/dev/null | awk -v arg="$arg" '$0 == arg { getline; print; exit }') || return 1
+    [ -n "$value" ] || return 1
+    systemd_unescape_arg "$value"
 }
 
 unit_password_value() {
@@ -809,7 +830,24 @@ systemd_escape_arg() {
     case "$s" in
         *[[:space:]\"\\%]* ) die "systemd 参数包含不支持的字符: $s" ;;
     esac
+    s=${s//\$/\$\$}
     printf '%s' "$s"
+}
+
+systemd_unescape_arg() {
+    local s="$1" out="" c next i
+    for ((i=0; i<${#s}; i++)); do
+        c=${s:i:1}
+        if [ "$c" = '$' ]; then
+            next=${s:i+1:1}
+            [ "$next" = '$' ] || return 1
+            out+='$'
+            i=$((i + 1))
+        else
+            out+="$c"
+        fi
+    done
+    printf '%s' "$out"
 }
 
 validate_hostname() {
@@ -869,20 +907,33 @@ service_port_listening() {
 }
 
 service_port_family_listening() {
-    local port="$1" transport="$2" service="$3" family="$4" flag pid bindonly
+    local port="$1" transport="$2" service="$3" family="$4" flag family_flag pid bindonly
     case "$transport" in tcp) flag=-ltnp ;; udp) flag=-lunp ;; *) return 2 ;; esac
+    case "$family" in ipv4) family_flag=-4 ;; ipv6) family_flag=-6 ;; *) return 2 ;; esac
     pid=$(systemctl show -p MainPID --value "$service" 2>/dev/null) || return 1
     [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
-    bindonly=$(bindv6only_value)
-    ss -H "$flag" 2>/dev/null | awk -v port="$port" -v pid="$pid" -v family="$family" -v bindonly="$bindonly" '
+    if ss -H "$family_flag" "$flag" 2>/dev/null | awk -v port="$port" -v pid="$pid" '
         {
             addr=$4
             marker="pid=" pid "([,)]|$)"
             if ($0 !~ marker || addr !~ (":" port "$")) next
-            is6=(addr ~ /^\[/ || gsub(/:/, ":", addr) > 1)
-            if (family == "ipv6" && is6) found=1
-            if (family == "ipv4" && !is6) found=1
-            if (family == "ipv4" && is6 && bindonly == 0 && (addr ~ /^\[?::\]?:/ || addr ~ /^\*:/)) found=1
+            found=1
+        }
+        END { exit found ? 0 : 1 }
+    '; then
+        return 0
+    fi
+    [ "$family" = ipv4 ] || return 1
+    bindonly=$(bindv6only_value)
+    [ "$bindonly" = 0 ] || return 1
+    # An IPv6 wildcard socket also accepts IPv4 when bindv6only=0.  The -6
+    # filter makes ambiguous ss output such as *:443 unambiguously IPv6 here.
+    ss -H -6 "$flag" 2>/dev/null | awk -v port="$port" -v pid="$pid" '
+        {
+            addr=$4
+            marker="pid=" pid "([,)]|$)"
+            if ($0 !~ marker || addr !~ (":" port "$")) next
+            if (addr ~ /^\[::\]:/ || addr ~ /^:::/ || addr ~ /^\*:/) found=1
         }
         END { exit found ? 0 : 1 }
     '
@@ -1426,6 +1477,39 @@ state_set() {
     [ "$(id -u)" != 0 ] || chown root:root "$STATE_FILE" || return 1
 }
 
+state_set_fields() {
+    local key="$1" line="" tmp assignment field value
+    shift
+    [ "$#" -gt 0 ] || return 1
+    state_path_prepare || return 1
+    [ -f "$STATE_FILE" ] && line=$(awk -v key="$key" '$1 == key { print; exit }' "$STATE_FILE")
+    for assignment in "$@"; do
+        field=${assignment%%=*}
+        value=${assignment#*=}
+        [[ "$field" =~ ^[A-Za-z0-9_]+$ ]] && [[ "$value" != *[[:space:]]* ]] \
+            || { err "状态字段格式无效: $assignment"; return 1; }
+        if printf '%s\n' "$line" | tr ' ' '\n' | grep -q "^${field}="; then
+            line=$(printf '%s\n' "$line" | awk -v f="$field" -v v="$value" \
+                '{ for (i=1; i<=NF; i++) if ($i ~ "^" f "=") $i=f "=" v; print }') || return 1
+        elif [ -n "$line" ]; then
+            line="$line $field=$value"
+        else
+            line="$key $field=$value"
+        fi
+    done
+    line=$(printf '%s\n' "$line" | sed 's/^ *//;s/ *$//')
+    tmp=$(mktemp "$BASE_DIR/.state.XXXXXX") || { err "创建状态临时文件失败"; return 1; }
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    if [ "$(id -u)" = 0 ]; then
+        chown root:root "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    if [ -f "$STATE_FILE" ]; then
+        awk -v key="$key" '$1 != key { print }' "$STATE_FILE" > "$tmp" || { rm -f "$tmp"; return 1; }
+    fi
+    printf '%s\n' "$line" >> "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$STATE_FILE" || { rm -f "$tmp"; err "原子更新状态文件失败"; return 1; }
+}
+
 state_del() {
     local key="$1"
     state_path_prepare || return 1
@@ -1773,10 +1857,14 @@ transaction_discard_unstarted() {
 }
 
 transaction_run() {
-    local rc had_errexit=0
+    local rc had_errexit=0 tmp_start=${#_PD_TMPFILES[@]}
     [[ $- == *e* ]] && had_errexit=1
     set +e
-    ( set -e; "$@" )
+    (
+        trap 'cleanup_tmpfiles_from "$tmp_start"' EXIT
+        set -e
+        "$@"
+    )
     rc=$?
     if [ "$rc" -ne 0 ]; then
         transaction_rollback || true
@@ -2150,6 +2238,7 @@ install_shadowtls() {
 write_shadowtls_unit() {
     local ext_port="$1" int_port="$2" sni="$3" tls_pass="$4" v3_arg="$5" bin="$6" listen
     listen=$(listen_endpoint "$ext_port")
+    tls_pass=$(systemd_escape_arg "$tls_pass")
     atomic_write_file "$SYSTEMD_DIR/shadowtls-snell.service" 600 <<EOF
 [Unit]
 Description=PD-proxy: ShadowTLS for Snell
@@ -2189,7 +2278,6 @@ snell_shadowtls_configure() {
     validate_hostname "$sni" "PD_SNELL_TLS_SNI"
     case "$tls_version" in v3|3) tls_version="v3" ;; v2|2) tls_version="v2" ;; *) die "PD_SNELL_TLS_VERSION 仅支持 v3 或 v2，当前: $tls_version" ;; esac
     [ -n "$tls_pass" ] || tls_pass=$(rand_pass)
-    tls_pass=$(systemd_escape_arg "$tls_pass")
     PD_OPT_SNELL_TLS_PASS="$tls_pass"
     local v3_arg="--v3"
     [ "$tls_version" = "v2" ] && v3_arg=""
@@ -3199,8 +3287,28 @@ calculate_bbr_buf() {
 }
 
 install_speedtest_cli() {
-    command -v speedtest >/dev/null 2>&1 && return 0
-    local cpu_arch url tmpdir
+    local cpu_arch url tmpdir target="$SPEEDTEST_BIN" target_dir tmp_install="" backup=""
+    local old_exists=0 expected actual digest tmp_start=${#_PD_TMPFILES[@]}
+    target_dir=$(dirname "$target")
+    [ -d "$target_dir" ] && [ ! -L "$target_dir" ] \
+        || { err "speedtest 目标目录不安全: $target_dir"; return 1; }
+    if [ -L "$target" ]; then
+        err "拒绝覆盖 speedtest 符号链接: $target"
+        return 1
+    fi
+    if [ -e "$target" ]; then
+        [ -f "$target" ] || { err "speedtest 目标不是普通文件: $target"; return 1; }
+        [ "$(state_get system speedtest_owned 2>/dev/null || true)" = 1 ] \
+            || { err "发现不属于本脚本的 speedtest，拒绝覆盖: $target"; return 1; }
+        expected=$(state_get system speedtest_sha256 2>/dev/null || true)
+        expected=$(printf '%s' "$expected" | tr 'A-F' 'a-f')
+        actual=$(sha256_file "$target" 2>/dev/null || true)
+        [[ "$expected" =~ ^[0-9a-f]{64}$ ]] && [ "$actual" = "$expected" ] \
+            || { err "speedtest 所有权摘要不匹配，拒绝覆盖: $target"; return 1; }
+        old_exists=1
+    elif command -v speedtest >/dev/null 2>&1; then
+        return 0
+    fi
     cpu_arch=$(uname -m)
     case "$cpu_arch" in
         x86_64|amd64) url="https://install.speedtest.net/app/cli/ookla-speedtest-1.2.0-linux-x86_64.tgz" ;;
@@ -3208,15 +3316,61 @@ install_speedtest_cli() {
         *) warn "speedtest 不支持当前架构: $cpu_arch" >&2; return 1 ;;
     esac
     mktemp_dir_pd tmpdir
-    download_https "$url" "$tmpdir/speedtest.tgz" "Ookla speedtest CLI 1.2.0" || { rm -rf "$tmpdir"; return 1; }
-    tar -tzf "$tmpdir/speedtest.tgz" | archive_paths_are_safe || { rm -rf "$tmpdir"; return 1; }
-    tar -xzf "$tmpdir/speedtest.tgz" -C "$tmpdir" >/dev/null 2>&1 || { rm -rf "$tmpdir"; return 1; }
-    [ -f "$tmpdir/speedtest" ] && [ ! -L "$tmpdir/speedtest" ] || { rm -rf "$tmpdir"; return 1; }
-    install -m 0755 "$tmpdir/speedtest" /usr/local/bin/speedtest || { rm -rf "$tmpdir"; return 1; }
-    state_set system speedtest_owned 1 || { rm -f /usr/local/bin/speedtest; return 1; }
-    state_set system speedtest_sha256 "$(sha256_file /usr/local/bin/speedtest)" \
-        || { rm -f /usr/local/bin/speedtest; return 1; }
-    rm -rf "$tmpdir"
+    download_https "$url" "$tmpdir/speedtest.tgz" "Ookla speedtest CLI 1.2.0" \
+        || { cleanup_tmpfiles_from "$tmp_start"; return 1; }
+    tar -tzf "$tmpdir/speedtest.tgz" | archive_paths_are_safe \
+        || { cleanup_tmpfiles_from "$tmp_start"; return 1; }
+    tar -xzf "$tmpdir/speedtest.tgz" -C "$tmpdir" >/dev/null 2>&1 \
+        || { cleanup_tmpfiles_from "$tmp_start"; return 1; }
+    [ -f "$tmpdir/speedtest" ] && [ ! -L "$tmpdir/speedtest" ] \
+        || { cleanup_tmpfiles_from "$tmp_start"; return 1; }
+    tmp_install=$(mktemp "$target_dir/.speedtest.XXXXXX") \
+        || { cleanup_tmpfiles_from "$tmp_start"; return 1; }
+    if ! install -m 0755 "$tmpdir/speedtest" "$tmp_install"; then
+        rm -f "$tmp_install"; cleanup_tmpfiles_from "$tmp_start"; return 1
+    fi
+    if [ "$(id -u)" = 0 ] && ! chown root:root "$tmp_install"; then
+        rm -f "$tmp_install"; cleanup_tmpfiles_from "$tmp_start"; return 1
+    fi
+    digest=$(sha256_file "$tmp_install") \
+        || { rm -f "$tmp_install"; cleanup_tmpfiles_from "$tmp_start"; return 1; }
+    if [ "$old_exists" = 1 ]; then
+        backup=$(mktemp "$target_dir/.speedtest-backup.XXXXXX") \
+            || { rm -f "$tmp_install"; cleanup_tmpfiles_from "$tmp_start"; return 1; }
+        cp -p "$target" "$backup" \
+            || { rm -f "$tmp_install" "$backup"; cleanup_tmpfiles_from "$tmp_start"; return 1; }
+    fi
+    # Recheck immediately before the rename so a resource created or changed
+    # while the archive was prepared is never treated as ours.
+    if [ "$old_exists" = 1 ]; then
+        actual=$(sha256_file "$target" 2>/dev/null || true)
+        if [ -L "$target" ] || [ ! -f "$target" ] || [ "$actual" != "$expected" ]; then
+            err "speedtest 目标在安装期间发生变化，拒绝覆盖: $target"
+            rm -f "$tmp_install" "$backup"
+            cleanup_tmpfiles_from "$tmp_start"
+            return 1
+        fi
+    elif [ -e "$target" ] || [ -L "$target" ]; then
+        err "speedtest 目标在安装期间出现，拒绝覆盖: $target"
+        rm -f "$tmp_install"
+        cleanup_tmpfiles_from "$tmp_start"
+        return 1
+    fi
+    if ! mv -f "$tmp_install" "$target"; then
+        rm -f "$tmp_install" "$backup"; cleanup_tmpfiles_from "$tmp_start"; return 1
+    fi
+    if ! state_set_fields system "speedtest_owned=1" "speedtest_sha256=$digest"; then
+        if [ "$old_exists" = 1 ]; then
+            mv -f "$backup" "$target" || err "speedtest 状态写入失败且旧文件回滚失败: $target"
+        else
+            rm -f "$target"
+        fi
+        rm -f "$backup"
+        cleanup_tmpfiles_from "$tmp_start"
+        return 1
+    fi
+    rm -f "$backup"
+    cleanup_tmpfiles_from "$tmp_start"
     return 0
 }
 
@@ -4004,9 +4158,13 @@ cleanup_managed_system_resources() {
 
     if [ "$(state_get system speedtest_owned 2>/dev/null || true)" = 1 ]; then
         expected=$(state_get system speedtest_sha256 2>/dev/null || true)
-        actual=$(sha256_file /usr/local/bin/speedtest 2>/dev/null || true)
+        actual=$(sha256_file "$SPEEDTEST_BIN" 2>/dev/null || true)
         if [ -n "$expected" ] && [ "$actual" = "$expected" ]; then
-            rm -f /usr/local/bin/speedtest || rc=1
+            if [ ! -L "$SPEEDTEST_BIN" ] && [ -f "$SPEEDTEST_BIN" ]; then
+                rm -f "$SPEEDTEST_BIN" || rc=1
+            else
+                rc=1
+            fi
         else
             warn "speedtest 二进制已变化，无法确认仍是本脚本安装的版本，已保留"
         fi
@@ -4176,7 +4334,7 @@ doctor_add() {
 }
 
 doctor_firewall() {
-    local key="$1" backend spec transport owned
+    local key="$1" backend spec transport owned check4=0 check6=0 failed=0
     backend=$(state_get "$key" fw_backend 2>/dev/null || true)
     spec=$(state_get "$key" fw_spec 2>/dev/null || true)
     transport=$(state_get "$key" fw_proto 2>/dev/null || true)
@@ -4190,10 +4348,29 @@ doctor_firewall() {
                 doctor_add "${key}.firewall" fail "状态记录的 ufw 规则不存在"
             fi ;;
         iptables)
-            if command -v iptables >/dev/null 2>&1 && iptables -C INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1; then
-                doctor_add "${key}.firewall" ok "iptables 规则存在（owned=${owned:-no}）"
+            # Empty ownership is the legacy IPv4-only state.  Otherwise verify
+            # every family explicitly recorded as owned, and no unrecorded one.
+            [ -n "$owned" ] || check4=1
+            [[ ",$owned," == *,iptables4,* ]] && check4=1
+            [[ ",$owned," == *,iptables6,* ]] && check6=1
+            if [ "$check4" = 0 ] && [ "$check6" = 0 ]; then
+                doctor_add "${key}.firewall" fail "iptables 所有权记录无效: $owned"
+                return
+            fi
+            if [ "$check4" = 1 ]; then
+                command -v iptables >/dev/null 2>&1 \
+                    && iptables -C INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1 \
+                    || failed=1
+            fi
+            if [ "$check6" = 1 ]; then
+                command -v ip6tables >/dev/null 2>&1 \
+                    && ip6tables -C INPUT -p "$transport" --dport "$spec" -j ACCEPT >/dev/null 2>&1 \
+                    || failed=1
+            fi
+            if [ "$failed" = 0 ]; then
+                doctor_add "${key}.firewall" ok "iptables 规则存在（owned=${owned:-legacy-ipv4}）"
             else
-                doctor_add "${key}.firewall" fail "状态记录的 iptables 规则不存在"
+                doctor_add "${key}.firewall" fail "状态记录的 iptables 规则不存在（owned=${owned:-legacy-ipv4}）"
             fi ;;
         *) doctor_add "${key}.firewall" warn "缺少可核验的防火墙状态" ;;
     esac
