@@ -423,16 +423,45 @@ test_lock_symlink_rejected() {
 }
 
 test_run_write_locked_isolates_errexit_and_releases() {
-    local marker="$TEST_ROOT/locked-after-false" releases="$TEST_ROOT/lock-releases" rc e_was_preserved
+    local marker="$TEST_ROOT/locked-after-false" releases="$TEST_ROOT/lock-releases" worker_pid="$TEST_ROOT/locked-worker-pid"
+    local nested_pid="$TEST_ROOT/locked-nested-pid" stdout_file="$TEST_ROOT/locked-stdout" stderr_file="$TEST_ROOT/locked-stderr"
+    local rc e_was_preserved parent_pid=$$ expected_sni=worker-state.example.com
     write_lock_acquire() { _PD_LOCK_DEPTH=1; }
     write_lock_release() { _PD_LOCK_DEPTH=0; printf 'released\n' >> "$releases"; }
     locked_failure() {
+        local marker="$1" worker_pid="$2"
+        printf '%s\n' "$$" > "$worker_pid"
         false
         : > "$marker"
     }
+    locked_stdio_failure() {
+        local marker="$1" input
+        IFS= read -r input
+        printf 'stdout:%s\n' "$input"
+        printf 'stderr:%s\n' "$input" >&2
+        false
+        : > "$marker"
+    }
+    locked_nested_check() {
+        local marker="$1" nested_pid="$2" expected_sni="$3" nested_rc
+        nested_failure() {
+            local marker="$1" nested_pid="$2"
+            printf '%s\n' "$$" > "$nested_pid"
+            false
+            : > "$marker"
+        }
+        [ "$PD_OPT_ANYTLS_SNI" = "$expected_sni" ]
+        if run_write_locked nested_failure "$marker" "$nested_pid"; then
+            return 90
+        else
+            nested_rc=$?
+        fi
+        [ "$nested_rc" -ne 0 ]
+        [ ! -e "$marker" ]
+    }
 
     set -e
-    if run_write_locked locked_failure; then
+    if run_write_locked locked_failure "$marker" "$worker_pid"; then
         return 1
     else
         rc=$?
@@ -440,18 +469,34 @@ test_run_write_locked_isolates_errexit_and_releases() {
     [ "$rc" -ne 0 ]
     [[ $- == *e* ]]
     [ ! -e "$marker" ]
+    [ "$(cat "$worker_pid")" != "$parent_pid" ]
+    [ "$_PD_LOCK_DEPTH" -eq 0 ]
+
+    rc=0
+    run_write_locked locked_failure "$marker" "$worker_pid" || rc=$?
+    [ "$rc" -ne 0 ]
+    [[ $- == *e* ]]
+    [ ! -e "$marker" ]
     [ "$_PD_LOCK_DEPTH" -eq 0 ]
 
     set +e
-    run_write_locked locked_failure
+    run_write_locked locked_stdio_failure "$marker" < <(printf 'input-ok\n') > "$stdout_file" 2> "$stderr_file"
     rc=$?
     [[ $- == *e* ]] && e_was_preserved=0 || e_was_preserved=1
     set -e
     [ "$rc" -ne 0 ]
     [ "$e_was_preserved" -eq 1 ]
     [ ! -e "$marker" ]
+    [ "$(cat "$stdout_file")" = "stdout:input-ok" ]
+    [ "$(cat "$stderr_file")" = "stderr:input-ok" ]
     [ "$_PD_LOCK_DEPTH" -eq 0 ]
-    [ "$(wc -l < "$releases" | tr -d ' ')" -eq 2 ]
+
+    PD_OPT_ANYTLS_SNI="$expected_sni"
+    run_write_locked locked_nested_check "$marker" "$nested_pid" "$expected_sni"
+    [ "$(cat "$nested_pid")" != "$parent_pid" ]
+    [ ! -e "$marker" ]
+    [ "$_PD_LOCK_DEPTH" -eq 0 ]
+    [ "$(wc -l < "$releases" | tr -d ' ')" -eq 4 ]
 }
 
 test_run_write_locked_captures_tmp_cleanup_start() {
@@ -464,19 +509,23 @@ test_run_write_locked_captures_tmp_cleanup_start() {
     write_lock_acquire() { _PD_LOCK_DEPTH=$((_PD_LOCK_DEPTH + 1)); }
     write_lock_release() { _PD_LOCK_DEPTH=$((_PD_LOCK_DEPTH - 1)); }
     locked_make_tmpfiles() {
-        local f d
+        local paths="$1" trap_snapshot="$2" f d
         mktemp_pd f
         mktemp_dir_pd d
         printf '%s\n%s\n' "$f" "$d" > "$paths"
         trap -p EXIT > "$trap_snapshot"
     }
     locked_make_tmpfiles_then_fail() {
-        locked_make_tmpfiles
+        local paths="$1" trap_snapshot="$2" f d
+        mktemp_pd f
+        mktemp_dir_pd d
+        printf '%s\n%s\n' "$f" "$d" > "$paths"
+        trap -p EXIT > "$trap_snapshot"
         return 23
     }
 
     mktemp_pd preserved
-    run_write_locked locked_make_tmpfiles
+    run_write_locked locked_make_tmpfiles "$paths" "$trap_snapshot"
     created_file=$(sed -n '1p' "$paths")
     created_dir=$(sed -n '2p' "$paths")
     [ -f "$preserved" ]
@@ -486,7 +535,7 @@ test_run_write_locked_captures_tmp_cleanup_start() {
     if grep -F '$tmp_start' "$trap_snapshot" >/dev/null; then return 1; fi
 
     set +e
-    run_write_locked locked_make_tmpfiles_then_fail
+    run_write_locked locked_make_tmpfiles_then_fail "$paths" "$trap_snapshot"
     rc=$?
     set -e
     [ "$rc" -eq 23 ]

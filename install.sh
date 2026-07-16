@@ -16,6 +16,11 @@ umask 077
 VERSION="3.8.0"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 SCRIPT_URL="${PD_SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
+_PD_SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+case "$_PD_SCRIPT_SOURCE" in
+    /*) ;;
+    *) _PD_SCRIPT_SOURCE="$(cd "$(dirname "$_PD_SCRIPT_SOURCE")" && pwd)/$(basename "$_PD_SCRIPT_SOURCE")" ;;
+esac
 
 cli_usage_error() {
     echo "参数错误: $*" >&2
@@ -311,31 +316,90 @@ write_lock_release() {
     return "$rc"
 }
 
-run_write_locked() {
-    local rc release_rc=0 had_errexit=0 ignored cleanup_trap tmp_start=${#_PD_TMPFILES[@]}
-    [[ $- == *e* ]] && had_errexit=1
-    case "$tmp_start" in
-        ''|*[!0-9]*) err "无效的临时文件清理起点"; return 1 ;;
+write_worker_operation_allowed() {
+    case "$1" in
+        self_install|install_protocol|uninstall_protocol|upgrade_protocol|restart_service|stop_service|start_service|run_export|enable_bbr|enable_bbrv3_kernel|remove_all)
+            return 0 ;;
+        *) [ "${_PD_WRITE_TEST_MODE:-${PD_TEST_MODE:-0}}" = 1 ] ;;
     esac
-    printf -v cleanup_trap 'cleanup_tmpfiles_from %q' "$tmp_start"
+}
 
-    # Keep the operation out of the caller's conditional/errexit context.
-    # Bash disables errexit throughout a function called from if/||, and a
-    # plain subshell inherits that suppression.  A command substitution is a
-    # fresh execution context; fd 3 preserves the operation's normal stdout.
-    set +e
-    write_lock_acquire
+write_worker_save_state() {
+    local dest="$1" name
+    : > "$dest" || return 1
+    for name in SCRIPT_URL BASE_DIR STATE_FILE INSTALLED_BIN SYSTEMD_DIR LOCK_FILE SPEEDTEST_BIN \
+        OS_ID OS_PRETTY OS_FAMILY ARCH IP IP6 PUBLIC_HOST MEM_TOTAL MEM_AVAIL \
+        PD_OPT_SNELL_MODE PD_OPT_SNELL_TLS_SNI PD_OPT_SNELL_TLS_PASS PD_OPT_SNELL_TLS_VERSION \
+        PD_OPT_HY2_HOP PD_OPT_HY2_HOP_RANGE PD_OPT_VLESS_DEST PD_OPT_VLESS_SNI \
+        PD_OPT_VLESS_TRANSPORT PD_OPT_VLESS_FP PD_OPT_ANYTLS_PADDING PD_OPT_ANYTLS_SNI \
+        PD_OPT_INSTALL_QR $(compgen -A variable PD_); do
+        case "$name" in
+            ''|*[!A-Za-z0-9_]*) continue ;;
+        esac
+        declare -p "$name" >> "$dest" 2>/dev/null || true
+    done
+}
+
+run_write_worker() {
+    local operation="${1:-}" worker_dir state_file override_file rc test_mode tmp_start=${#_PD_TMPFILES[@]}
+    test_mode="${_PD_WRITE_TEST_MODE:-${PD_TEST_MODE:-0}}"
+    [ -n "$operation" ] || { err "写操作缺少目标函数"; return 1; }
+    case "$operation" in
+        [A-Za-z_]* ) [[ "$operation" != *[!A-Za-z0-9_]* ]] || { err "无效的写操作函数"; return 1; } ;;
+        *) err "无效的写操作函数"; return 1 ;;
+    esac
+    write_worker_operation_allowed "$operation" || { err "拒绝未注册的写操作: $operation"; return 1; }
+    declare -f "$operation" >/dev/null 2>&1 || { err "写操作函数不存在: $operation"; return 1; }
+
+    mktemp_dir_pd worker_dir
+    state_file="$worker_dir/state.sh"
+    override_file="$worker_dir/operation.sh"
+    write_worker_save_state "$state_file" || { cleanup_tmpfiles_from "$tmp_start"; return 1; }
+    : > "$override_file" || { cleanup_tmpfiles_from "$tmp_start"; return 1; }
+    if [ "$test_mode" = 1 ]; then
+        # Tests may replace exactly the requested operation.  Never export the
+        # script's function namespace into a privileged child.
+        declare -f "$operation" > "$override_file" \
+            || { cleanup_tmpfiles_from "$tmp_start"; return 1; }
+    fi
+
+    # Privileged mode ignores BASH_ENV and inherited exported functions; only
+    # the explicit state and (in tests) single-operation override are loaded.
+    PD_TEST_MODE=1 "$BASH" -p -euo pipefail -c '
+        source "$1"
+        source "$2"
+        [ ! -s "$3" ] || source "$3"
+        _PD_WRITE_TEST_MODE="$4"
+        _PD_IN_WRITE_WORKER=1
+        trap "cleanup_tmpfiles_from 0" EXIT
+        exec 200>&-
+        shift 4
+        "$@"
+    ' pd-write-worker "$_PD_SCRIPT_SOURCE" "$state_file" "$override_file" "$test_mode" "$@"
     rc=$?
-    if [ "$rc" -eq 0 ]; then
-        {
-            ignored=$(
-                trap "$cleanup_trap" EXIT
-                set -e
-                "$@" >&3
-            )
-            rc=$?
-        } 3>&1
+    cleanup_tmpfiles_from "$tmp_start"
+    return "$rc"
+}
 
+run_write_locked() {
+    local rc release_rc=0 had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+
+    # A new Bash process is required: if/|| and set +e suppression propagates
+    # through functions, compound commands, subshells, and command
+    # substitutions in Bash 5.2.  A nested worker starts another fresh Bash
+    # without reacquiring the lock still held by the original parent.
+    set +e
+    if [ "${_PD_IN_WRITE_WORKER:-0}" = 1 ]; then
+        run_write_worker "$@"
+        rc=$?
+    else
+        write_lock_acquire
+        rc=$?
+        if [ "$rc" -eq 0 ]; then
+            run_write_worker "$@"
+            rc=$?
+        fi
         write_lock_release
         release_rc=$?
         if [ "$release_rc" -ne 0 ]; then
