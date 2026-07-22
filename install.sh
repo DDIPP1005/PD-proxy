@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v3.9.0
+# PD-proxy — 多协议代理一键部署脚本 v4.0.0
 # 协议: Snell v4/v5/v6（ShadowTLS 可选）| Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -13,7 +13,7 @@ umask 077
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="3.9.0"
+VERSION="4.0.0"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 SCRIPT_URL="${PD_SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
 _PD_SCRIPT_SOURCE="${BASH_SOURCE[0]}"
@@ -46,6 +46,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   pd --doctor [--json]     只读诊断
   pd --bbr                 开启BBR  pd --bbrv3     BBRv3内核
   pd --update              更新    pd --remove-all [--yes]  卸载全部
+  交互菜单 → 端口转发     IPv4 单端口 TCP / UDP / TCP+UDP
 
 协议: snell (Snell v4/v5/v6；ShadowTLS 可选且可后续启用/关闭) | hy2 | vless | anytls
 
@@ -326,7 +327,7 @@ write_lock_release() {
 
 write_worker_operation_allowed() {
     case "$1" in
-        self_install|install_protocol|uninstall_protocol|upgrade_protocol|restart_service|stop_service|start_service|run_export|enable_bbr|enable_bbrv3_kernel|remove_all|snell_enable_shadowtls|snell_disable_shadowtls|snell_reconfigure_shadowtls)
+        self_install|install_protocol|uninstall_protocol|upgrade_protocol|restart_service|stop_service|start_service|run_export|enable_bbr|enable_bbrv3_kernel|remove_all|snell_enable_shadowtls|snell_disable_shadowtls|snell_reconfigure_shadowtls|forward_add_rule|forward_update_rule|forward_set_rule_enabled|forward_delete_rule|forward_repair_rules|forward_remove_all)
             return 0 ;;
         *) [ "${_PD_WRITE_TEST_MODE:-${PD_TEST_MODE:-0}}" = 1 ] ;;
     esac
@@ -1745,27 +1746,30 @@ state_installed() {
 }
 
 get_all_ports() {
-    [ -f "$STATE_FILE" ] || return 0
-    awk '
-        {
-            port=""; hop=1; status=""
-            for (i=2; i<=NF; i++) {
-                split($i, kv, "=")
-                if (kv[1] == "port") port=kv[2]
-                else if (kv[1] == "hop") hop=kv[2]
-                else if (kv[1] == "status") status=kv[2]
+    if [ -f "$STATE_FILE" ]; then
+        awk '
+            {
+                port=""; hop=1; status=""
+                for (i=2; i<=NF; i++) {
+                    split($i, kv, "=")
+                    if (kv[1] == "port") port=kv[2]
+                    else if (kv[1] == "hop") hop=kv[2]
+                    else if (kv[1] == "status") status=kv[2]
+                }
+                if (status != "installed" || port == "") next
+                if (hop !~ /^[0-9]+$/ || hop < 1) hop=1
+                for (p=port; p<port+hop; p++) print p
             }
-            if (status != "installed" || port == "") next
-            if (hop !~ /^[0-9]+$/ || hop < 1) hop=1
-            for (p=port; p<port+hop; p++) print p
-        }
-    ' "$STATE_FILE"
+        ' "$STATE_FILE"
+    fi
+    if declare -F forward_rules_file >/dev/null 2>&1 && [ -f "$(forward_rules_file)" ]; then
+        awk -F'|' 'NF && $4 ~ /^[0-9]+$/ { print $4 }' "$(forward_rules_file)"
+    fi
 }
 
 state_port_range_conflict() {
     local start="$1" end="$2" exclude_key="${3:-}"
-    [ -f "$STATE_FILE" ] || return 1
-    awk -v start="$start" -v end="$end" -v exclude="$exclude_key" '
+    if [ -f "$STATE_FILE" ] && awk -v start="$start" -v end="$end" -v exclude="$exclude_key" '
         {
             key=$1; port=""; hop=1; status=""
             for (i=2; i<=NF; i++) {
@@ -1781,7 +1785,14 @@ state_port_range_conflict() {
             if (start <= other_end && end >= other_start) found=1
         }
         END { exit found ? 0 : 1 }
-    ' "$STATE_FILE"
+    ' "$STATE_FILE"; then
+        return 0
+    fi
+    if declare -F forward_port_range_conflict >/dev/null 2>&1 \
+        && forward_port_range_conflict "$start" "$end" "$exclude_key"; then
+        return 0
+    fi
+    return 1
 }
 
 # ============================================================
@@ -4467,6 +4478,469 @@ self_install() {
 }
 
 # ============================================================
+# IPv4 单端口转发（nftables DNAT/MASQUERADE）
+# ============================================================
+
+forward_dir()        { printf '%s/forward' "$BASE_DIR"; }
+forward_rules_file() { printf '%s/rules' "$(forward_dir)"; }
+forward_nft_file()   { printf '%s/rules.nft' "$(forward_dir)"; }
+forward_apply_file() { printf '%s/apply.sh' "$(forward_dir)"; }
+forward_unit_file()  { printf '%s/pd-port-forward.service' "$SYSTEMD_DIR"; }
+forward_sysctl_file(){ printf '%s' /etc/sysctl.d/99-pd-port-forward.conf; }
+
+forward_validate_ipv4() {
+    local value="$1" a b c d
+    [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { err "目标必须是固定 IPv4 地址"; return 1; }
+    IFS=. read -r a b c d <<< "$value"
+    for a in "$a" "$b" "$c" "$d"; do
+        [ "$a" -ge 0 ] 2>/dev/null && [ "$a" -le 255 ] || { err "IPv4 地址无效: $value"; return 1; }
+    done
+    case "$value" in
+        0.*|127.*|224.*|225.*|226.*|227.*|228.*|229.*|230.*|231.*|232.*|233.*|234.*|235.*|236.*|237.*|238.*|239.*|24[0-9].*|25[0-5].*)
+            err "拒绝回环、未指定、组播或保留目标地址: $value"; return 1 ;;
+    esac
+}
+
+forward_validate_name() {
+    local value="$1"
+    [ -n "$value" ] || { err "转发名称不能为空"; return 1; }
+    [ "${#value}" -le 40 ] || { err "转发名称最多 40 个字符"; return 1; }
+    case "$value" in *'|'*|*$'\t'*|*$'\n'*|*$'\r'*) err "转发名称不能包含竖线或控制字符"; return 1 ;; esac
+}
+
+forward_validate_proto() {
+    case "$1" in tcp|udp|both) return 0 ;; *) err "转发协议必须是 tcp、udp 或 both"; return 1 ;; esac
+}
+
+forward_validate_id() {
+    [[ "$1" =~ ^pf[0-9]{4}$ ]] || { err "转发编号无效: $1"; return 1; }
+}
+
+forward_prepare_dir() {
+    local dir rules
+    dir=$(forward_dir); rules=$(forward_rules_file)
+    state_path_prepare || return 1
+    [ ! -L "$dir" ] || { err "拒绝使用符号链接转发目录: $dir"; return 1; }
+    if [ -e "$dir" ] && [ ! -f "$dir/.pd-proxy-owned" ]; then
+        err "端口转发目录缺少 PD-proxy 所有权标记: $dir"
+        return 1
+    fi
+    mkdir -p "$dir" || return 1
+    chmod 700 "$dir" || return 1
+    if [ ! -f "$dir/.pd-proxy-owned" ]; then
+        printf '%s\n' 'PD-proxy owned resource' | atomic_write_file "$dir/.pd-proxy-owned" 600 || return 1
+    fi
+    [ ! -L "$rules" ] || { err "拒绝使用符号链接转发状态文件"; return 1; }
+    [ ! -e "$rules" ] || [ -f "$rules" ] || { err "转发状态路径不是普通文件"; return 1; }
+    if [ ! -f "$rules" ]; then
+        : | atomic_write_file "$rules" 600 || return 1
+    fi
+}
+
+forward_assert_owned() {
+    local dir unit
+    dir=$(forward_dir); unit=$(forward_unit_file)
+    if [ -e "$dir" ] || [ -L "$dir" ]; then
+        [ -d "$dir" ] && [ ! -L "$dir" ] && [ -f "$dir/.pd-proxy-owned" ] \
+            || { err "端口转发目录所有权无法确认"; return 1; }
+    fi
+    [ ! -L "$unit" ] || { err "端口转发 unit 是符号链接，拒绝操作"; return 1; }
+    [ ! -e "$unit" ] || unit_is_pd_owned "$unit" \
+        || { err "端口转发 unit 所有权无法确认"; return 1; }
+    if command -v nft >/dev/null 2>&1 && nft list table ip pd_port_forward >/dev/null 2>&1; then
+        [ -f "$dir/.pd-proxy-owned" ] && unit_is_pd_owned "$unit" \
+            || { err "发现所有权未知的 nft table ip pd_port_forward"; return 1; }
+    fi
+    if command -v iptables >/dev/null 2>&1 && iptables -S PD_PORT_FORWARD >/dev/null 2>&1; then
+        [ -f "$dir/.pd-proxy-owned" ] || { err "发现所有权未知的 iptables 链 PD_PORT_FORWARD"; return 1; }
+        if iptables -S PD_PORT_FORWARD 2>/dev/null | grep '^-' \
+            | grep -v '^-N PD_PORT_FORWARD$' | grep -v 'PD-proxy:forward' | grep -q .; then
+            err "PD_PORT_FORWARD 链包含非本脚本规则，拒绝覆盖"
+            return 1
+        fi
+    fi
+}
+
+forward_rule_line() {
+    local id="$1" rules
+    rules=$(forward_rules_file)
+    [ -f "$rules" ] || return 1
+    awk -F'|' -v id="$id" '$1 == id { print; found=1; exit } END { exit found ? 0 : 1 }' "$rules"
+}
+
+forward_rule_count() {
+    local rules
+    rules=$(forward_rules_file)
+    [ -f "$rules" ] || { echo 0; return 0; }
+    awk -F'|' 'NF { n++ } END { print n+0 }' "$rules"
+}
+
+forward_enabled_count() {
+    local rules
+    rules=$(forward_rules_file)
+    [ -f "$rules" ] || { echo 0; return 0; }
+    awk -F'|' '$2 == "1" { n++ } END { print n+0 }' "$rules"
+}
+
+forward_runtime_status() {
+    local enabled
+    enabled=$(forward_enabled_count)
+    if [ "$(forward_rule_count)" -eq 0 ]; then
+        echo "未配置"
+        return 0
+    fi
+    systemctl is-active --quiet pd-port-forward.service 2>/dev/null \
+        || { echo "需修复（服务未运行）"; return 1; }
+    nft list table ip pd_port_forward >/dev/null 2>&1 \
+        || { echo "需修复（nft规则缺失）"; return 1; }
+    [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" = 1 ] \
+        || { echo "需修复（内核转发关闭）"; return 1; }
+    if command -v iptables >/dev/null 2>&1 \
+        && ! iptables -C FORWARD -m comment --comment PD-proxy:forward-jump -j PD_PORT_FORWARD >/dev/null 2>&1; then
+        echo "需修复（FORWARD入口缺失）"
+        return 1
+    fi
+    echo "正常（启用 $enabled 条）"
+}
+
+forward_next_id() {
+    local n id rules
+    rules=$(forward_rules_file)
+    for ((n=1; n<=9999; n++)); do
+        printf -v id 'pf%04d' "$n"
+        if [ ! -f "$rules" ] || ! awk -F'|' -v id="$id" '$1 == id { found=1 } END { exit found ? 0 : 1 }' "$rules"; then
+            echo "$id"
+            return 0
+        fi
+    done
+    err "端口转发数量已达到上限"
+    return 1
+}
+
+forward_port_range_conflict() {
+    local start="$1" end="$2" exclude="${3:-}" rules
+    rules=$(forward_rules_file)
+    [ -f "$rules" ] || return 1
+    awk -F'|' -v start="$start" -v end="$end" -v exclude="$exclude" \
+        '$1 != exclude && $4 >= start && $4 <= end { found=1 } END { exit found ? 0 : 1 }' "$rules"
+}
+
+forward_listen_port_conflict() {
+    local port="$1" exclude="${2:-}"
+    forward_port_range_conflict "$port" "$port" "$exclude"
+}
+
+forward_validate_candidate() {
+    local id="$1" name="$2" proto="$3" listen_port="$4" target_ip="$5" target_port="$6"
+    forward_validate_name "$name" || return 1
+    forward_validate_proto "$proto" || return 1
+    validate_port "$listen_port" "入口"
+    forward_validate_ipv4 "$target_ip" || return 1
+    validate_port "$target_port" "目标"
+    if state_port_range_conflict "$listen_port" "$listen_port" "$id"; then
+        err "入口端口 $listen_port 与已安装的 PD 协议冲突"
+        return 1
+    fi
+    if forward_listen_port_conflict "$listen_port" "$id"; then
+        err "入口端口 $listen_port 已被另一条端口转发保留"
+        return 1
+    fi
+    if port_in_use "$listen_port"; then
+        err "入口端口 $listen_port 已被本机程序监听"
+        return 1
+    fi
+    if command -v ip >/dev/null 2>&1 && ip -4 -o addr show 2>/dev/null \
+        | awk '{split($4,a,"/"); print a[1]}' | grep -Fqx "$target_ip" \
+        && [ "$listen_port" = "$target_port" ]; then
+        err "目标指向本机同一端口，会形成转发回路"
+        return 1
+    fi
+}
+
+forward_rule_upsert() {
+    local id="$1" line="$2" rules dir tmp
+    rules=$(forward_rules_file); dir=$(forward_dir)
+    forward_prepare_dir || return 1
+    tmp=$(mktemp "$dir/.rules.XXXXXX") || return 1
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    awk -F'|' -v id="$id" '$1 != id { print }' "$rules" > "$tmp" || { rm -f "$tmp"; return 1; }
+    printf '%s\n' "$line" >> "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$rules" || { rm -f "$tmp"; return 1; }
+}
+
+forward_rule_remove_record() {
+    local id="$1" rules dir tmp
+    rules=$(forward_rules_file); dir=$(forward_dir)
+    [ -f "$rules" ] || return 0
+    tmp=$(mktemp "$dir/.rules.XXXXXX") || return 1
+    chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+    awk -F'|' -v id="$id" '$1 != id { print }' "$rules" > "$tmp" || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$rules" || { rm -f "$tmp"; return 1; }
+}
+
+forward_validate_rules_file() {
+    local rules line id enabled proto listen target target_port name extra seen=" " count=0
+    rules=$(forward_rules_file)
+    [ -f "$rules" ] || return 0
+    while IFS='|' read -r id enabled proto listen target target_port name extra; do
+        [ -n "$id$enabled$proto$listen$target$target_port$name$extra" ] || continue
+        [ -z "$extra" ] || { err "端口转发状态字段数量无效"; return 1; }
+        forward_validate_id "$id" || return 1
+        case " $seen " in *" $id "*) err "端口转发编号重复: $id"; return 1 ;; esac
+        seen="$seen$id "
+        case "$enabled" in 0|1) ;; *) err "端口转发启用状态无效: $id"; return 1 ;; esac
+        forward_validate_name "$name" || return 1
+        forward_validate_proto "$proto" || return 1
+        validate_port "$listen" "入口"
+        forward_validate_ipv4 "$target" || return 1
+        validate_port "$target_port" "目标"
+        count=$((count + 1))
+        [ "$count" -le 100 ] || { err "端口转发规则最多 100 条"; return 1; }
+    done < "$rules"
+}
+
+forward_generate_nft() {
+    local rules nft id enabled proto listen target target_port name extra transport check
+    rules=$(forward_rules_file); nft=$(forward_nft_file)
+    {
+        echo 'table ip pd_port_forward {'
+        echo '  chain prerouting {'
+        echo '    type nat hook prerouting priority dstnat; policy accept;'
+        while IFS='|' read -r id enabled proto listen target target_port name extra; do
+            [ "$enabled" = 1 ] || continue
+            for transport in $([ "$proto" = both ] && echo 'tcp udp' || echo "$proto"); do
+                printf '    fib daddr type local %s dport %s dnat to %s:%s comment "PD-proxy:%s"\n' \
+                    "$transport" "$listen" "$target" "$target_port" "$id"
+            done
+        done < "$rules"
+        echo '  }'
+        echo '  chain forward {'
+        echo '    type filter hook forward priority -10; policy accept;'
+        echo '    ct state established,related accept comment "PD-proxy:forward-established"'
+        while IFS='|' read -r id enabled proto listen target target_port name extra; do
+            [ "$enabled" = 1 ] || continue
+            for transport in $([ "$proto" = both ] && echo 'tcp udp' || echo "$proto"); do
+                printf '    ct status dnat ip daddr %s %s dport %s accept comment "PD-proxy:%s"\n' \
+                    "$target" "$transport" "$target_port" "$id"
+            done
+        done < "$rules"
+        echo '  }'
+        echo '  chain postrouting {'
+        echo '    type nat hook postrouting priority srcnat; policy accept;'
+        while IFS='|' read -r id enabled proto listen target target_port name extra; do
+            [ "$enabled" = 1 ] || continue
+            for transport in $([ "$proto" = both ] && echo 'tcp udp' || echo "$proto"); do
+                printf '    ct status dnat ip daddr %s %s dport %s masquerade comment "PD-proxy:%s"\n' \
+                    "$target" "$transport" "$target_port" "$id"
+            done
+        done < "$rules"
+        echo '  }'
+        echo '}'
+    } | atomic_write_file "$nft" 600 || return 1
+    mktemp_pd check
+    sed "s/pd_port_forward/pd_port_forward_check_$$/g" "$nft" > "$check" || return 1
+    nft -c -f "$check" || { err "生成的 nftables 规则未通过语法检查"; return 1; }
+}
+
+forward_generate_apply_script() {
+    local rules apply nft id enabled proto listen target target_port name extra transport
+    rules=$(forward_rules_file); apply=$(forward_apply_file); nft=$(forward_nft_file)
+    {
+        cat <<EOF
+#!/usr/bin/env bash
+# PD-proxy owned resource
+set -euo pipefail
+mode="\${1:-apply}"
+nft_bin="\$(command -v nft)"
+remove_runtime() {
+    "\$nft_bin" list table ip pd_port_forward >/dev/null 2>&1 && "\$nft_bin" delete table ip pd_port_forward || true
+    if command -v iptables >/dev/null 2>&1; then
+        while iptables -C FORWARD -m comment --comment PD-proxy:forward-jump -j PD_PORT_FORWARD >/dev/null 2>&1; do
+            iptables -D FORWARD -m comment --comment PD-proxy:forward-jump -j PD_PORT_FORWARD
+        done
+        if iptables -S PD_PORT_FORWARD >/dev/null 2>&1; then
+            iptables -F PD_PORT_FORWARD
+            iptables -X PD_PORT_FORWARD
+        fi
+    fi
+}
+remove_runtime
+[ "\$mode" = remove ] && exit 0
+sysctl -q -w net.ipv4.ip_forward=1
+"\$nft_bin" -f "$nft"
+if command -v iptables >/dev/null 2>&1; then
+    iptables -N PD_PORT_FORWARD
+    iptables -I FORWARD 1 -m comment --comment PD-proxy:forward-jump -j PD_PORT_FORWARD
+    iptables -A PD_PORT_FORWARD -m conntrack --ctstate ESTABLISHED,RELATED -m comment --comment PD-proxy:forward-established -j ACCEPT
+EOF
+        while IFS='|' read -r id enabled proto listen target target_port name extra; do
+            [ "$enabled" = 1 ] || continue
+            for transport in $([ "$proto" = both ] && echo 'tcp udp' || echo "$proto"); do
+                printf '    iptables -A PD_PORT_FORWARD -p %q -d %q --dport %q -m conntrack --ctstate NEW,ESTABLISHED,RELATED -m comment --comment %q -j ACCEPT\n' \
+                    "$transport" "$target" "$target_port" "PD-proxy:forward:$id"
+            done
+        done < "$rules"
+        echo 'fi'
+    } | atomic_write_file "$apply" 700
+}
+
+forward_install_persistence() {
+    local unit sysctl apply
+    unit=$(forward_unit_file); sysctl=$(forward_sysctl_file); apply=$(forward_apply_file)
+    if [ -e "$sysctl" ]; then
+        [ -f "$sysctl" ] && [ ! -L "$sysctl" ] && grep -q '^# PD-proxy owned resource$' "$sysctl" \
+            || { err "IPv4 转发 sysctl 文件已存在且所有权未知: $sysctl"; return 1; }
+    else
+        {
+            echo '# PD-proxy owned resource'
+            echo 'net.ipv4.ip_forward=1'
+        } | atomic_write_file "$sysctl" 644 || return 1
+    fi
+    [ ! -e "$unit" ] || unit_is_pd_owned "$unit" || { err "端口转发 unit 所有权未知"; return 1; }
+    atomic_write_file "$unit" 644 <<EOF || return 1
+[Unit]
+Description=PD-proxy: IPv4 port forwarding
+Wants=network-online.target
+After=network-online.target ufw.service docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$apply apply
+ExecStop=$apply remove
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload || return 1
+    systemctl enable pd-port-forward.service >/dev/null || return 1
+}
+
+forward_apply_current() {
+    local apply
+    apply=$(forward_apply_file)
+    forward_assert_owned || return 1
+    forward_validate_rules_file || return 1
+    check_nftables || { err "当前系统不支持可用的 nftables"; return 1; }
+    forward_generate_nft || return 1
+    forward_generate_apply_script || return 1
+    forward_install_persistence || return 1
+    "$apply" apply || return 1
+    if command -v iptables >/dev/null 2>&1; then save_iptables || return 1; fi
+    systemctl restart pd-port-forward.service || return 1
+    state_set_fields forward "status=installed" "rules=$(forward_rule_count)" "enabled=$(forward_enabled_count)" || return 1
+}
+
+forward_teardown() {
+    local dir unit sysctl apply
+    dir=$(forward_dir); unit=$(forward_unit_file); sysctl=$(forward_sysctl_file); apply=$(forward_apply_file)
+    forward_assert_owned || return 1
+    if [ -x "$apply" ]; then "$apply" remove || return 1; fi
+    if [ -e "$unit" ]; then
+        unit_is_pd_owned "$unit" || { err "端口转发 unit 所有权未知"; return 1; }
+        systemctl disable --now pd-port-forward.service >/dev/null 2>&1 || true
+        rm -f "$unit" || return 1
+        systemctl daemon-reload || return 1
+    fi
+    if [ -e "$sysctl" ]; then
+        [ -f "$sysctl" ] && [ ! -L "$sysctl" ] && grep -q '^# PD-proxy owned resource$' "$sysctl" \
+            || { err "IPv4 转发 sysctl 文件所有权未知"; return 1; }
+        rm -f "$sysctl" || return 1
+        warn "已删除本脚本的 IPv4 转发持久化文件；运行时 ip_forward 保持不变以免影响其他服务"
+    fi
+    if command -v iptables >/dev/null 2>&1; then save_iptables || return 1; fi
+    if [ -e "$dir" ]; then
+        [ -f "$dir/.pd-proxy-owned" ] || { err "端口转发目录所有权未知"; return 1; }
+        rm -rf -- "$dir" || return 1
+    fi
+    state_del forward || return 1
+}
+
+forward_restore_snapshot() {
+    local snapshot="$1" rules
+    rules=$(forward_rules_file)
+    forward_prepare_dir || return 1
+    cp -f "$snapshot" "$rules" || return 1
+    chmod 600 "$rules" || return 1
+    if [ "$(forward_rule_count)" -eq 0 ]; then forward_teardown; else forward_apply_current; fi
+}
+
+forward_mutation_finish() {
+    local snapshot="$1" rc=0
+    if [ "$(forward_rule_count)" -eq 0 ]; then
+        forward_teardown || rc=$?
+    else
+        forward_apply_current || rc=$?
+    fi
+    if [ "$rc" -ne 0 ]; then
+        err "端口转发变更失败，正在恢复原状态"
+        forward_restore_snapshot "$snapshot" || err "端口转发回滚不完整，请立即检查"
+        return "$rc"
+    fi
+}
+
+forward_add_rule() {
+    local name="$1" proto="$2" listen="$3" target="$4" target_port="$5" id rules snapshot
+    forward_prepare_dir || return 1
+    [ "$(forward_rule_count)" -lt 100 ] || { err "端口转发规则最多 100 条"; return 1; }
+    forward_validate_candidate "" "$name" "$proto" "$listen" "$target" "$target_port" || return 1
+    id=$(forward_next_id) || return 1
+    rules=$(forward_rules_file); mktemp_pd snapshot; cp -f "$rules" "$snapshot" || return 1
+    forward_rule_upsert "$id" "$id|1|$proto|$listen|$target|$target_port|$name" || return 1
+    forward_mutation_finish "$snapshot" || return 1
+    info "端口转发已添加: $id  $proto :$listen -> $target:$target_port"
+}
+
+forward_update_rule() {
+    local id="$1" name="$2" proto="$3" listen="$4" target="$5" target_port="$6" old enabled rules snapshot
+    forward_validate_id "$id" || return 1
+    old=$(forward_rule_line "$id") || { err "未找到端口转发: $id"; return 1; }
+    IFS='|' read -r _ enabled _ _ _ _ _ <<< "$old"
+    forward_validate_candidate "$id" "$name" "$proto" "$listen" "$target" "$target_port" || return 1
+    rules=$(forward_rules_file); mktemp_pd snapshot; cp -f "$rules" "$snapshot" || return 1
+    forward_rule_upsert "$id" "$id|$enabled|$proto|$listen|$target|$target_port|$name" || return 1
+    forward_mutation_finish "$snapshot" || return 1
+    info "端口转发已更新: $id"
+}
+
+forward_set_rule_enabled() {
+    local id="$1" enabled="$2" old _ old_enabled proto listen target target_port name rules snapshot
+    forward_validate_id "$id" || return 1
+    case "$enabled" in 0|1) ;; *) err "启用状态无效"; return 1 ;; esac
+    old=$(forward_rule_line "$id") || { err "未找到端口转发: $id"; return 1; }
+    IFS='|' read -r _ old_enabled proto listen target target_port name <<< "$old"
+    [ "$old_enabled" != "$enabled" ] || { info "端口转发状态未变化"; return 0; }
+    if [ "$enabled" = 1 ]; then
+        forward_validate_candidate "$id" "$name" "$proto" "$listen" "$target" "$target_port" || return 1
+    fi
+    rules=$(forward_rules_file); mktemp_pd snapshot; cp -f "$rules" "$snapshot" || return 1
+    forward_rule_upsert "$id" "$id|$enabled|$proto|$listen|$target|$target_port|$name" || return 1
+    forward_mutation_finish "$snapshot" || return 1
+    [ "$enabled" = 1 ] && info "端口转发已启用: $id" || info "端口转发已停用: $id"
+}
+
+forward_delete_rule() {
+    local id="$1" rules snapshot
+    forward_validate_id "$id" || return 1
+    forward_rule_line "$id" >/dev/null || { err "未找到端口转发: $id"; return 1; }
+    rules=$(forward_rules_file); mktemp_pd snapshot; cp -f "$rules" "$snapshot" || return 1
+    forward_rule_remove_record "$id" || return 1
+    forward_mutation_finish "$snapshot" || return 1
+    info "端口转发已删除: $id"
+}
+
+forward_repair_rules() {
+    [ "$(forward_rule_count)" -gt 0 ] || { warn "没有端口转发规则"; return 0; }
+    forward_apply_current || return 1
+    info "端口转发规则已重新生成并加载"
+}
+
+forward_remove_all() {
+    forward_teardown || return 1
+    info "全部 PD-proxy 端口转发已删除"
+}
+
+# ============================================================
 # 卸载全部
 # ============================================================
 
@@ -4579,6 +5053,10 @@ remove_all() {
     fi
 
     local proto failed=0 target entry
+    if ! forward_remove_all; then
+        err "端口转发清理失败；保留 PD-proxy 状态和入口以便重试"
+        return 1
+    fi
     for proto in $ALL_PROTOS; do
         if state_installed "$(pkey "$proto")"; then
             if ! uninstall_protocol "$proto"; then
@@ -5325,6 +5803,114 @@ menu_view() {
     return 0
 }
 
+forward_show_rules() {
+    local rules id enabled proto listen target target_port name extra status
+    rules=$(forward_rules_file)
+    echo ""
+    echo -e "  ${MAGENTA}▸ 端口转发列表${RESET}"
+    status=$(forward_runtime_status || true)
+    echo -e "  运行状态: ${CYAN}$status${RESET}"
+    if [ ! -f "$rules" ] || [ "$(forward_rule_count)" -eq 0 ]; then
+        echo -e "  ${DIM}暂无端口转发${RESET}"
+        return 0
+    fi
+    while IFS='|' read -r id enabled proto listen target target_port name extra; do
+        [ -n "$id" ] || continue
+        status="${DIM}已停用${RESET}"; [ "$enabled" = 1 ] && status="${GREEN}运行中${RESET}"
+        printf "  %-6s %-12s %-4s :%-5s → %-15s:%-5s %b\n" \
+            "$id" "$name" "$proto" "$listen" "$target" "$target_port" "$status"
+    done < "$rules"
+}
+
+menu_forward_prompt_fields() {
+    local current_name="${1:-}" current_proto="${2:-tcp}" current_listen="${3:-}" current_target="${4:-}" current_target_port="${5:-}"
+    local input pc
+    echo -ne "  名称${current_name:+ [$current_name]}: "; read -r input
+    PF_NAME="${input:-$current_name}"
+    echo "  协议: [1] TCP  [2] UDP  [3] TCP+UDP"
+    echo -ne "  选择 [当前 $current_proto]: "; read -r pc
+    case "$pc" in 1) PF_PROTO=tcp ;; 2) PF_PROTO=udp ;; 3) PF_PROTO=both ;; *) PF_PROTO="$current_proto" ;; esac
+    echo -ne "  本机入口端口${current_listen:+ [$current_listen]}: "; read -r input
+    PF_LISTEN="${input:-$current_listen}"
+    echo -ne "  目标固定IPv4${current_target:+ [$current_target]}: "; read -r input
+    PF_TARGET="${input:-$current_target}"
+    echo -ne "  目标端口${current_target_port:+ [$current_target_port]}: "; read -r input
+    PF_TARGET_PORT="${input:-$current_target_port}"
+    forward_validate_name "$PF_NAME" || return 1
+    forward_validate_proto "$PF_PROTO" || return 1
+    validate_port "$PF_LISTEN" "入口"
+    forward_validate_ipv4 "$PF_TARGET" || return 1
+    validate_port "$PF_TARGET_PORT" "目标"
+}
+
+menu_forward_add() {
+    local confirm
+    menu_forward_prompt_fields || return 1
+    echo -e "  ${YELLOW}将创建: $PF_PROTO :$PF_LISTEN → $PF_TARGET:$PF_TARGET_PORT${RESET}"
+    echo -ne "  确认？输入 yes: "; read -r confirm
+    [ "$confirm" = yes ] || { info "已取消"; return 0; }
+    run_write_locked forward_add_rule "$PF_NAME" "$PF_PROTO" "$PF_LISTEN" "$PF_TARGET" "$PF_TARGET_PORT"
+}
+
+menu_forward_modify() {
+    local id line enabled proto listen target target_port name confirm
+    forward_show_rules
+    echo -ne "  输入要修改的编号（例如 pf0001）: "; read -r id
+    line=$(forward_rule_line "$id") || { warn "未找到端口转发: $id"; return 1; }
+    IFS='|' read -r _ enabled proto listen target target_port name <<< "$line"
+    menu_forward_prompt_fields "$name" "$proto" "$listen" "$target" "$target_port" || return 1
+    echo -ne "  确认修改？输入 yes: "; read -r confirm
+    [ "$confirm" = yes ] || { info "已取消"; return 0; }
+    run_write_locked forward_update_rule "$id" "$PF_NAME" "$PF_PROTO" "$PF_LISTEN" "$PF_TARGET" "$PF_TARGET_PORT"
+}
+
+menu_forward_toggle() {
+    local id line enabled action
+    forward_show_rules
+    echo -ne "  输入要启用/停用的编号: "; read -r id
+    line=$(forward_rule_line "$id") || { warn "未找到端口转发: $id"; return 1; }
+    IFS='|' read -r _ enabled _ <<< "$line"
+    if [ "$enabled" = 1 ]; then action=0; else action=1; fi
+    run_write_locked forward_set_rule_enabled "$id" "$action"
+}
+
+menu_forward_delete() {
+    local id confirm
+    forward_show_rules
+    echo -ne "  输入要删除的编号: "; read -r id
+    forward_rule_line "$id" >/dev/null || { warn "未找到端口转发: $id"; return 1; }
+    echo -ne "  确认删除 $id？输入 yes: "; read -r confirm
+    [ "$confirm" = yes ] || { info "已取消"; return 0; }
+    run_write_locked forward_delete_rule "$id"
+}
+
+menu_forwarding() {
+    local cc
+    while true; do
+        forward_show_rules
+        echo ""
+        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
+        echo -e "  ${CYAN}│${RESET} [1] 添加端口转发                     ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [2] 修改端口转发                     ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [3] 启用/停用端口转发                ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [4] 删除端口转发                     ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [5] 检查并修复规则                   ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}│${RESET} [B] 返回主菜单                       ${CYAN}│${RESET}"
+        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
+        echo -ne "  ${MAGENTA}▸${RESET} 选择: "; read -r cc
+        case "$cc" in
+            1) menu_forward_add || true ;;
+            2) menu_forward_modify || true ;;
+            3) menu_forward_toggle || true ;;
+            4) menu_forward_delete || true ;;
+            5) run_write_locked forward_repair_rules || true ;;
+            [Bb]) return 0 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) warn "无效选择" ;;
+        esac
+    done
+}
+
 menu_system() {
     echo -e "  ${MAGENTA}▸ 系统工具${RESET}"
     echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
@@ -5360,7 +5946,8 @@ run_write_locked self_install || warn "pd 更新失败，使用缓存版本"
 while true; do
     show_status
     echo -e "  ${CYAN}[1]${RESET} 安装协议    ${CYAN}[2]${RESET} 协议管理"
-    echo -e "  ${CYAN}[3]${RESET} 系统工具    ${CYAN}[4]${RESET} 更新脚本"
+    echo -e "  ${CYAN}[3]${RESET} 端口转发    ${CYAN}[4]${RESET} 系统工具"
+    echo -e "  ${CYAN}[5]${RESET} 更新脚本"
     echo -e "  ${CYAN}[Q]${RESET} 退出"
     echo ""
     echo -ne "  ${MAGENTA}▸${RESET} 选择: "
@@ -5368,8 +5955,9 @@ while true; do
     case "$cc" in
         1) while menu_install; do :; done ;;
         2) while menu_manage; do :; done ;;
-        3) while menu_system; do :; done ;;
-        4) PD_UPDATE=1 run_write_locked self_install && info "PD-proxy脚本已更新" ;;
+        3) menu_forwarding ;;
+        4) while menu_system; do :; done ;;
+        5) PD_UPDATE=1 run_write_locked self_install && info "PD-proxy脚本已更新" ;;
         [Qq]) info "再见 👋"; exit 0 ;;
         *) ;;
     esac

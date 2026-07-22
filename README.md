@@ -1,15 +1,15 @@
 # PD-proxy
 
-> 一个 `pd` 命令，部署和管理 Snell、Hysteria2、VLESS Reality 与 AnyTLS。
+> 一个 `pd` 命令，部署和管理 Snell、Hysteria2、VLESS Reality、AnyTLS 与独立 IPv4 端口转发。
 
 <p>
-  <kbd>v3.9.0</kbd>
+  <kbd>v4.0.0</kbd>
   <kbd>Debian / Ubuntu</kbd>
   <kbd>amd64 / arm64</kbd>
   <kbd>Surge / Shadowrocket</kbd>
 </p>
 
-[快速开始](#快速开始) · [支持协议](#支持协议) · [常用命令](#常用命令) · [部署示例](#部署示例) · [旧版更新](#旧版无中断更新) · [故障诊断](#故障诊断)
+[快速开始](#快速开始) · [支持协议](#支持协议) · [常用命令](#常用命令) · [部署示例](#部署示例) · [端口转发](#ipv4-单端口转发) · [旧版更新](#旧版无中断更新) · [故障诊断](#故障诊断)
 
 ---
 
@@ -21,6 +21,7 @@
 - **Snell 多版本**：安装时可选 v4、v5、v6，并按所选大版本自动解析官方最新资产。
 - **ShadowTLS 可切换**：安装时可启用，也可在 Snell 深入管理中后续启用、修改或关闭，无需重装 Snell。
 - **安全更新**：HTTPS 下载、可选 SHA-256 严格校验、原子写入和资源所有权保护。
+- **独立端口转发**：通过 nftables DNAT/MASQUERADE 管理 IPv4 TCP、UDP 或 TCP+UDP 单端口转发，支持启停、修改、修复与开机恢复。
 - **一键诊断**：`pd --doctor` 检查服务、端口、监听族、防火墙和 BBR。
 
 ## 支持协议
@@ -107,6 +108,8 @@ sudo env PD_SNELL_MAJOR=6 PD_SNELL_V6_MODE=unshaped \
 
 > `pd --upgrade` 更新代理程序；`pd --update` 更新管理脚本，两者用途不同。
 
+端口转发目前通过 Root 交互菜单管理：运行 `sudo pd`，选择“端口转发”。
+
 ## 部署示例
 
 ### Snell + ShadowTLS
@@ -152,9 +155,49 @@ sudo env PD_LISTEN_FAMILY=dual pd --install snell
 > [!NOTE]
 > Snell v4/v5 普通模式受上游服务端能力限制，仅使用 IPv4 监听；Snell v6 以及 ShadowTLS 公网前端可按实际网络能力使用双栈。脚本不会为未验证成功的地址族输出客户端配置。
 
+## IPv4 单端口转发
+
+适用于把中转服务器 A 的一个公网入口端口转发到目标服务器 B 的固定 IPv4 与服务端口：
+
+```text
+客户端 → A公网IPv4:入口端口 → B固定IPv4:目标端口
+```
+
+只需在中转服务器 A 安装并运行 PD-proxy；B 只需运行实际服务，并允许来自 A 的访问。运行：
+
+```bash
+sudo pd
+# 选择：端口转发
+```
+
+菜单支持：
+
+- 添加、查看和修改规则；
+- 启用、停用和删除单条规则；
+- 检查并修复运行态；
+- 删除全部由 PD-proxy 管理的转发资源。
+
+当前版本边界：
+
+- 仅支持固定目标 IPv4，不支持域名、IPv6、端口段、多目标负载均衡或故障切换；
+- 每条规则使用单个入口端口和单个目标端口，协议可选 TCP、UDP 或 TCP+UDP；
+- 入口端口不得与已安装代理协议或其他端口转发规则冲突；停用规则仍保留该入口端口；
+- 默认使用 MASQUERADE，目标服务器 B 通常看到的是中转服务器 A 的地址，而不是客户端真实源地址；
+- 脚本不会自动修改云厂商安全组；需自行放行 A 的入口端口，并确保 B 允许 A 访问目标端口。
+
+运行态使用独立资源：
+
+- nftables：`table ip pd_port_forward`；
+- iptables：`PD_PORT_FORWARD` 链，用于兼容 FORWARD 策略；
+- systemd：`pd-port-forward.service`，开机自动恢复已启用规则；
+- sysctl：`/etc/sysctl.d/99-pd-port-forward.conf`，持久化 IPv4 转发；
+- 状态与生成文件：`/opt/pd/forward/`。
+
+脚本只覆盖和删除带有 PD-proxy 所有权标记的对象，不覆盖 Docker、UFW 或用户已有防火墙资源。删除最后一条规则会清理自有 nftables、iptables、systemd 与持久化文件；为避免影响其他服务，移除持久化文件时不会擅自关闭当前运行中的 `ip_forward`。
+
 ## 旧版无中断更新
 
-v3.7.x / v3.8.x 已安装节点不需要重装协议。只替换管理脚本即可：
+v3.7.x / v3.8.x / v3.9.x 已安装节点不需要重装协议。只替换管理脚本即可：
 
 ```bash
 bash -n ./install.sh
@@ -243,6 +286,7 @@ sudo pd --bbrv3
 - amd64 / arm64
 - Bash 4.0+
 - systemd
+- 使用端口转发功能时需要 nftables、iptables 与 IPv4 转发能力
 - 安装与变更操作需要 Root
 
-主要目录：`/opt/pd/`、`/opt/snell/`、`/opt/hysteria2/`、`/opt/xray/`、`/opt/anytls/`。
+主要目录：`/opt/pd/`、`/opt/pd/forward/`、`/opt/snell/`、`/opt/hysteria2/`、`/opt/xray/`、`/opt/anytls/`。
