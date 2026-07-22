@@ -1246,6 +1246,27 @@ test_unknown_cli_parameter_framework() {
     grep -q '未知参数: --future-reserved-flag' <<< "$output"
 }
 
+test_snell_latest_asset_parsing_prefers_rc() {
+    local version order
+    BASE_DIR="$TEST_ROOT/snell-version"
+    ARCH=amd64
+    unset PD_SNELL_VERSION PD_STRICT_LATEST
+    snell_manual_html() {
+        printf '%s\n' \
+            '### v6.0.0 Beta' \
+            'https://dl.nssurge.com/snell/snell-server-v6.0.0b4-linux-amd64.zip' \
+            'https://dl.nssurge.com/snell/snell-server-v6.0.0rc-linux-amd64.zip'
+    }
+    version=$(snell_get_version 6)
+    [ "$version" = v6.0.0rc ]
+    order=$(printf 'v6.0.0b4\nv6.0.0rc\nv6.0.0rc2\nv6.0.0\n' | snell_version_sort)
+    [ "$(printf '%s\n' "$order" | sed -n '1p')" = v6.0.0 ]
+    [ "$(printf '%s\n' "$order" | sed -n '2p')" = v6.0.0rc2 ]
+    [ "$(printf '%s\n' "$order" | sed -n '3p')" = v6.0.0rc ]
+    [ "$(printf '%s\n' "$order" | sed -n '4p')" = v6.0.0b4 ]
+    [ "$(snell_probe_candidates 6 | sed -n '1p')" = v6.0.0rc ]
+}
+
 run_test "test runner preserves errexit after an earlier failed assertion" test_framework_errexit_self_check
 run_test "explicit transaction rollback survives die/exit" test_transaction_control_flow
 run_test "no ERR rollback trap is installed" test_no_err_rollback_trap
@@ -1272,6 +1293,7 @@ run_test "IPv6-only protocol outputs always use a bracketed primary host" test_i
 run_test "dual-stack output keeps one primary and one IPv6 addition" test_dual_stack_output_is_not_duplicated
 run_test "uninstall CLI preserves a failing operation exit code" test_uninstall_failure_exit_is_preserved
 run_test "unknown CLI parameters have a reserved rejection test" test_unknown_cli_parameter_framework
+run_test "Snell latest asset parsing prefers RC over beta headings" test_snell_latest_asset_parsing_prefers_rc
 run_test "public IP discovery is HTTPS-consistent and supports overrides" test_ip_https_consensus_and_overrides
 run_test "unknown public endpoints never generate configuration" test_no_unknown_endpoint_output
 run_test "extra CLI arguments exit 2 before privileged work" test_cli_arity_is_exit_2
