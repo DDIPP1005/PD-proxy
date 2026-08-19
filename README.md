@@ -128,6 +128,9 @@ Snell v6 的 Surge 配置会按服务端模式输出 `mode=unshaped` 或 `mode=u
 
 ### Hysteria2 端口跳跃
 
+Surge 使用官方 `port-hopping=` 参数；分享 URI 会携带完整跳跃端口范围。
+
+
 ```bash
 sudo env PD_HY2_HOP=5 pd --install hy2
 # 或指定完整范围
@@ -290,3 +293,60 @@ sudo pd --bbrv3
 - 安装与变更操作需要 Root
 
 主要目录：`/opt/pd/`、`/opt/pd/forward/`、`/opt/snell/`、`/opt/hysteria2/`、`/opt/xray/`、`/opt/anytls/`。
+
+
+## AnyTLS 稳定模式：sing-box 后端
+
+AnyTLS 默认后端已改为 `sing-box`，适合 Surge 长期使用；旧的 `anytls-go` 参考实现保留为 legacy/快速测试模式。
+
+### 推荐安装
+
+```bash
+sudo env \
+  PD_ANYTLS_BACKEND=sing-box \
+  PD_ANYTLS_DOMAIN=node.example.com \
+  PD_PUBLIC_HOST=node.example.com \
+  PD_ANYTLS_PORT=443 \
+  PD_ANYTLS_CERT_MODE=auto \
+  bash install.sh --install anytls
+```
+
+要求：
+
+- `node.example.com` 已经 A/AAAA 解析到当前 VPS；
+- Cloudflare 使用 DNS only，不要橙云代理；
+- `80/TCP` 可临时用于 Let's Encrypt standalone 申请证书；
+- `443/TCP` 用于 AnyTLS 服务。
+
+### 使用已有证书
+
+```bash
+sudo env \
+  PD_ANYTLS_BACKEND=sing-box \
+  PD_ANYTLS_DOMAIN=node.example.com \
+  PD_ANYTLS_CERT_MODE=existing \
+  PD_ANYTLS_CERT_PATH=/etc/letsencrypt/live/node.example.com/fullchain.pem \
+  PD_ANYTLS_KEY_PATH=/etc/letsencrypt/live/node.example.com/privkey.pem \
+  PD_ANYTLS_PORT=443 \
+  bash install.sh --install anytls
+```
+
+### 保留旧 anytls-go 模式
+
+```bash
+sudo env PD_ANYTLS_BACKEND=anytls-go bash install.sh --install anytls
+```
+
+### 新增环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `PD_ANYTLS_BACKEND` | `sing-box` | `sing-box` 稳定模式；`anytls-go` legacy 模式 |
+| `PD_ANYTLS_DOMAIN` | `PD_PUBLIC_HOST` | AnyTLS 证书域名与默认输出地址 |
+| `PD_ANYTLS_CERT_MODE` | `auto` | `auto` / `existing` / `acme` / `self-signed` |
+| `PD_ANYTLS_CERT_PATH` | 空 | 现有证书 fullchain 路径 |
+| `PD_ANYTLS_KEY_PATH` | 空 | 现有私钥路径 |
+| `PD_ANYTLS_SNI` | 域名 | Surge/客户端 SNI |
+| `PD_ANYTLS_REUSE` | `auto` | `auto` / `true` / `false` |
+| `PD_ANYTLS_PADDING` | `standard` | `standard` 默认；`none` 关闭 sing-box padding_scheme |
+| `PD_ANYTLS_SINGBOX_VERSION` | 空 | 固定 sing-box 版本，例如 `v1.13.14` |

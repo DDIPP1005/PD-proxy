@@ -257,6 +257,7 @@ test_systemd_dollar_credentials_round_trip() {
     [ "$(unit_password_value "$unit")" = "$raw" ]
 
     pdir() { echo "$dir/anytls"; }
+    anytls_backend() { echo anytls-go; }
     printf '%s\n' "$raw" > "$dir/anytls/.password"
     write_systemd anytls /opt/anytls/anytls-server "$(anytls_service_args 8443)"
     unit="$SYSTEMD_DIR/anytls.service"
@@ -581,6 +582,7 @@ test_run_write_locked_reports_release_failure() {
 test_anytls_surge_output() {
     local dir="$TEST_ROOT/anytls-output" output
     pdir() { echo "$dir"; }
+    anytls_backend() { echo anytls-go; }
     mkdir -p "$dir"; printf standard > "$dir/.padding"
     IP=203.0.113.10; IP6=""
     state_get() { [ "$2" = listen_ipv4 ] && echo 1 || echo 0; }
@@ -601,6 +603,7 @@ test_ipv6_only_protocol_outputs() {
     printf standard > "$dir/anytls/.padding"
 
     pdir() { echo "$dir/$1"; }
+    anytls_backend() { echo anytls-go; }
     output_header() { :; }
     output_footer() { :; }
     gen_qr() { printf 'QR: %s\n' "$1"; }
@@ -643,8 +646,8 @@ test_ipv6_only_protocol_outputs() {
     grep -Fq "Proxy = snell, [$ipv6], 444, psk=snell-secret, version=4" <<< "$snell_shadow"
     grep -Fq "Proxy = hysteria2, [$ipv6], 8443, password=hy2-secret" <<< "$hy2_single"
     grep -Fq "QR: hysteria2://hy2-secret@[$ipv6]:8443?" <<< "$hy2_single"
-    grep -Fq "Proxy = hysteria2, [$ipv6], 9443-9445, password=hy2-secret" <<< "$hy2_hop"
-    grep -Fq "QR: hysteria2://hy2-secret@[$ipv6]:9443?" <<< "$hy2_hop"
+    grep -Fq "Proxy = hysteria2, [$ipv6], 9443, password=hy2-secret, sni=www.bing.com, skip-cert-verify=true, port-hopping=9443-9445" <<< "$hy2_hop"
+    grep -Fq "QR: hysteria2://hy2-secret@[$ipv6]:9443-9445?" <<< "$hy2_hop"
     grep -Fq "QR: vless://00000000-0000-0000-0000-000000000001@[$ipv6]:10443?" <<< "$vless"
     grep -Fq "vless://00000000-0000-0000-0000-000000000001@[$ipv6]:10443?" <<< "$vless"
     grep -Fq "Proxy = anytls, [$ipv6], 11443, password=anytls-secret" <<< "$anytls"
@@ -657,6 +660,7 @@ test_dual_stack_output_is_not_duplicated() {
     mkdir -p "$dir"
     printf standard > "$dir/.padding"
     pdir() { echo "$dir"; }
+    anytls_backend() { echo anytls-go; }
     state_get() {
         case "$2" in listen_ipv4|listen_ipv6) echo 1 ;; *) echo 0 ;; esac
     }
@@ -1175,13 +1179,30 @@ test_sensitive_units_are_mode_600_and_sandboxed() {
     local unit
     SYSTEMD_DIR="$TEST_ROOT/secret-systemd"
     mkdir -p "$SYSTEMD_DIR"
+    # Keep this unit test isolated from any real /opt/anytls metadata on the host.
+    anytls_backend() { printf '%s
+' "$PD_OPT_ANYTLS_BACKEND"; }
+
+    # legacy anytls-go keeps DynamicUser because it only needs argv/config data.
+    PD_OPT_ANYTLS_BACKEND=anytls-go
     write_systemd anytls /opt/anytls/anytls-server '-l 0.0.0.0:443 -p secret'
     unit="$SYSTEMD_DIR/anytls.service"
     [ "$(stat -f%Lp "$unit" 2>/dev/null || stat -c%a "$unit")" = 600 ]
     grep -q '^DynamicUser=yes$' "$unit"
     grep -q '^ProtectSystem=strict$' "$unit"
-}
+    grep -q '^RestrictAddressFamilies=AF_INET AF_INET6$' "$unit"
 
+    # sing-box stable mode must read certificate/key paths (e.g. LetsEncrypt),
+    # so it intentionally stays root but remains sandboxed and capability-bounded.
+    rm -f "$unit"
+    PD_OPT_ANYTLS_BACKEND=sing-box
+    write_systemd anytls /opt/anytls/sing-box 'run -c /opt/anytls/config.json'
+    [ "$(stat -f%Lp "$unit" 2>/dev/null || stat -c%a "$unit")" = 600 ]
+    ! grep -q '^DynamicUser=yes$' "$unit"
+    grep -q '^ProtectSystem=strict$' "$unit"
+    grep -q '^AmbientCapabilities=CAP_NET_BIND_SERVICE$' "$unit"
+    grep -q '^RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK$' "$unit"
+}
 test_bbr_unsupported_is_nonzero() {
     sysctl() { [ "${1:-}" = -n ] && echo cubic || return 0; }
     uname() { [ "${1:-}" = -r ] && echo 4.8.0 || command uname "$@"; }
@@ -1267,6 +1288,76 @@ test_snell_latest_asset_parsing_prefers_rc() {
     [ "$(snell_probe_candidates 6 | sed -n '1p')" = v6.0.0rc ]
 }
 
+test_hy2_surge_port_hopping_uses_official_parameter() {
+    local output
+    IP=203.0.113.10; IP6=""; PUBLIC_HOST=""
+    state_get() {
+        case "$2" in
+            listen_ipv4) echo 1 ;;
+            listen_ipv6) echo 0 ;;
+            hop) echo 4 ;;
+            *) echo "" ;;
+        esac
+    }
+    output_header() { :; }; output_footer() { :; }; gen_qr() { printf 'QR: %s\n' "$1"; }
+    output=$(hy2_output 20000 secret)
+    grep -Fq 'Proxy = hysteria2, 203.0.113.10, 20000, password=secret, sni=www.bing.com, skip-cert-verify=true, port-hopping=20000-20003' <<< "$output"
+    ! grep -Fq 'ports=' <<< "$output"
+    grep -Fq 'QR: hysteria2://secret@203.0.113.10:20000-20003?sni=www.bing.com&insecure=1#PD-HY2' <<< "$output"
+}
+
+test_hy2_config_export_uses_official_port_hopping() {
+    local output
+    IP=203.0.113.10; IP6=""; PUBLIC_HOST=""
+    state_installed() { [ "$1" = hy2 ]; }
+    state_get() {
+        case "$2" in
+            port) echo 20000 ;;
+            hop) echo 4 ;;
+            listen_ipv4) echo 1 ;;
+            listen_ipv6) echo 0 ;;
+            *) echo "" ;;
+        esac
+    }
+    yaml_value() { [ "$1" = password ] && echo secret; }
+    pkey() { echo "$1"; }
+    pdir() { echo "$TEST_ROOT/$1"; }
+    output=$(show_config_only hy2)
+    grep -Fq 'Proxy = hysteria2, 203.0.113.10, 20000, password=secret, sni=www.bing.com, skip-cert-verify=true, port-hopping=20000-20003' <<< "$output"
+    ! grep -Fq 'ports=' <<< "$output"
+    grep -Fq '# Shadowrocket: hysteria2://secret@203.0.113.10:20000-20003?sni=www.bing.com&insecure=1#PD-HY2' <<< "$output"
+}
+
+test_forward_rules_generate_owned_dnat_and_masquerade() {
+    local dir="$TEST_ROOT/forward-core" rules nft
+    mkdir -p "$dir"
+    forward_dir() { echo "$dir"; }
+    forward_rules_file() { echo "$dir/rules"; }
+    forward_nft_file() { echo "$dir/rules.nft"; }
+    atomic_write_file() {
+        local path="$1" mode="$2"
+        cat > "$path"
+        chmod "$mode" "$path"
+    }
+    mktemp_pd() {
+        local __name="$1" tmp="$dir/check.nft"
+        : > "$tmp"
+        printf -v "$__name" '%s' "$tmp"
+    }
+    nft() { [ "${1:-}" = -c ] && [ "${2:-}" = -f ]; }
+
+    rules=$(forward_rules_file)
+    printf '%s\n' 'pf0001|1|both|12000|198.51.100.20|443|demo' > "$rules"
+    forward_validate_rules_file
+    forward_generate_nft
+    nft=$(forward_nft_file)
+    grep -Fq 'table ip pd_port_forward' "$nft"
+    grep -Fq 'tcp dport 12000 dnat to 198.51.100.20:443 comment "PD-proxy:pf0001"' "$nft"
+    grep -Fq 'udp dport 12000 dnat to 198.51.100.20:443 comment "PD-proxy:pf0001"' "$nft"
+    grep -Fq 'tcp dport 443 masquerade comment "PD-proxy:pf0001"' "$nft"
+    grep -Fq 'udp dport 443 masquerade comment "PD-proxy:pf0001"' "$nft"
+}
+
 run_test "test runner preserves errexit after an earlier failed assertion" test_framework_errexit_self_check
 run_test "explicit transaction rollback survives die/exit" test_transaction_control_flow
 run_test "no ERR rollback trap is installed" test_no_err_rollback_trap
@@ -1289,6 +1380,9 @@ run_test "write lock isolates errexit and preserves caller state" test_run_write
 run_test "write lock captures scoped temp cleanup before EXIT" test_run_write_locked_captures_tmp_cleanup_start
 run_test "write lock reports release failure after a successful operation" test_run_write_locked_reports_release_failure
 run_test "AnyTLS emits Surge Proxy = anytls" test_anytls_surge_output
+run_test "HY2 Surge port hopping uses the official parameter" test_hy2_surge_port_hopping_uses_official_parameter
+run_test "HY2 config/export uses the official port hopping parameter" test_hy2_config_export_uses_official_port_hopping
+run_test "port forwarding generates owned DNAT and masquerade rules" test_forward_rules_generate_owned_dnat_and_masquerade
 run_test "IPv6-only protocol outputs always use a bracketed primary host" test_ipv6_only_protocol_outputs
 run_test "dual-stack output keeps one primary and one IPv6 addition" test_dual_stack_output_is_not_duplicated
 run_test "uninstall CLI preserves a failing operation exit code" test_uninstall_failure_exit_is_preserved

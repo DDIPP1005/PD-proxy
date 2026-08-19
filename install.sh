@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v4.0.0
+# PD-proxy — 多协议代理一键部署脚本 v4.2.0
 # 协议: Snell v4/v5/v6（ShadowTLS 可选）| Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -13,7 +13,7 @@ umask 077
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="4.0.0"
+VERSION="4.2.0"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 SCRIPT_URL="${PD_SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
 _PD_SCRIPT_SOURCE="${BASH_SOURCE[0]}"
@@ -46,6 +46,7 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   pd --doctor [--json]     只读诊断
   pd --bbr                 开启BBR  pd --bbrv3     BBRv3内核
   pd --update              更新    pd --remove-all [--yes]  卸载全部
+  pd --self-test          只读静态自检（上线前建议运行）
   交互菜单 → 端口转发     IPv4 单端口 TCP / UDP / TCP+UDP
 
 协议: snell (Snell v4/v5/v6；ShadowTLS 可选且可后续启用/关闭) | hy2 | vless | anytls
@@ -58,6 +59,8 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   PD_SNELL_MANUAL_TIMEOUT=6  PD_SNELL_PROBE_PARALLEL=12  PD_SNELL_VERSION=v6.0.0rc
   PD_BBR_BANDWIDTH=1000  PD_BBR_REGION=asia
   PD_LISTEN_FAMILY=auto  PD_PUBLIC_HOST=proxy.example.com
+  PD_ANYTLS_BACKEND=sing-box|anytls-go  PD_ANYTLS_DOMAIN=node.example.com
+  PD_ANYTLS_CERT_MODE=auto|existing|acme|self-signed  PD_ANYTLS_REUSE=auto|true|false
   PD_PUBLIC_IPV4=203.0.113.10  PD_PUBLIC_IPV6=2001:db8::10
   PD_STRICT_CHECKSUM=1  PD_SCRIPT_SHA256=<64位十六进制摘要>
 
@@ -135,8 +138,16 @@ PD_OPT_VLESS_TRANSPORT="${PD_VLESS_TRANSPORT:-tcp}"     # tcp | grpc | ws
 PD_OPT_VLESS_FP="${PD_VLESS_FP:-chrome}"                # chrome | firefox | safari | ios | randomized
 
 # AnyTLS 选项
-PD_OPT_ANYTLS_PADDING="${PD_ANYTLS_PADDING:-standard}"  # 兼容旧环境变量；当前服务端使用默认填充
-PD_OPT_ANYTLS_SNI="${PD_ANYTLS_SNI:-}"                  # 空=不伪装
+PD_OPT_ANYTLS_BACKEND="${PD_ANYTLS_BACKEND:-sing-box}"  # sing-box | anytls-go
+PD_OPT_ANYTLS_DOMAIN="${PD_ANYTLS_DOMAIN:-${PD_PUBLIC_HOST:-}}"
+PD_OPT_ANYTLS_CERT_MODE="${PD_ANYTLS_CERT_MODE:-auto}"  # auto | existing | acme | self-signed
+PD_OPT_ANYTLS_CERT_PATH="${PD_ANYTLS_CERT_PATH:-}"
+PD_OPT_ANYTLS_KEY_PATH="${PD_ANYTLS_KEY_PATH:-}"
+PD_OPT_ANYTLS_PADDING="${PD_ANYTLS_PADDING:-standard}"  # standard/default/auto 或 none
+PD_OPT_ANYTLS_SNI="${PD_ANYTLS_SNI:-${PD_OPT_ANYTLS_DOMAIN:-}}"
+PD_OPT_ANYTLS_REUSE="${PD_ANYTLS_REUSE:-auto}"          # auto | true | false
+PD_OPT_ANYTLS_SKIP_CERT_VERIFY="${PD_ANYTLS_SKIP_CERT_VERIFY:-0}"
+PD_OPT_ANYTLS_SINGBOX_VERSION="${PD_ANYTLS_SINGBOX_VERSION:-}"
 
 # 轻量化选项
 PD_OPT_INSTALL_QR="${PD_INSTALL_QR:-0}"                  # 1=安装 qrencode 生成二维码
@@ -338,9 +349,12 @@ write_worker_save_state() {
     : > "$dest" || return 1
     for name in SCRIPT_URL BASE_DIR STATE_FILE INSTALLED_BIN SYSTEMD_DIR LOCK_FILE SPEEDTEST_BIN \
         OS_ID OS_PRETTY OS_FAMILY ARCH IP IP6 PUBLIC_HOST MEM_TOTAL MEM_AVAIL \
-        PD_OPT_SNELL_MODE PD_OPT_SNELL_TLS_SNI PD_OPT_SNELL_TLS_PASS PD_OPT_SNELL_TLS_VERSION \
+        PD_OPT_SNELL_MAJOR PD_OPT_SNELL_MODE PD_OPT_SNELL_V6_MODE \
+        PD_OPT_SNELL_TLS_SNI PD_OPT_SNELL_TLS_PASS PD_OPT_SNELL_TLS_VERSION \
         PD_OPT_HY2_HOP PD_OPT_HY2_HOP_RANGE PD_OPT_VLESS_DEST PD_OPT_VLESS_SNI \
-        PD_OPT_VLESS_TRANSPORT PD_OPT_VLESS_FP PD_OPT_ANYTLS_PADDING PD_OPT_ANYTLS_SNI \
+        PD_OPT_VLESS_TRANSPORT PD_OPT_VLESS_FP \
+        PD_OPT_ANYTLS_BACKEND PD_OPT_ANYTLS_DOMAIN PD_OPT_ANYTLS_CERT_MODE PD_OPT_ANYTLS_CERT_PATH PD_OPT_ANYTLS_KEY_PATH \
+        PD_OPT_ANYTLS_PADDING PD_OPT_ANYTLS_SNI PD_OPT_ANYTLS_REUSE PD_OPT_ANYTLS_SKIP_CERT_VERIFY PD_OPT_ANYTLS_SINGBOX_VERSION \
         PD_OPT_INSTALL_QR $(compgen -A variable PD_); do
         case "$name" in
             ''|*[!A-Za-z0-9_]*) continue ;;
@@ -510,6 +524,10 @@ get_ip() {
     if [ -n "${PD_PUBLIC_HOST:-}" ]; then
         validate_hostname "$PD_PUBLIC_HOST" "PD_PUBLIC_HOST"
         PUBLIC_HOST="$PD_PUBLIC_HOST"
+    elif [ -n "${PD_ANYTLS_DOMAIN:-}" ] && [ "${PD_ANYTLS_BACKEND:-sing-box}" = sing-box ]; then
+        # PD_ANYTLS_DOMAIN public host fallback
+        validate_hostname "$PD_ANYTLS_DOMAIN" "PD_ANYTLS_DOMAIN"
+        PUBLIC_HOST="$PD_ANYTLS_DOMAIN"
     fi
     if [ -n "${PD_PUBLIC_IPV4:-}" ]; then
         valid_ipv4 "$PD_PUBLIC_IPV4" || die "PD_PUBLIC_IPV4 不是有效 IPv4 地址"
@@ -1335,6 +1353,27 @@ clear_hy2_hop_rules() {
     [ "$rc" -eq 0 ] || { err "清理 HY2 端口跳跃资源失败"; return 1; }
 }
 
+extract_targz_binary() {
+    local archive="$1" expected="$2" target="$3" label="$4" tmpdir source rc=0
+    tar -tzf "$archive" | archive_paths_are_safe || return 1
+    mktemp_dir_pd tmpdir
+    if ! tar -xzf "$archive" -C "$tmpdir"; then
+        rc=1
+    elif find "$tmpdir" -type l -print -quit | grep -q .; then
+        err "$label 压缩包包含符号链接，拒绝安装"
+        rc=1
+    else
+        source=$(find "$tmpdir" -type f -name "$expected" -print -quit) || rc=1
+        if [ -z "${source:-}" ]; then
+            err "$label 压缩包未找到 $expected"
+            rc=1
+        else
+            install -m 0755 -o root -g root "$source" "$target" || rc=1
+        fi
+    fi
+    return "$rc"
+}
+
 verify_download() {
     local file="$1" label="$2" min_bytes="${3:-100000}"
     if [ ! -f "$file" ]; then
@@ -1588,7 +1627,13 @@ install_deps() {
     command -v openssl >/dev/null 2>&1 || missing="$missing openssl"
     command -v ss >/dev/null 2>&1 || missing="$missing iproute2"
     case "$proto" in
-        snell|vless|anytls) command -v unzip >/dev/null 2>&1 || missing="$missing unzip" ;;
+        snell|vless) command -v unzip >/dev/null 2>&1 || missing="$missing unzip" ;;
+        anytls)
+            if [ "${PD_OPT_ANYTLS_BACKEND:-sing-box}" = "anytls-go" ]; then
+                command -v unzip >/dev/null 2>&1 || missing="$missing unzip"
+            else
+                command -v tar >/dev/null 2>&1 || missing="$missing tar"
+            fi ;;
     esac
     if [ "$proto" = "hy2" ] && [ "${PD_OPT_HY2_HOP:-0}" -ge 3 ] 2>/dev/null; then
         command -v nft >/dev/null 2>&1 || missing="$missing nftables"
@@ -1831,7 +1876,7 @@ register_protocols() {
     PROTO[anytls_key]="anytls"
     PROTO[anytls_name]="AnyTLS"
     PROTO[anytls_dir]="/opt/anytls"
-    PROTO[anytls_bin]="/opt/anytls/anytls-server"
+    PROTO[anytls_bin]="/opt/anytls/sing-box"
     PROTO[anytls_service]="anytls"
     PROTO[anytls_disk]="20"
 }
@@ -1840,7 +1885,13 @@ register_protocols() {
 pkey()   { echo "${PROTO[${1}_key]}"; }
 pname()  { echo "${PROTO[${1}_name]}"; }
 pdir()   { echo "${PROTO[${1}_dir]}"; }
-pbin()   { echo "${PROTO[${1}_bin]}"; }
+pbin()   {
+    if [ "${1:-}" = anytls ] && declare -F anytls_bin_path >/dev/null 2>&1; then
+        anytls_bin_path
+        return
+    fi
+    echo "${PROTO[${1}_bin]}"
+}
 psvc()   { echo "${PROTO[${1}_service]}"; }
 pdisk()  { echo "${PROTO[${1}_disk]}"; }
 
@@ -2081,10 +2132,16 @@ transaction_run() {
 # ============================================================
 
 write_systemd() {
-    local svc="$1" bin="$2" args="$3" mode=644 identity=""
+    local svc="$1" bin="$2" args="$3" mode=644 identity="" address_families="AF_INET AF_INET6"
     if [ "$svc" = anytls ]; then
         mode=600
-        identity=$'DynamicUser=yes\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes'
+        if declare -F anytls_backend >/dev/null 2>&1 && [ "$(anytls_backend 2>/dev/null || echo anytls-go)" = sing-box ]; then
+            # sing-box 稳定模式需要读取证书私钥；保持 root 运行并通过 systemd 沙箱收紧权限。
+            identity=$'AmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes'
+            address_families="AF_INET AF_INET6 AF_NETLINK"
+        else
+            identity=$'DynamicUser=yes\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nPrivateDevices=yes\nProtectKernelTunables=yes\nProtectKernelModules=yes\nProtectControlGroups=yes\nRestrictSUIDSGID=yes'
+        fi
     fi
     atomic_write_file "$SYSTEMD_DIR/${svc}.service" "$mode" <<EOF
 [Unit]
@@ -2101,7 +2158,7 @@ LimitNOFILE=32768
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+RestrictAddressFamilies=${address_families}
 PrivateTmp=yes
 
 [Install]
@@ -2714,16 +2771,22 @@ hy2_output() {
     hop_count=$(state_get hy2 hop)
     if [ "${hop_count:-0}" -ge 3 ] 2>/dev/null; then
         local last_port=$((port + hop_count - 1))
-        echo -e "${GREEN}Proxy = hysteria2, ${host4}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}${RESET}"
-        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = hysteria2, ${host6}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}${RESET}"
+        echo -e "${GREEN}Proxy = hysteria2, ${host4}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}${RESET}"
+        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = hysteria2, ${host6}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}${RESET}"
     else
         echo -e "${GREEN}Proxy = hysteria2, ${host4}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
         [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = hysteria2, ${host6}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
     fi
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
-    gen_qr "hysteria2://${pass}@${host4}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
-    [ -n "$host6" ] && echo -e "${GREEN}hysteria2://${pass}@${host6}:${port}?sni=www.bing.com&insecure=1#PD-HY2-IPv6${RESET}"
+    if [ "${hop_count:-0}" -ge 3 ] 2>/dev/null; then
+        local uri_last_port=$((port + hop_count - 1))
+        gen_qr "hysteria2://${pass}@${host4}:${port}-${uri_last_port}?sni=www.bing.com&insecure=1#PD-HY2"
+        [ -n "$host6" ] && echo -e "${GREEN}hysteria2://${pass}@${host6}:${port}-${uri_last_port}?sni=www.bing.com&insecure=1#PD-HY2-IPv6${RESET}"
+    else
+        gen_qr "hysteria2://${pass}@${host4}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
+        [ -n "$host6" ] && echo -e "${GREEN}hysteria2://${pass}@${host6}:${port}?sni=www.bing.com&insecure=1#PD-HY2-IPv6${RESET}"
+    fi
     output_footer
 }
 
@@ -2868,14 +2931,73 @@ vless_output() {
 }
 
 # ---- AnyTLS ----
-anytls_get_version() {
-    local v
-    v=$(curl_https -fs --retry 3 --max-time 15 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null \
-        | json_tag_name || true)
-    [ -n "$v" ] && echo "$v" || die "AnyTLS 版本检测失败，请检查 GitHub 是否可达"
+anytls_backend() {
+    local backend=""
+    backend=$(state_get anytls backend 2>/dev/null || true)
+    [ -n "$backend" ] || backend=$(cat "$(pdir anytls)/.backend" 2>/dev/null || true)
+    if [ -z "$backend" ]; then
+        if [ -x "$(pdir anytls)/anytls-server" ] && [ ! -x "$(pdir anytls)/sing-box" ]; then
+            backend="anytls-go"
+        else
+            backend="${PD_OPT_ANYTLS_BACKEND:-sing-box}"
+        fi
+    fi
+    case "$backend" in
+        sing-box|anytls-go) printf '%s
+' "$backend" ;;
+        *) die "PD_ANYTLS_BACKEND 仅支持 sing-box 或 anytls-go，当前: $backend" ;;
+    esac
 }
 
-anytls_download() {
+anytls_bin_path() {
+    case "$(anytls_backend)" in
+        sing-box) echo "$(pdir anytls)/sing-box" ;;
+        anytls-go) echo "$(pdir anytls)/anytls-server" ;;
+    esac
+}
+
+anytls_get_version() {
+    local backend v
+    backend=$(anytls_backend)
+    case "$backend" in
+        sing-box)
+            if [ -n "${PD_OPT_ANYTLS_SINGBOX_VERSION:-}" ]; then
+                v="$PD_OPT_ANYTLS_SINGBOX_VERSION"
+                case "$v" in v*) ;; *) v="v${v}" ;; esac
+                echo "$v"
+                return 0
+            fi
+            v=$(curl_https -fs --retry 3 --max-time 15 "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null \
+                | json_tag_name || true)
+            [ -n "$v" ] && echo "$v" || die "sing-box 版本检测失败，请检查 GitHub 是否可达" ;;
+        anytls-go)
+            v=$(curl_https -fs --retry 3 --max-time 15 "https://api.github.com/repos/anytls/anytls-go/releases/latest" 2>/dev/null \
+                | json_tag_name || true)
+            [ -n "$v" ] && echo "$v" || die "AnyTLS 版本检测失败，请检查 GitHub 是否可达" ;;
+    esac
+}
+
+anytls_download_singbox() {
+    local ver="$1" ver_num="${ver#v}" arch_asset="$ARCH"
+    require_version "$ver" "sing-box"
+    case "$arch_asset" in amd64|arm64) ;; *) die "sing-box AnyTLS 仅支持当前脚本已验证架构 amd64/arm64，当前: $arch_asset" ;; esac
+    local asset="sing-box-${ver_num}-linux-${arch_asset}.tar.gz"
+    local url="https://github.com/SagerNet/sing-box/releases/download/${ver}/${asset}"
+    step "下载 sing-box $ver ..."
+    mkdir -p "$(pdir anytls)"
+    chmod 755 "$(pdir anytls)"
+    local tmptgz
+    mktemp_pd tmptgz
+    download_https "$url" "$tmptgz" "sing-box $ver" "SagerNet/sing-box" "$ver" "$asset" \
+        || die "sing-box 下载失败: $url"
+    extract_targz_binary "$tmptgz" sing-box "$(pdir anytls)/sing-box" "sing-box" \
+        || die "sing-box 安全解压失败"
+    rm -f "$tmptgz"
+    verify_download "$(pdir anytls)/sing-box" "sing-box" 5000000
+    info "sing-box 下载完成"
+}
+
+anytls_download_legacy() {
     local ver="$1"
     local ver_num="${ver#v}"
     local url="https://github.com/anytls/anytls-go/releases/download/${ver}/anytls_${ver_num}_linux_${ARCH}.zip"
@@ -2886,63 +3008,244 @@ anytls_download() {
     mktemp_pd tmpzip
     download_https "$url" "$tmpzip" "AnyTLS $ver" "anytls/anytls-go" "$ver" \
         || die "AnyTLS 下载失败: $url"
-    extract_zip_binary "$tmpzip" anytls-server "$(pbin anytls)" "AnyTLS" \
+    extract_zip_binary "$tmpzip" anytls-server "$(pdir anytls)/anytls-server" "AnyTLS" \
         || die "AnyTLS 安全解压失败"
     rm -f "$tmpzip"
-    verify_download "$(pbin anytls)" "AnyTLS" 1000000
+    verify_download "$(pdir anytls)/anytls-server" "AnyTLS" 1000000
     info "AnyTLS 下载完成"
 }
 
-anytls_configure() {
+anytls_download() {
+    local ver="$1"
+    case "$(anytls_backend)" in
+        sing-box) anytls_download_singbox "$ver" ;;
+        anytls-go) anytls_download_legacy "$ver" ;;
+    esac
+}
+
+anytls_cert_paths() {
+    local domain="$1"
+    local cert="${PD_OPT_ANYTLS_CERT_PATH:-}"
+    local key="${PD_OPT_ANYTLS_KEY_PATH:-}"
+    if [ -z "$cert" ] || [ -z "$key" ]; then
+        cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
+        key="/etc/letsencrypt/live/${domain}/privkey.pem"
+    fi
+    printf '%s
+%s
+' "$cert" "$key"
+}
+
+anytls_prepare_cert() {
+    local domain="$1" mode="$PD_OPT_ANYTLS_CERT_MODE" cert key paths
+    paths=$(anytls_cert_paths "$domain")
+    cert=$(printf '%s
+' "$paths" | sed -n '1p')
+    key=$(printf '%s
+' "$paths" | sed -n '2p')
+    case "$mode" in
+        auto)
+            if [ -s "$cert" ] && [ -s "$key" ]; then
+                mode="existing"
+            else
+                mode="acme"
+            fi ;;
+        existing|acme|self-signed) ;;
+        *) die "PD_ANYTLS_CERT_MODE 仅支持 auto/existing/acme/self-signed，当前: $mode" ;;
+    esac
+    case "$mode" in
+        existing)
+            [ -s "$cert" ] && [ -s "$key" ] || die "证书不存在，请设置 PD_ANYTLS_CERT_MODE=acme 或提供 PD_ANYTLS_CERT_PATH/PD_ANYTLS_KEY_PATH" ;;
+        acme)
+            command -v certbot >/dev/null 2>&1 || {
+                info "安装 certbot ..."
+                apt-get update -qq || die "apt-get update 失败，请检查网络"
+                apt-get install -y -qq certbot >/dev/null || die "certbot 安装失败"
+            }
+            if [ ! -s "$cert" ] || [ ! -s "$key" ]; then
+                warn "将使用 certbot standalone 为 $domain 申请证书；请确保 DNS 已解析到本机，80/TCP 未被占用且云防火墙已放行。"
+                if port_in_use 80; then
+                    die "80/TCP 已被占用，certbot standalone 无法申请证书；请先释放 80 端口，或设置 PD_ANYTLS_CERT_MODE=existing 并提供证书路径"
+                fi
+                certbot certonly --standalone -d "$domain" --agree-tos --register-unsafely-without-email --non-interactive \
+                    || die "Let's Encrypt 证书申请失败"
+            fi ;;
+        self-signed)
+            cert="$(pdir anytls)/certs/fullchain.pem"
+            key="$(pdir anytls)/certs/privkey.pem"
+            mkdir -p "$(pdir anytls)/certs"
+            if [ ! -s "$cert" ] || [ ! -s "$key" ]; then
+                warn "正在生成自签证书，仅建议测试/备用；Surge 输出会带 skip-cert-verify=true"
+                openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
+                    -subj "/CN=${domain}" -keyout "$key" -out "$cert" >/dev/null 2>&1 \
+                    || die "自签证书生成失败"
+            fi ;;
+    esac
+    [ -s "$cert" ] && [ -s "$key" ] || die "证书文件无效: $cert / $key"
+    printf '%s
+' "$cert" | atomic_write_file "$(pdir anytls)/.cert" 600
+    printf '%s
+' "$key" | atomic_write_file "$(pdir anytls)/.key" 600
+    printf '%s
+' "$mode" | atomic_write_file "$(pdir anytls)/.cert_mode" 600
+}
+
+anytls_configure_singbox() {
+    local port="$1" pass="$2"
+    local domain="${PD_OPT_ANYTLS_DOMAIN:-}"
+    local sni="${PD_OPT_ANYTLS_SNI:-}"
+    local reuse="${PD_OPT_ANYTLS_REUSE:-auto}"
+    [ -n "$domain" ] || domain="${sni:-${PUBLIC_HOST:-}}"
+    [ -n "$domain" ] || die "sing-box AnyTLS 稳定模式需要域名：请设置 PD_ANYTLS_DOMAIN=node.example.com 或 PD_PUBLIC_HOST=node.example.com"
+    validate_hostname "$domain" "PD_ANYTLS_DOMAIN"
+    [ -n "$sni" ] || sni="$domain"
+    validate_hostname "$sni" "PD_ANYTLS_SNI"
+    [ "$sni" = "$domain" ] || die "AnyTLS sing-box 稳定模式要求 PD_ANYTLS_SNI 与 PD_ANYTLS_DOMAIN 相同，以保证 TLS 证书主机名校验；当前 SNI=$sni domain=$domain"
+    case "$reuse" in auto|true|false) ;; *) die "PD_ANYTLS_REUSE 仅支持 auto/true/false，当前: $reuse" ;; esac
+    anytls_prepare_cert "$domain"
+    local cert key cert_mode listen_json padding_json=""
+    cert=$(cat "$(pdir anytls)/.cert")
+    key=$(cat "$(pdir anytls)/.key")
+    cert_mode=$(cat "$(pdir anytls)/.cert_mode")
+    listen_json=$(json_escape "$PD_LISTEN_HOST")
+    case "$PD_OPT_ANYTLS_PADDING" in
+        standard|default|auto) padding_json='' ;;
+        none) padding_json=',
+      "padding_scheme": []' ;;
+        *) die "sing-box AnyTLS 目前支持 PD_ANYTLS_PADDING=standard/default/auto/none，当前: $PD_OPT_ANYTLS_PADDING" ;;
+    esac
+    printf '%s
+' "sing-box" | atomic_write_file "$(pdir anytls)/.backend" 600
+    printf '%s
+' "$pass" | atomic_write_file "$(pdir anytls)/.password" 600
+    printf '%s
+' "$sni" | atomic_write_file "$(pdir anytls)/.sni" 600
+    printf '%s
+' "$domain" | atomic_write_file "$(pdir anytls)/.domain" 600
+    printf '%s
+' "${PD_OPT_ANYTLS_PADDING:-standard}" | atomic_write_file "$(pdir anytls)/.padding" 600
+    printf '%s
+' "$reuse" | atomic_write_file "$(pdir anytls)/.reuse" 600
+    printf '%s
+' "$cert_mode" | atomic_write_file "$(pdir anytls)/.cert_mode" 600
+    atomic_write_file "$(pdir anytls)/config.json" 600 <<EOF
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "${listen_json}",
+      "listen_port": ${port},
+      "users": [
+        {
+          "name": "pd",
+          "password": "$(json_escape "$pass")"
+        }
+      ]${padding_json},
+      "tls": {
+        "enabled": true,
+        "server_name": "$(json_escape "$sni")",
+        "certificate_path": "$(json_escape "$cert")",
+        "key_path": "$(json_escape "$key")"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ]
+}
+EOF
+    "$(pdir anytls)/sing-box" check -c "$(pdir anytls)/config.json" >/dev/null \
+        || die "sing-box AnyTLS 配置检查失败"
+}
+
+anytls_configure_legacy() {
     local port="$1" pass="$2"
     local padding="${PD_OPT_ANYTLS_PADDING}"
     local sni="${PD_OPT_ANYTLS_SNI}"
-    case "$padding" in standard|deep|fixed|none) ;; *) die "PD_ANYTLS_PADDING 无效: $padding" ;; esac
-    [ "$padding" = "standard" ] || warn "当前 anytls-server 未启用预设填充参数，PD_ANYTLS_PADDING=$padding 已忽略"
+    case "$padding" in standard|deep|fixed|none|default|auto) ;; *) die "PD_ANYTLS_PADDING 无效: $padding" ;; esac
+    [ "$padding" = "standard" ] || [ "$padding" = "default" ] || [ "$padding" = "auto" ] || warn "当前 anytls-server 未启用预设填充参数，PD_ANYTLS_PADDING=$padding 已忽略"
     [ -z "$sni" ] || validate_hostname "$sni" "PD_ANYTLS_SNI"
-
-    printf '%s\n' "$pass" | atomic_write_file "$(pdir anytls)/.password" 600
-    printf '%s\n' "server-default" | atomic_write_file "$(pdir anytls)/.padding" 600
+    printf '%s
+' "anytls-go" | atomic_write_file "$(pdir anytls)/.backend" 600
+    printf '%s
+' "$pass" | atomic_write_file "$(pdir anytls)/.password" 600
+    printf '%s
+' "server-default" | atomic_write_file "$(pdir anytls)/.padding" 600
     if [ -n "$sni" ]; then
-        printf '%s\n' "$sni" | atomic_write_file "$(pdir anytls)/.sni" 600
+        printf '%s
+' "$sni" | atomic_write_file "$(pdir anytls)/.sni" 600
     else
         rm -f "$(pdir anytls)/.sni"
     fi
 }
 
+anytls_configure() {
+    local port="$1" pass="$2"
+    case "$(anytls_backend)" in
+        sing-box) anytls_configure_singbox "$port" "$pass" ;;
+        anytls-go) anytls_configure_legacy "$port" "$pass" ;;
+    esac
+}
+
 anytls_service_args() {
     local port="$1"
-    local pass
-    pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "")
-    pass=$(systemd_escape_arg "$pass")
-
-    local listen_host
-    listen_host=$(listen_endpoint "$port")
-    local args="-l ${listen_host} -p ${pass}"
-    # anytls-server v0.0.12 无 -sni 参数，SNI 由客户端侧处理
-    echo "$args"
+    case "$(anytls_backend)" in
+        sing-box)
+            echo "run -c $(pdir anytls)/config.json" ;;
+        anytls-go)
+            local pass listen_host
+            pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "")
+            pass=$(systemd_escape_arg "$pass")
+            listen_host=$(listen_endpoint "$port")
+            echo "-l ${listen_host} -p ${pass}" ;;
+    esac
 }
 
 anytls_output() {
     local port="$1" pass="$2"
-    local padding sni
+    local backend padding sni domain cert_mode reuse insecure_arg="" surge_extra="" query="" link link6 host4 host6
+    backend=$(anytls_backend)
     padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
     sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
-
-    local host4 host6 query="" link link6
+    domain=$(cat "$(pdir anytls)/.domain" 2>/dev/null || echo "")
+    cert_mode=$(cat "$(pdir anytls)/.cert_mode" 2>/dev/null || echo "")
+    reuse=$(cat "$(pdir anytls)/.reuse" 2>/dev/null || echo "auto")
     select_output_hosts anytls || return 1
     host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
-    [ -n "$sni" ] && query="?sni=$(url_escape "$sni")&insecure=1"
+    if [ "$backend" = sing-box ]; then
+        [ -n "$domain" ] && host4="$domain" && host6=""
+        [ -n "$sni" ] && surge_extra=", sni=${sni}" && query="?sni=$(url_escape "$sni")"
+        if [ "$cert_mode" = self-signed ] || [ "${PD_OPT_ANYTLS_SKIP_CERT_VERIFY:-0}" = 1 ]; then
+            surge_extra="${surge_extra}, skip-cert-verify=true"
+            insecure_arg="${query:+&}insecure=1"
+            query="${query:-?}${insecure_arg}"
+        fi
+        [ "$reuse" = auto ] || surge_extra="${surge_extra}, reuse=${reuse}"
+    else
+        [ -n "$sni" ] && query="?sni=$(url_escape "$sni")&insecure=1"
+        [ -n "$sni" ] && surge_extra=", sni=${sni}, skip-cert-verify=true"
+    fi
     link="anytls://${pass}@${host4}:${port}${query}#PD-AnyTLS"
     [ -n "$host6" ] && link6="anytls://${pass}@${host6}:${port}${query}#PD-AnyTLS-IPv6"
-    output_header "AnyTLS" "$port"
+    output_header "AnyTLS (${backend})" "$port"
     echo -e "密码:   ${GREEN}${pass}${RESET}"
-    echo -e "填充:   ${DIM}${padding}（服务端默认）${RESET}"
-    [ -n "$sni" ] && echo -e "SNI:    ${DIM}${sni}（客户端侧使用）${RESET}"
+    echo -e "后端:   ${DIM}${backend}${RESET}"
+    echo -e "填充:   ${DIM}${padding}${RESET}"
+    [ -n "$domain" ] && echo -e "域名:   ${DIM}${domain}${RESET}"
+    [ -n "$sni" ] && echo -e "SNI:    ${DIM}${sni}${RESET}"
+    [ -n "$cert_mode" ] && echo -e "证书:   ${DIM}${cert_mode}${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
-    echo -e "${GREEN}Proxy = anytls, ${host4}, ${port}, password=${pass}${RESET}"
-    [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = anytls, ${host6}, ${port}, password=${pass}${RESET}"
+    echo -e "${GREEN}Proxy = anytls, ${host4}, ${port}, password=${pass}${surge_extra}${RESET}"
+    [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = anytls, ${host6}, ${port}, password=${pass}${surge_extra}${RESET}"
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
     gen_qr "$link"
@@ -2952,7 +3255,6 @@ anytls_output() {
     [ -n "${link6:-}" ] && echo -e "${GREEN}${link6}${RESET}"
     output_footer
 }
-
 # ============================================================
 # 统一安装流水线（核心 — 所有协议走同一套流程）
 # ============================================================
@@ -2961,6 +3263,26 @@ install_protocol() {
     local proto="$1" key cur_sts=false want_sts=false current_major requested_major
     assert_base_dir_safe || return 1
     key=$(pkey "$proto")
+    if state_installed "$key" && [ "$proto" = anytls ]; then
+        local installed_backend desired_backend
+        desired_backend="${PD_OPT_ANYTLS_BACKEND:-sing-box}"
+        installed_backend=$(state_get anytls backend 2>/dev/null || true)
+        [ -n "$installed_backend" ] || installed_backend=$(cat "$(pdir anytls)/.backend" 2>/dev/null || true)
+        if [ -z "$installed_backend" ]; then
+            if [ -x "$(pdir anytls)/anytls-server" ] && [ ! -x "$(pdir anytls)/sing-box" ]; then
+                installed_backend="anytls-go"
+            elif [ -x "$(pdir anytls)/sing-box" ]; then
+                installed_backend="sing-box"
+            else
+                installed_backend="unknown"
+            fi
+        fi
+        case "$desired_backend" in sing-box|anytls-go) ;; *) die "PD_ANYTLS_BACKEND 仅支持 sing-box 或 anytls-go，当前: $desired_backend" ;; esac
+        if [ "$installed_backend" != unknown ] && [ "$desired_backend" != "$installed_backend" ]; then
+            err "AnyTLS 已安装为 ${installed_backend}，当前请求 ${desired_backend}；为避免混合升级，请先执行: sudo pd --uninstall anytls，再重新安装"
+            return 1
+        fi
+    fi
     if state_installed "$key"; then
         if [ "$proto" = snell ]; then
             current_major=$(snell_installed_major) || return 1
@@ -3007,6 +3329,9 @@ install_protocol_impl() {
         case "$PD_OPT_SNELL_V6_MODE" in default|unshaped) ;; *) die "PD_SNELL_V6_MODE仅支持default或unshaped" ;; esac
         display_name="Snell v${PD_OPT_SNELL_MAJOR}"
         [ "$PD_OPT_SNELL_MODE" = shadowtls ] && display_name+=" + ShadowTLS"
+    fi
+    if [ "$proto" = anytls ]; then
+        display_name="AnyTLS ($(anytls_backend))"
     fi
     title "安装 $display_name"
 
@@ -3158,6 +3483,12 @@ install_protocol_impl() {
 
     state_set "$key" "port" "$port"
     state_set "$key" "version" "$ver"
+    if [ "$proto" = anytls ]; then
+        local anytls_backend_state anytls_cert_mode_state
+        anytls_backend_state=$(cat "$(pdir anytls)/.backend" 2>/dev/null || anytls_backend)
+        anytls_cert_mode_state=$(cat "$(pdir anytls)/.cert_mode" 2>/dev/null || echo "")
+        state_set_fields anytls "backend=${anytls_backend_state}" "cert_mode=${anytls_cert_mode_state}"
+    fi
     if [ "$proto" = snell ]; then
         state_set_fields snell \
             "snell_major=$PD_OPT_SNELL_MAJOR" \
@@ -3252,6 +3583,7 @@ upgrade_protocol_impl() {
     local proto="$1" key name svc bin bin_bak ver="" old_ver port hop transport major=""
     local was_active=false shadow_active=false shadow_enabled=false hop_active=false hop_enabled=false download_main=true
     key=$(pkey "$proto"); name=$(pname "$proto"); svc=$(psvc "$proto"); bin=$(pbin "$proto")
+    [ "$proto" = anytls ] && name="AnyTLS ($(anytls_backend))"
     bin_bak="${bin}.bak"
     title "升级 $name"
     check_disk "$(pdisk "$proto")"
@@ -3486,15 +3818,18 @@ show_config_only() {
             host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
             if [ "$hop" -ge 3 ] 2>/dev/null; then
                 local last_port=$((port + hop - 1))
-                echo "Proxy = hysteria2, ${host4}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}"
-                [ -n "$host6" ] && echo "Proxy-IPv6 = hysteria2, ${host6}, ${port}-${last_port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, ports=${port}-${last_port}"
+                echo "Proxy = hysteria2, ${host4}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}"
+                [ -n "$host6" ] && echo "Proxy-IPv6 = hysteria2, ${host6}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}"
+                echo ""
+                echo "# Shadowrocket: hysteria2://${pass}@${host4}:${port}-${last_port}?sni=www.bing.com&insecure=1#PD-HY2"
+                [ -n "$host6" ] && echo "# Shadowrocket-IPv6: hysteria2://${pass}@${host6}:${port}-${last_port}?sni=www.bing.com&insecure=1#PD-HY2-IPv6"
             else
                 echo "Proxy = hysteria2, ${host4}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
                 [ -n "$host6" ] && echo "Proxy-IPv6 = hysteria2, ${host6}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
-            fi
-            echo ""
-            echo "# Shadowrocket: hysteria2://${pass}@${host4}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
-            [ -n "$host6" ] && echo "# Shadowrocket-IPv6: hysteria2://${pass}@${host6}:${port}?sni=www.bing.com&insecure=1#PD-HY2-IPv6" ;;
+                echo ""
+                echo "# Shadowrocket: hysteria2://${pass}@${host4}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
+                [ -n "$host6" ] && echo "# Shadowrocket-IPv6: hysteria2://${pass}@${host6}:${port}?sni=www.bing.com&insecure=1#PD-HY2-IPv6"
+            fi ;;
         vless)
             local uuid pubkey shortid dest transport fp dest_host host4 host6
             uuid=$(json_value "id" "$(pdir vless)/config.json" || echo "")
@@ -3512,21 +3847,32 @@ show_config_only() {
             echo "vless://${uuid}@${host4}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS"
             [ -n "$host6" ] && echo "vless://${uuid}@${host6}:${port}?encryption=none&security=reality&sni=${dest_host}&fp=${fp}&pbk=${pubkey}&sid=${shortid}&type=${transport}&flow=xtls-rprx-vision#PD-VLESS-IPv6" ;;
         anytls)
-            local pass padding sni host4 host6
+            local pass backend padding sni domain cert_mode reuse host4 host6 query="" surge_extra=""
             pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || echo "")
             [ -n "$pass" ] || { err "AnyTLS 密码缺失，拒绝生成配置"; return 1; }
+            backend=$(anytls_backend)
             padding=$(cat "$(pdir anytls)/.padding" 2>/dev/null || echo "standard")
             sni=$(cat "$(pdir anytls)/.sni" 2>/dev/null || echo "")
+            domain=$(cat "$(pdir anytls)/.domain" 2>/dev/null || echo "")
+            cert_mode=$(cat "$(pdir anytls)/.cert_mode" 2>/dev/null || echo "")
+            reuse=$(cat "$(pdir anytls)/.reuse" 2>/dev/null || echo "auto")
             select_output_hosts anytls || return 1
             host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
-            echo "Proxy = anytls, ${host4}, ${port}, password=${pass}"
-            [ -n "$host6" ] && echo "Proxy-IPv6 = anytls, ${host6}, ${port}, password=${pass}"
+            if [ "$backend" = sing-box ]; then
+                [ -n "$domain" ] && host4="$domain" && host6=""
+                [ -n "$sni" ] && surge_extra=", sni=${sni}" && query="?sni=$(url_escape "$sni")"
+                if [ "$cert_mode" = self-signed ]; then surge_extra="${surge_extra}, skip-cert-verify=true"; query="${query:-?}${query:+&}insecure=1"; fi
+                [ "$reuse" = auto ] || surge_extra="${surge_extra}, reuse=${reuse}"
+            else
+                [ -n "$sni" ] && surge_extra=", sni=${sni}, skip-cert-verify=true" && query="?sni=$(url_escape "$sni")&insecure=1"
+            fi
+            echo "Proxy = anytls, ${host4}, ${port}, password=${pass}${surge_extra}"
+            [ -n "$host6" ] && echo "Proxy-IPv6 = anytls, ${host6}, ${port}, password=${pass}${surge_extra}"
             echo ""
-            local query=""
-            [ -n "$sni" ] && query="?sni=$(url_escape "$sni")&insecure=1"
             echo "# Shadowrocket: anytls://${pass}@${host4}:${port}${query}#PD-AnyTLS"
             [ -n "$host6" ] && echo "# Shadowrocket-IPv6: anytls://${pass}@${host6}:${port}${query}#PD-AnyTLS-IPv6" ;;
     esac
+    return 0
 }
 
 # ============================================================
@@ -3963,7 +4309,7 @@ select_xanmod_package_candidates() {
 
 xanmod_supported_codename() {
     case "$1" in
-        bookworm|trixie|forky|sid|noble|plucky|questing|resolute|faye|gigi|wilma|xia|zara|zena) return 0 ;;
+        bookworm|trixie|forky|sid|noble|plucky|questing|resolute|stonking|faye|gigi|wilma|xia|zara|zena) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -4300,7 +4646,7 @@ enable_bbrv3_kernel() {
     [ -n "$codename" ] || { rollback_xanmod_swap_if_created; warn "无法识别系统代号，无法添加 XanMod 源"; return 1; }
     if ! xanmod_supported_codename "$codename"; then
         warn "XanMod 官方源暂不支持当前系统代号: $codename"
-        warn "支持: bookworm/trixie/forky/sid/noble/plucky/questing/resolute 以及 Linux Mint faye/gigi/wilma/xia/zara/zena"
+        warn "支持: bookworm/trixie/forky/sid/noble/plucky/questing/resolute/stonking 以及 Linux Mint faye/gigi/wilma/xia/zara/zena"
         warn "已取消 BBRv3 内核安装；可继续使用 pd --bbr 开启普通 BBR"
         rollback_xanmod_swap_if_created
         return 1
@@ -5257,6 +5603,7 @@ doctor_protocol() {
         doctor_add "${key}.family" warn "监听族状态缺失或无效（记录 IPv4=${recorded4:-?} IPv6=${recorded6:-?}）"
     fi
     doctor_firewall "$key"
+    doctor_protocol_extra "$proto" "$port"
     if [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
         local inner_addr inner_port
         inner_addr=$(unit_arg_value --server "$SYSTEMD_DIR/shadowtls-snell.service" 2>/dev/null || true)
@@ -5267,6 +5614,35 @@ doctor_protocol() {
             doctor_add shadowtls.layer ok "Snell 与 ShadowTLS 外层均运行"
         else
             doctor_add shadowtls.layer fail "Snell 内层或 ShadowTLS 外层未运行/监听"
+        fi
+    fi
+    if [ "$proto" = anytls ]; then
+        local backend cfg cert key cert_mode domain
+        backend=$(anytls_backend 2>/dev/null || echo unknown)
+        doctor_add anytls.backend ok "AnyTLS 后端: $backend"
+        if [ "$backend" = sing-box ]; then
+            cfg="$(pdir anytls)/config.json"
+            cert=$(cat "$(pdir anytls)/.cert" 2>/dev/null || true)
+            key=$(cat "$(pdir anytls)/.key" 2>/dev/null || true)
+            cert_mode=$(cat "$(pdir anytls)/.cert_mode" 2>/dev/null || true)
+            domain=$(cat "$(pdir anytls)/.domain" 2>/dev/null || true)
+            if [ -s "$cfg" ] && [ -x "$bin" ] && "$bin" check -c "$cfg" >/dev/null 2>&1; then
+                doctor_add anytls.config ok "sing-box 配置校验通过"
+            else
+                doctor_add anytls.config fail "sing-box 配置缺失或校验失败"
+            fi
+            if [ -s "$cert" ] && [ -s "$key" ]; then
+                doctor_add anytls.cert ok "证书文件存在（mode=${cert_mode:-unknown} domain=${domain:-unknown}）"
+                if command -v openssl >/dev/null 2>&1; then
+                    if openssl x509 -checkend 1209600 -noout -in "$cert" >/dev/null 2>&1; then
+                        doctor_add anytls.cert_expiry ok "证书 14 天内不会过期"
+                    else
+                        doctor_add anytls.cert_expiry warn "证书可能在 14 天内过期或无法解析"
+                    fi
+                fi
+            else
+                doctor_add anytls.cert fail "证书或私钥路径缺失/不可读"
+            fi
         fi
     fi
     if [ "$proto" = hy2 ]; then
@@ -5332,6 +5708,100 @@ doctor_run() {
     [ "$_DOCTOR_FAILED" = 0 ]
 }
 
+doctor_protocol_extra() {
+    local proto="$1" port="${2:-}" backend pass conf cert keyfile
+    case "$proto" in
+        snell)
+            conf="$(pdir snell)/snell.conf"
+            if [ -r "$conf" ] && [ -n "$(conf_value psk "$conf" 2>/dev/null || true)" ]; then
+                doctor_add snell.config ok "snell.conf 可读且 PSK 存在"
+            else
+                doctor_add snell.config fail "snell.conf 或 PSK 缺失"
+            fi
+            ;;
+        hy2)
+            conf="$(pdir hy2)/config.yaml"
+            if [ -r "$conf" ] && [ -n "$(yaml_value password "$conf" 2>/dev/null || true)" ]; then
+                doctor_add hy2.config ok "config.yaml 可读且 password 存在"
+            else
+                doctor_add hy2.config fail "config.yaml 或 password 缺失"
+            fi
+            ;;
+        vless)
+            conf="$(pdir vless)/config.json"
+            if [ -r "$conf" ] && [ -n "$(json_value id "$conf" 2>/dev/null || true)" ] && grep -q '"protocol"[[:space:]]*:[[:space:]]*"vless"' "$conf" 2>/dev/null; then
+                doctor_add vless.config ok "config.json 可读且 VLESS UUID 存在"
+            else
+                doctor_add vless.config fail "config.json、VLESS protocol 或 UUID 缺失"
+            fi
+            ;;
+        anytls)
+            pass=$(cat "$(pdir anytls)/.password" 2>/dev/null || true)
+            [ -n "$pass" ] && doctor_add anytls.credential ok "AnyTLS 密码存在" \
+                || doctor_add anytls.credential fail "AnyTLS 密码缺失"
+            backend=$(anytls_backend 2>/dev/null || echo unknown)
+            if [ "$backend" = sing-box ]; then
+                conf="$(pdir anytls)/config.json"
+                cert=$(cat "$(pdir anytls)/.cert" 2>/dev/null || true)
+                keyfile=$(cat "$(pdir anytls)/.key" 2>/dev/null || true)
+                if [ -r "$conf" ] && [ -x "$(pbin anytls)" ] && "$(pbin anytls)" check -c "$conf" >/dev/null 2>&1; then
+                    doctor_add anytls.singbox_config ok "sing-box 配置校验通过"
+                else
+                    doctor_add anytls.singbox_config fail "sing-box 配置缺失或校验失败"
+                fi
+                if [ -r "$cert" ] && [ -r "$keyfile" ]; then
+                    doctor_add anytls.certificate ok "证书与私钥路径可读"
+                else
+                    doctor_add anytls.certificate fail "证书或私钥路径不可读"
+                fi
+            elif [ "$backend" = anytls-go ]; then
+                [ -x "$(pbin anytls)" ] && doctor_add anytls.legacy ok "anytls-go legacy 二进制存在" \
+                    || doctor_add anytls.legacy fail "anytls-go legacy 二进制缺失"
+            else
+                doctor_add anytls.backend fail "AnyTLS 后端无法识别: $backend"
+            fi
+            ;;
+    esac
+}
+
+pd_static_self_test() {
+    local rc=0 p fn key svc dir bin transport
+    register_protocols
+    for p in snell hy2 vless anytls; do
+        key=$(pkey "$p" 2>/dev/null || true)
+        svc=$(psvc "$p" 2>/dev/null || true)
+        dir=$(pdir "$p" 2>/dev/null || true)
+        bin=$(pbin "$p" 2>/dev/null || true)
+        transport=$(protocol_transport "$p" 2>/dev/null || true)
+        if [ -z "$key" ] || [ -z "$svc" ] || [ -z "$dir" ] || [ -z "$bin" ] || [ -z "$transport" ]; then
+            err "self-test: $p 元数据不完整"
+            rc=1
+        fi
+    done
+    for fn in \
+        resolve_proto protocol_transport port_var_name validate_port validate_hostname validate_hostport \
+        state_get state_set state_del state_installed \
+        write_systemd register_and_start install_protocol uninstall_protocol upgrade_protocol restart_service stop_service start_service \
+        snell_get_version snell_download snell_configure snell_output snell_installed_major \
+        hy2_get_version hy2_download hy2_configure hy2_output validate_hy2_hop \
+        vless_get_version vless_download vless_configure vless_output \
+        anytls_backend anytls_get_version anytls_download anytls_configure anytls_service_args anytls_output \
+        doctor_run doctor_protocol doctor_protocol_extra; do
+        if ! declare -F "$fn" >/dev/null 2>&1; then
+            err "self-test: 缺少函数 $fn"
+            rc=1
+        fi
+    done
+    resolve_proto hysteria2 >/dev/null 2>&1 || { err "self-test: hysteria2 别名失效"; rc=1; }
+    [ "$(protocol_transport hy2 2>/dev/null || true)" = udp ] || { err "self-test: hy2 transport 应为 udp"; rc=1; }
+    [ "$(protocol_transport snell 2>/dev/null || true)" = tcp ] || { err "self-test: snell transport 应为 tcp"; rc=1; }
+    snell_validate_major 4 >/dev/null 2>&1 && snell_validate_major 5 >/dev/null 2>&1 && snell_validate_major 6 >/dev/null 2>&1 \
+        || { err "self-test: Snell 大版本校验失败"; rc=1; }
+    validate_port 443 PD_SELF_TEST_PORT >/dev/null 2>&1 || { err "self-test: 端口校验失败"; rc=1; }
+    [ "$rc" -eq 0 ] && info "PD-proxy 静态自检通过（不改系统状态）"
+    return "$rc"
+}
+
 # 注册协议表
 register_protocols
 
@@ -5351,7 +5821,7 @@ validate_cli_arity() {
     case "$action" in
         --install|-i|--uninstall|-r|--upgrade|-u|--restart|--stop|--start|--log|-l|--config|-c)
             [ "$#" -eq 2 ] || cli_usage_error "$action 需要且只接受一个协议参数" ;;
-        --config-all|--show|--status|-s|--export|--bbr|--bbrv3|--update)
+        --config-all|--show|--status|-s|--export|--bbr|--bbrv3|--update|--self-test)
             [ "$#" -eq 1 ] || cli_usage_error "$action 不接受额外参数" ;;
         --doctor)
             [ "$#" -eq 1 ] || { [ "$#" -eq 2 ] && [ "${2:-}" = --json ]; } \
@@ -5383,8 +5853,12 @@ cli_dispatch() {
             [ -z "${PD_VLESS_SNI:-}" ] && PD_OPT_VLESS_SNI="addons.mozilla.org"
             [ -z "${PD_VLESS_TRANSPORT:-}" ] && PD_OPT_VLESS_TRANSPORT="tcp"
             [ -z "${PD_VLESS_FP:-}" ] && PD_OPT_VLESS_FP="chrome"
+            [ -z "${PD_ANYTLS_BACKEND:-}" ] && PD_OPT_ANYTLS_BACKEND="sing-box"
+            [ -z "${PD_ANYTLS_DOMAIN:-}" ] && PD_OPT_ANYTLS_DOMAIN="${PD_PUBLIC_HOST:-}"
+            [ -z "${PD_ANYTLS_CERT_MODE:-}" ] && PD_OPT_ANYTLS_CERT_MODE="auto"
             [ -z "${PD_ANYTLS_PADDING:-}" ] && PD_OPT_ANYTLS_PADDING="standard"
-            [ -z "${PD_ANYTLS_SNI:-}" ] && PD_OPT_ANYTLS_SNI=""
+            [ -z "${PD_ANYTLS_SNI:-}" ] && PD_OPT_ANYTLS_SNI="${PD_OPT_ANYTLS_DOMAIN:-}"
+            [ -z "${PD_ANYTLS_REUSE:-}" ] && PD_OPT_ANYTLS_REUSE="auto"
             run_write_locked install_protocol "$proto" ;;
         uninstall)
             [ -z "$proto" ] && die "用法: pd --uninstall <snell|hy2|vless|anytls>"
@@ -5424,6 +5898,7 @@ cli_dispatch() {
 }
 
 case "${1:-}" in
+    --self-test)   pd_static_self_test; exit $? ;;
     --install|-i)  cli_dispatch install  "${2:-}" ; exit $? ;;
     --uninstall|-r)
         case "${2:-}" in
@@ -5625,29 +6100,75 @@ menu_vless_config() {
 
 # ---- AnyTLS 配置子菜单 ----
 menu_anytls_config() {
-    while true; do
+    local cc domain_input cert_c cert_path key_path legacy_sni_c
+    echo ""
+    echo -e "  ${MAGENTA}▸ AnyTLS 后端${RESET}"
+    echo -e "  [1] ${GREEN}稳定模式${RESET}: sing-box + 域名 + 有效证书（推荐）"
+    echo -e "  [2] 快速模式: anytls-go 参考实现（legacy/测试）"
+    echo -e "  [B] 返回"
+    echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
+    read -r cc
+    case "$cc" in
+        2) PD_OPT_ANYTLS_BACKEND="anytls-go" ;;
+        [Bb]) return 1 ;;
+        [Qq]) info "再见 👋"; exit 0 ;;
+        *) PD_OPT_ANYTLS_BACKEND="sing-box" ;;
+    esac
+
+    if [ "$PD_OPT_ANYTLS_BACKEND" = "sing-box" ]; then
         echo ""
-        echo -e "  ${MAGENTA}▸ SNI 伪装${RESET}"
-        echo -e "  ${DIM}  AnyTLS 服务端使用默认填充；SNI 仅写入客户端链接${RESET}"
-        echo -e "  [1] 不伪装  [2] microsoft.com  [3] apple.com  [4] cloudflare.com"
-        echo -e "  [B] 返回"
+        echo -e "  ${MAGENTA}▸ AnyTLS 稳定模式域名${RESET}"
+        echo -e "  ${DIM}  建议一台 VPS 一个子域名，Cloudflare 用 DNS only。${RESET}"
+        echo -ne "  域名${PUBLIC_HOST:+ [$PUBLIC_HOST]}: "
+        read -r domain_input
+        PD_OPT_ANYTLS_DOMAIN="${domain_input:-${PUBLIC_HOST:-}}"
+        [ -n "$PD_OPT_ANYTLS_DOMAIN" ] || { err "sing-box 稳定模式必须填写域名"; return 1; }
+        validate_hostname "$PD_OPT_ANYTLS_DOMAIN" "AnyTLS 域名" || return 1
+        PD_OPT_ANYTLS_SNI="$PD_OPT_ANYTLS_DOMAIN"
+        # 让配置输出默认使用该域名，而不是自动探测 IP。
+        PUBLIC_HOST="$PD_OPT_ANYTLS_DOMAIN"
+        PD_PUBLIC_HOST="$PD_OPT_ANYTLS_DOMAIN"
+
+        echo ""
+        echo -e "  ${MAGENTA}▸ 证书方式${RESET}"
+        echo -e "  [1] auto：已有证书则复用，否则 certbot 申请（推荐）"
+        echo -e "  [2] existing：使用已有证书路径"
+        echo -e "  [3] self-signed：自签证书，仅测试"
         echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
-        read -r sni_c
-        case "$sni_c" in
+        read -r cert_c
+        case "$cert_c" in
+            2)
+                PD_OPT_ANYTLS_CERT_MODE="existing"
+                echo -ne "  fullchain.pem 路径: "; read -r cert_path
+                echo -ne "  privkey.pem 路径: "; read -r key_path
+                [ -n "$cert_path" ] && [ -n "$key_path" ] || { err "existing 模式必须填写证书和私钥路径"; return 1; }
+                PD_OPT_ANYTLS_CERT_PATH="$cert_path"
+                PD_OPT_ANYTLS_KEY_PATH="$key_path" ;;
+            3) PD_OPT_ANYTLS_CERT_MODE="self-signed" ;;
+            *) PD_OPT_ANYTLS_CERT_MODE="auto" ;;
+        esac
+        PD_OPT_ANYTLS_PADDING="standard"
+        PD_OPT_ANYTLS_REUSE="auto"
+    else
+        echo ""
+        echo -e "  ${MAGENTA}▸ legacy SNI${RESET}"
+        echo -e "  ${DIM}  anytls-go 模式仅建议临时测试；SNI 只写入客户端。${RESET}"
+        echo -e "  [1] 不写 SNI  [2] www.microsoft.com  [3] www.apple.com  [4] cloudflare.com"
+        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
+        read -r legacy_sni_c
+        case "$legacy_sni_c" in
             2) PD_OPT_ANYTLS_SNI="www.microsoft.com" ;;
             3) PD_OPT_ANYTLS_SNI="www.apple.com" ;;
             4) PD_OPT_ANYTLS_SNI="cloudflare.com" ;;
-            [Bb]) return 1 ;;
-            [Qq]) info "再见 👋"; exit 0 ;;
             *) PD_OPT_ANYTLS_SNI="" ;;
         esac
-        prompt_protocol_port anytls || return 1
-        break
-    done
+        PD_OPT_ANYTLS_CERT_MODE="self-signed"
+        PD_OPT_ANYTLS_PADDING="standard"
+    fi
+    prompt_protocol_port anytls || return 1
     run_write_locked install_protocol anytls
     return 0
 }
-
 menu_install() {
     echo -e "  ${MAGENTA}▸ 安装协议${RESET}"
     echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
