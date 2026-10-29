@@ -3,7 +3,7 @@
 > 一个 `pd` 命令，部署和管理 Snell、Hysteria2、VLESS Reality、AnyTLS 与独立 IPv4 端口转发。
 
 <p>
-  <kbd>v4.0.0</kbd>
+  <kbd>v4.2.0</kbd>
   <kbd>Debian / Ubuntu</kbd>
   <kbd>amd64 / arm64</kbd>
   <kbd>Surge / Shadowrocket</kbd>
