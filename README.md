@@ -3,7 +3,7 @@
 > 一个 `pd` 命令，部署和管理 Snell、Hysteria2、VLESS Reality、AnyTLS 与独立 IPv4 端口转发。
 
 <p>
-  <kbd>v4.2.0</kbd>
+  <kbd>v4.2.1</kbd>
   <kbd>Debian / Ubuntu</kbd>
   <kbd>amd64 / arm64</kbd>
   <kbd>Surge / Shadowrocket</kbd>
@@ -86,6 +86,16 @@ sudo env PD_SNELL_MAJOR=6 PD_SNELL_V6_MODE=unshaped \
 
 未设置 `PD_SNELL_MAJOR` 时默认安装 v5。脚本优先从 Snell 官方英文发布说明中的真实下载资产解析所选大版本最新版；无法读取时再探测下载源，最后才使用上次成功缓存。要求官方最新版检测失败时直接停止，可设置 `PD_STRICT_LATEST=1`；需要固定具体版本时使用 `PD_SNELL_VERSION=vX.Y.Z`。
 
+本版改动与升级注意事项见 [v4.2.1 发布说明](RELEASE_NOTES.md)。
+
+## 交互界面
+
+首页分别展示管理脚本版本、协议服务端版本、端口及运行状态；Snell 与 ShadowTLS 独立显示。状态文字不代表真实代理请求已验收。页面采用逐项布局，适合手机 SSH 和窄窗口；转发列表的“已启用”仅表示规则配置，运行检查结果单独展示。
+
+菜单支持 `B` 返回、`Q` 退出；有默认值的选项可直接回车。无效编号会重新提示，端口、域名和转发字段输错后只重填当前项，保留其他输入。交互操作结束后等待回车，再返回菜单；命令行调用不增加等待。
+
+“更新 PD 管理脚本”对应 `pd --update`；协议菜单中的“升级服务端”对应 `pd --upgrade <协议>`。只读诊断位于“诊断与系统工具 → 只读诊断”。取消、执行失败和回滚结果分别提示；失败后可按提示运行 `pd --doctor`。
+
 ## 常用命令
 
 | 命令 | 用途 | 权限 |
@@ -153,7 +163,9 @@ sudo env PD_LISTEN_FAMILY=ipv6 pd --install snell
 sudo env PD_LISTEN_FAMILY=dual pd --install snell
 ```
 
-支持值：`auto`、`ipv4`、`ipv6`、`dual`。双栈模式启动后必须验证两个地址族，否则回滚。
+支持值：`auto`、`ipv4`、`ipv6`、`dual`。双栈模式启动后必须分别确认两个地址族，否则回滚。仅看到 IPv6 通配监听（`[::]` / `*`）和全局 `bindv6only=0`，不能证明该服务接受 IPv4；无法确认时双栈操作会失败并回滚。`auto` 只记录已确认的监听族。配置输出会重新检查当前监听，旧状态中的可用标记不能单独作为输出依据。只确认一个地址族时，输出该族的公网 IP；`PD_PUBLIC_HOST` 可能解析到另一个地址族，因此只有两个监听族均确认时才作为连接地址输出，TLS SNI 独立保留。没有匹配的公网 IP 时拒绝输出。
+
+Surge 配置行的主机与端口是独立字段，IPv6 地址不带方括号；Shadowrocket 分享 URI 和二维码中的 IPv6 地址仍保留方括号。例如配置行使用 `2001:db8::42, 443`，URI 使用 `[2001:db8::42]:443`。安装完成后的输出、`--config`、`--config-all` 和导出采用相同格式。
 
 > [!NOTE]
 > Snell v4/v5 普通模式受上游服务端能力限制，仅使用 IPv4 监听；Snell v6 以及 ShadowTLS 公网前端可按实际网络能力使用双栈。脚本不会为未验证成功的地址族输出客户端配置。
@@ -196,7 +208,9 @@ sudo pd
 - sysctl：`/etc/sysctl.d/99-pd-port-forward.conf`，持久化 IPv4 转发；
 - 状态与生成文件：`/opt/pd/forward/`。
 
-脚本只覆盖和删除带有 PD-proxy 所有权标记的对象，不覆盖 Docker、UFW 或用户已有防火墙资源。删除最后一条规则会清理自有 nftables、iptables、systemd 与持久化文件；为避免影响其他服务，移除持久化文件时不会擅自关闭当前运行中的 `ip_forward`。
+管理入口和 systemd 实际执行脚本均会在修改前复核转发目录、nft 表内规则及 iptables 链和引用的所有权。发现无标记规则、外来引用、无法识别的规则结构或查询失败时拒绝修改。脚本只覆盖和删除带有 PD-proxy 所有权标记的对象，不覆盖 Docker、UFW 或用户已有防火墙资源。删除最后一条规则会清理自有 nftables、iptables、systemd 与持久化文件；为避免影响其他服务，移除持久化文件时不会擅自关闭当前运行中的 `ip_forward`。
+
+> `pd --update` 仍只替换管理脚本，不重写现有转发执行脚本、不重启服务。已有转发需在单独批准的维护操作中，通过“端口转发 → 检查并修复规则”重新生成执行脚本后，systemd 路径才获得本次保护；该操作会重新加载转发规则。
 
 ## 旧版无中断更新
 
@@ -229,7 +243,7 @@ Doctor 会检查：
 - ShadowTLS 双层、Hysteria2 hop 和防火墙；
 - 公网地址与 BBR 状态。
 
-存在确认故障时返回非零；无法安全判断的项目显示为 `warn`。
+存在确认故障时返回非零；无法安全判断的项目显示为 `warn`。Doctor 会明确标注真实客户端验收尚未执行；退出码为零或 JSON 的 `ok=true` 只说明没有发现确认故障，不代表代理请求可用。
 
 ## BBR 与 BBRv3
 
@@ -350,3 +364,23 @@ sudo env PD_ANYTLS_BACKEND=anytls-go bash install.sh --install anytls
 | `PD_ANYTLS_REUSE` | `auto` | `auto` / `true` / `false` |
 | `PD_ANYTLS_PADDING` | `standard` | `standard` 默认；`none` 关闭 sing-box padding_scheme |
 | `PD_ANYTLS_SINGBOX_VERSION` | 空 | 固定 sing-box 版本，例如 `v1.13.14` |
+
+
+## 真实客户端验收
+
+安装、启动、升级的服务及监听检查不能代替真实代理验收。仓库提供独立的 `tests/accept-proxy.sh`，由操作者在已授权的客户端环境中手动执行，不会被安装、更新或回归测试自动调用。
+
+1. 使用支持待验协议的真实客户端，将一个本机 SOCKS5 入口固定到单个待验节点。关闭 DIRECT 回退、自动切换和会绕过该节点的分流规则；Snell + ShadowTLS 必须启用与服务端匹配的两层配置。
+2. 准备一个你控制的 HTTPS 静态测试地址，以及事先通过可信渠道确定的响应正文 SHA-256。不要使用会动态变化的页面，不要把凭据放入 URL。
+3. 在客户端执行（替换入口端口、测试地址和摘要）：
+
+```bash
+bash tests/accept-proxy.sh socks5h://127.0.0.1:1080 \
+  https://probe.example.com/check.txt '替换为响应正文的64位SHA256'
+```
+
+工具强制使用指定 SOCKS 入口，禁用 curlrc 和 NO_PROXY 绕过，验证目标 HTTPS 证书，不跟随重定向。三次独立请求均须返回 HTTP 200 且正文摘要匹配；输出真实通过/失败数，任一次失败即返回非零。正文只保存在私有临时目录，退出时删除，不输出响应内容或客户端凭据。
+
+双栈验收须将客户端的**代理服务器地址**分别固定为 VPS 的 IPv4 和 IPv6，各跑一轮；改变目标网站的地址族不能证明 VPS 的两个入口都可用。记录客户端版本、协议/模式、入口地址族和每轮结果。脚本只能证明请求经过指定 SOCKS 入口，不能自动证明客户端没有使用 DIRECT 或其他节点；验收前必须核对客户端路由，并通过客户端连接记录确认选中的节点。
+
+本工具验证 HTTPS 代理请求，不替代 HY2 跳跃端口、UDP 业务或长连接稳定性专项测试。真实 VPS 操作必须另行明确机器、影响范围、回滚方法和验证方法并获得批准。

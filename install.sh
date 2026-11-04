@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# PD-proxy — 多协议代理一键部署脚本 v4.2.0
+# PD-proxy — 多协议代理一键部署脚本 v4.2.1
 # 协议: Snell v4/v5/v6（ShadowTLS 可选）| Hysteria2 | VLESS Reality | AnyTLS
 # 仓库: https://github.com/DDIPP1005/PD-proxy
 # ============================================================
@@ -13,7 +13,7 @@ umask 077
 # bash 4.0+ 必需（关联数组）
 [ "${BASH_VERSINFO[0]:-0}" -ge 4 ] || { echo "需要 Bash 4.0+（Debian/Ubuntu 默认满足；macOS /bin/bash 3.2 不支持），当前: ${BASH_VERSION:-unknown}" >&2; exit 1; }
 
-VERSION="4.2.0"
+VERSION="4.2.1"
 DEFAULT_SCRIPT_URL="https://raw.githubusercontent.com/DDIPP1005/PD-proxy/main/install.sh"
 SCRIPT_URL="${PD_SCRIPT_URL:-$DEFAULT_SCRIPT_URL}"
 _PD_SCRIPT_SOURCE="${BASH_SOURCE[0]}"
@@ -43,9 +43,9 @@ PD-proxy v${VERSION} — 多协议代理一键部署
   pd --log        <协议>   日志  pd --config    <协议> 配置
   pd --config-all          全部配置  pd --export   导出
   pd --status              状态  pd --show      详情
-  pd --doctor [--json]     只读诊断
+  pd --doctor [--json]     只读诊断（不代表真实客户端验收）
   pd --bbr                 开启BBR  pd --bbrv3     BBRv3内核
-  pd --update              更新    pd --remove-all [--yes]  卸载全部
+  pd --update              更新管理脚本    pd --remove-all [--yes]  卸载全部
   pd --self-test          只读静态自检（上线前建议运行）
   交互菜单 → 端口转发     IPv4 单端口 TCP / UDP / TCP+UDP
 
@@ -610,23 +610,23 @@ require_public_endpoint() {
 output_hosts() {
     local key="$1" allow4 allow6 port service transport
     OUTPUT_HOST4=""; OUTPUT_HOST6=""
-    allow4=$(state_get "$key" listen_ipv4 2>/dev/null || true)
-    allow6=$(state_get "$key" listen_ipv6 2>/dev/null || true)
-    if [ -z "$allow4$allow6" ]; then
-        port=$(state_get "$key" port 2>/dev/null || true)
-        case "$key" in
-            snell) service=snell; transport=tcp; [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && service=shadowtls-snell ;;
-            hy2) service=hysteria2; transport=udp ;;
-            vless) service=xray; transport=tcp ;;
-            anytls) service=anytls; transport=tcp ;;
-            *) return 1 ;;
-        esac
-        if [[ "$port" =~ ^[0-9]+$ ]] && systemctl is-active --quiet "$service" 2>/dev/null; then
-            service_port_family_listening "$port" "$transport" "$service" ipv4 && allow4=1 || allow4=0
-            service_port_family_listening "$port" "$transport" "$service" ipv6 && allow6=1 || allow6=0
-        fi
+    # Recheck sockets even for old state: cached flags may have been inferred.
+    allow4=0; allow6=0
+    port=$(state_get "$key" port 2>/dev/null || true)
+    case "$key" in
+        snell) service=snell; transport=tcp; [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && service=shadowtls-snell ;;
+        hy2) service=hysteria2; transport=udp ;;
+        vless) service=xray; transport=tcp ;;
+        anytls) service=anytls; transport=tcp ;;
+        *) return 1 ;;
+    esac
+    if [[ "$port" =~ ^[0-9]+$ ]] && systemctl is-active --quiet "$service" 2>/dev/null; then
+        service_port_family_listening "$port" "$transport" "$service" ipv4 && allow4=1
+        service_port_family_listening "$port" "$transport" "$service" ipv6 && allow6=1
     fi
-    if [ -n "${PUBLIC_HOST:-}" ] && { [ "$allow4" = 1 ] || [ "$allow6" = 1 ]; }; then
+    # A hostname may resolve to either family; use a verified numeric address
+    # when only one family is confirmed (TLS SNI is configured separately).
+    if [ -n "${PUBLIC_HOST:-}" ] && [ "$allow4" = 1 ] && [ "$allow6" = 1 ]; then
         OUTPUT_HOST4=$(format_proxy_host "$PUBLIC_HOST")
         return 0
     fi
@@ -659,6 +659,15 @@ format_proxy_host() {
         *:*) printf '[%s]' "$host" ;;
         *) printf '%s' "$host" ;;
     esac
+}
+
+# Surge uses separate host and port fields; URI IPv6 brackets do not belong here.
+format_surge_host() {
+    local host="$1"
+    case "$host" in
+        \[*:*\]) host="${host#\[}"; host="${host%\]}" ;;
+    esac
+    printf '%s' "$host"
 }
 
 check_nftables() {
@@ -1089,7 +1098,7 @@ bindv6only_confirmed_value() {
 # IPv4: IPV6_V6ONLY is per-socket and may override net.ipv6.bindv6only.
 _service_port_family_probe() {
     local mode="$1" port="$2" transport="$3" service="$4" family="$5"
-    local flag family_flag pid bindonly sockets
+    local flag family_flag pid sockets
     case "$mode" in strict|compat) ;; *) return 2 ;; esac
     case "$transport" in tcp) flag=-ltnp ;; udp) flag=-lunp ;; *) return 2 ;; esac
     case "$family" in ipv4) family_flag=-4 ;; ipv6) family_flag=-6 ;; *) return 2 ;; esac
@@ -1123,11 +1132,8 @@ _service_port_family_probe() {
         }
         END { exit found ? 0 : 1 }
     '; then
-        [ "$mode" = compat ] || return 2
-        # Compatibility heuristic for post-install verification only.  The
-        # global default cannot prove this socket's IPV6_V6ONLY setting.
-        bindonly=$(bindv6only_confirmed_value) || return 2
-        [ "$bindonly" = 0 ] && printf '1\n' || printf '0\n'
+        # Global bindv6only cannot prove the setting of this socket.
+        return 2
     else
         printf '0\n'
     fi
@@ -1143,20 +1149,22 @@ service_port_family_compat_probe() {
 
 service_port_family_listening() {
     local actual
-    actual=$(service_port_family_compat_probe "$@") || return $?
+    actual=$(service_port_family_probe "$@") || return $?
     [ "$actual" = 1 ]
 }
 
 verify_and_record_listen_families() {
-    local key="$1" port="$2" transport="$3" service="$4" got4=0 got6=0
-    service_port_family_listening "$port" "$transport" "$service" ipv4 && got4=1
-    service_port_family_listening "$port" "$transport" "$service" ipv6 && got6=1
+    local key="$1" port="$2" transport="$3" service="$4" got4=unknown got6=unknown
+    got4=$(service_port_family_probe "$port" "$transport" "$service" ipv4) || got4=unknown
+    got6=$(service_port_family_probe "$port" "$transport" "$service" ipv6) || got6=unknown
     case "${PD_EFFECTIVE_LISTEN_FAMILY:-auto}" in
-        ipv4) [ "$got4" = 1 ] && [ "$got6" = 0 ] || { err "服务未实现仅 IPv4 监听（IPv4=$got4 IPv6=$got6）"; return 1; } ;;
-        ipv6) [ "$got6" = 1 ] && [ "$got4" = 0 ] || { err "服务未实现仅 IPv6 监听（IPv4=$got4 IPv6=$got6）"; return 1; } ;;
-        dual) [ "$got4" = 1 ] && [ "$got6" = 1 ] || { err "服务未实际提供双栈监听（IPv4=$got4 IPv6=$got6）"; return 1; } ;;
+        ipv4) [ "$got4" = 1 ] && [ "$got6" = 0 ] || { err "服务未实现仅 IPv4 监听（IPv4=$got4 IPv6=${got6}）"; return 1; } ;;
+        ipv6) [ "$got6" = 1 ] && [ "$got4" = 0 ] || { err "服务未实现仅 IPv6 监听（IPv4=$got4 IPv6=${got6}）"; return 1; } ;;
+        dual) [ "$got4" = 1 ] && [ "$got6" = 1 ] || { err "服务未实际提供双栈监听（IPv4=$got4 IPv6=${got6}）"; return 1; } ;;
         auto) [ "$got4" = 1 ] || [ "$got6" = 1 ] || return 1 ;;
     esac
+    [ "$got4" = 1 ] || got4=0
+    [ "$got6" = 1 ] || got6=0
     state_set "$key" listen_ipv4 "$got4" || return 1
     state_set "$key" listen_ipv6 "$got6" || return 1
     state_set "$key" listen_family "${PD_EFFECTIVE_LISTEN_FAMILY:-auto}"
@@ -1194,6 +1202,75 @@ set_protocol_port() {
     printf -v "$port_var" '%s' "$port"
 }
 
+# UI-only readers. EOF/B returns 2; Q exits without changing resources.
+menu_choice() {
+    local out="$1" allowed="$2" fallback="${3:-}" reply
+    while true; do
+        IFS= read -r reply || { _PD_MENU_CANCELLED=1; return 2; }
+        reply="${reply:-$fallback}"
+        case "$reply" in q|Q) info "已退出"; exit 0 ;; b) reply=B ;; esac
+        case " $allowed " in
+            *" $reply "*)
+                [ "$reply" != B ] || { _PD_MENU_CANCELLED=1; return 2; }
+                printf -v "$out" '%s' "$reply"; return 0 ;;
+        esac
+        warn "无效选择，请重新输入（B 返回，Q 退出）"
+        printf '  选择: '
+    done
+}
+
+menu_field() {
+    local out="$1" label="$2" fallback="$3" validator="$4" reply
+    shift 4
+    while true; do
+        printf '  %s%s（B 返回，Q 退出）: ' "$label" "${fallback:+ [$fallback]}"
+        IFS= read -r reply || { _PD_MENU_CANCELLED=1; return 2; }
+        case "$reply" in b|B) _PD_MENU_CANCELLED=1; return 2 ;; q|Q) info "已退出"; exit 0 ;; esac
+        reply="${reply:-$fallback}"
+        if ( "$validator" "$reply" "$@" ); then
+            printf -v "$out" '%s' "$reply"; return 0
+        fi
+        warn "请重新填写此项，其他输入已保留"
+    done
+}
+
+menu_existing_file() {
+    [ -n "$1" ] && [ -s "$1" ] || { err "请选择存在且非空的文件"; return 1; }
+}
+
+menu_pause() {
+    local ignored
+    if [ -t 0 ] && [ -t 1 ]; then
+        printf '\n按回车返回菜单...'
+        IFS= read -r ignored || true
+    fi
+    return 0
+}
+
+menu_action() {
+    local rc had_errexit=0
+    [[ $- == *e* ]] && had_errexit=1
+    _PD_MENU_CANCELLED=0
+    set +e
+    "$@"
+    rc=$?
+    [ "$had_errexit" = 0 ] || set -e
+    case "$rc" in
+        0) info "操作结束，请查看上方结果" ;;
+        2)
+            if [ "${_PD_MENU_CANCELLED:-0}" = 1 ]; then
+                info "已取消"
+            else
+                err "操作未完成（退出码 2）；请查看上方失败步骤和回滚结果"
+                warn "下一步可运行 pd --doctor"
+            fi ;;
+        *) err "操作未完成（退出码 ${rc}）；请查看上方失败步骤和回滚结果"
+           warn "下一步可运行 pd --doctor；请勿在回滚不完整时继续变更" ;;
+    esac
+    menu_pause
+    return 0
+}
+
 prompt_protocol_port() {
     local proto="$1" name port_var port pc
     name=$(pname "$proto")
@@ -1201,18 +1278,14 @@ prompt_protocol_port() {
     while true; do
         echo ""
         echo -e "  ${MAGENTA}▸ ${name} — 监听端口${RESET}"
-        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
-        echo -e "  ${CYAN}│${RESET} [1] ${GREEN}自动分配${RESET}         推荐              ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [2] 自定义端口                        ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回${RESET}                            ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
-        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
-        read -r pc
+        echo -e "  [1] ${GREEN}自动分配${RESET}         推荐             "
+        echo -e "  [2] 自定义端口                       "
+        echo -e "  [B] 返回  [Q] 退出"
+        echo -ne "  选择 [1]: "
+        menu_choice pc "1 2 B" 1 || return $?
         case "$pc" in
             2)
-                echo -ne "  输入端口 (1-65535): "
-                read -r port
-                validate_port "$port" "端口"
+                menu_field port "端口 (1-65535)" "" validate_port "端口" || return $?
                 if state_port_range_conflict "$port" "$port" "$(pkey "$proto")"; then
                     warn "端口 $port 已被其它 PD 协议使用，请换一个端口"
                     continue
@@ -1402,7 +1475,7 @@ verify_port() {
         warn "查看日志: journalctl -u $service -n 30 --no-pager"
         return 1
     fi
-    info "端口 $port/${transport} 与服务 $service 验证通过 ✅"
+    info "服务 $service 与端口 $port/${transport} 检查通过；尚未完成真实客户端代理验收"
 }
 
 verify_hy2_hop() {
@@ -2371,15 +2444,15 @@ snell_output() {
         echo -e "协议:    ${GREEN}ShadowTLS v${tls_proto}${RESET}"
         echo ""
         echo -e "${CYAN}[Surge 配置]${RESET}"
-        echo -e "${GREEN}Proxy = snell, ${host4}, ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}${RESET}"
-        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = snell, ${host6}, ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}${RESET}"
+        echo -e "${GREEN}Proxy = snell, $(format_surge_host "$host4"), ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}${RESET}"
+        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = snell, $(format_surge_host "$host6"), ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}${RESET}"
     else
         output_header "Snell v${major}" "$port"
         echo -e "PSK:    ${GREEN}${psk}${RESET}"
         echo ""
         echo -e "${CYAN}[Surge 配置]${RESET}"
-        echo -e "${GREEN}Proxy = snell, ${host4}, ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, tfo=true${RESET}"
-        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = snell, ${host6}, ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, tfo=true${RESET}"
+        echo -e "${GREEN}Proxy = snell, $(format_surge_host "$host4"), ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, tfo=true${RESET}"
+        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = snell, $(format_surge_host "$host6"), ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, tfo=true${RESET}"
     fi
     output_footer
 }
@@ -2771,11 +2844,11 @@ hy2_output() {
     hop_count=$(state_get hy2 hop)
     if [ "${hop_count:-0}" -ge 3 ] 2>/dev/null; then
         local last_port=$((port + hop_count - 1))
-        echo -e "${GREEN}Proxy = hysteria2, ${host4}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}${RESET}"
-        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = hysteria2, ${host6}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}${RESET}"
+        echo -e "${GREEN}Proxy = hysteria2, $(format_surge_host "$host4"), ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}${RESET}"
+        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = hysteria2, $(format_surge_host "$host6"), ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}${RESET}"
     else
-        echo -e "${GREEN}Proxy = hysteria2, ${host4}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
-        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = hysteria2, ${host6}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
+        echo -e "${GREEN}Proxy = hysteria2, $(format_surge_host "$host4"), ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
+        [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = hysteria2, $(format_surge_host "$host6"), ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true${RESET}"
     fi
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
@@ -3221,7 +3294,6 @@ anytls_output() {
     select_output_hosts anytls || return 1
     host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
     if [ "$backend" = sing-box ]; then
-        [ -n "$domain" ] && host4="$domain" && host6=""
         [ -n "$sni" ] && surge_extra=", sni=${sni}" && query="?sni=$(url_escape "$sni")"
         if [ "$cert_mode" = self-signed ] || [ "${PD_OPT_ANYTLS_SKIP_CERT_VERIFY:-0}" = 1 ]; then
             surge_extra="${surge_extra}, skip-cert-verify=true"
@@ -3244,8 +3316,8 @@ anytls_output() {
     [ -n "$cert_mode" ] && echo -e "证书:   ${DIM}${cert_mode}${RESET}"
     echo ""
     echo -e "${CYAN}[Surge 配置]${RESET}"
-    echo -e "${GREEN}Proxy = anytls, ${host4}, ${port}, password=${pass}${surge_extra}${RESET}"
-    [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = anytls, ${host6}, ${port}, password=${pass}${surge_extra}${RESET}"
+    echo -e "${GREEN}Proxy = anytls, $(format_surge_host "$host4"), ${port}, password=${pass}${surge_extra}${RESET}"
+    [ -n "$host6" ] && echo -e "${GREEN}Proxy-IPv6 = anytls, $(format_surge_host "$host6"), ${port}, password=${pass}${surge_extra}${RESET}"
     echo ""
     echo -e "${CYAN}[Shadowrocket]${RESET}"
     gen_qr "$link"
@@ -3803,11 +3875,11 @@ show_config_only() {
                 tls_sni=$(printf '%s\n' "$tls_values" | sed -n '2p')
                 tls_proto=$(printf '%s\n' "$tls_values" | sed -n '3p')
                 [ -n "$tls_proto" ] || tls_proto="2"
-                echo "Proxy = snell, ${host4}, ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}"
-                [ -n "$host6" ] && echo "Proxy-IPv6 = snell, ${host6}, ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}"
+                echo "Proxy = snell, $(format_surge_host "$host4"), ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}"
+                [ -n "$host6" ] && echo "Proxy-IPv6 = snell, $(format_surge_host "$host6"), ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, shadow-tls-password=${tls_pass}, shadow-tls-sni=${tls_sni%:*}, shadow-tls-version=${tls_proto}"
             else
-                echo "Proxy = snell, ${host4}, ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, tfo=true"
-                [ -n "$host6" ] && echo "Proxy-IPv6 = snell, ${host6}, ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, tfo=true"
+                echo "Proxy = snell, $(format_surge_host "$host4"), ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, tfo=true"
+                [ -n "$host6" ] && echo "Proxy-IPv6 = snell, $(format_surge_host "$host6"), ${port}, psk=${psk}, version=${major}${mode_arg}, reuse=true, tfo=true"
             fi ;;
         hy2)
             local pass hop host4 host6
@@ -3818,14 +3890,14 @@ show_config_only() {
             host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
             if [ "$hop" -ge 3 ] 2>/dev/null; then
                 local last_port=$((port + hop - 1))
-                echo "Proxy = hysteria2, ${host4}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}"
-                [ -n "$host6" ] && echo "Proxy-IPv6 = hysteria2, ${host6}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}"
+                echo "Proxy = hysteria2, $(format_surge_host "$host4"), ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}"
+                [ -n "$host6" ] && echo "Proxy-IPv6 = hysteria2, $(format_surge_host "$host6"), ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true, port-hopping=${port}-${last_port}"
                 echo ""
                 echo "# Shadowrocket: hysteria2://${pass}@${host4}:${port}-${last_port}?sni=www.bing.com&insecure=1#PD-HY2"
                 [ -n "$host6" ] && echo "# Shadowrocket-IPv6: hysteria2://${pass}@${host6}:${port}-${last_port}?sni=www.bing.com&insecure=1#PD-HY2-IPv6"
             else
-                echo "Proxy = hysteria2, ${host4}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
-                [ -n "$host6" ] && echo "Proxy-IPv6 = hysteria2, ${host6}, ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
+                echo "Proxy = hysteria2, $(format_surge_host "$host4"), ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
+                [ -n "$host6" ] && echo "Proxy-IPv6 = hysteria2, $(format_surge_host "$host6"), ${port}, password=${pass}, sni=www.bing.com, skip-cert-verify=true"
                 echo ""
                 echo "# Shadowrocket: hysteria2://${pass}@${host4}:${port}?sni=www.bing.com&insecure=1#PD-HY2"
                 [ -n "$host6" ] && echo "# Shadowrocket-IPv6: hysteria2://${pass}@${host6}:${port}?sni=www.bing.com&insecure=1#PD-HY2-IPv6"
@@ -3859,15 +3931,14 @@ show_config_only() {
             select_output_hosts anytls || return 1
             host4="$OUTPUT_HOST4"; host6="$OUTPUT_HOST6"
             if [ "$backend" = sing-box ]; then
-                [ -n "$domain" ] && host4="$domain" && host6=""
                 [ -n "$sni" ] && surge_extra=", sni=${sni}" && query="?sni=$(url_escape "$sni")"
                 if [ "$cert_mode" = self-signed ]; then surge_extra="${surge_extra}, skip-cert-verify=true"; query="${query:-?}${query:+&}insecure=1"; fi
                 [ "$reuse" = auto ] || surge_extra="${surge_extra}, reuse=${reuse}"
             else
                 [ -n "$sni" ] && surge_extra=", sni=${sni}, skip-cert-verify=true" && query="?sni=$(url_escape "$sni")&insecure=1"
             fi
-            echo "Proxy = anytls, ${host4}, ${port}, password=${pass}${surge_extra}"
-            [ -n "$host6" ] && echo "Proxy-IPv6 = anytls, ${host6}, ${port}, password=${pass}${surge_extra}"
+            echo "Proxy = anytls, $(format_surge_host "$host4"), ${port}, password=${pass}${surge_extra}"
+            [ -n "$host6" ] && echo "Proxy-IPv6 = anytls, $(format_surge_host "$host6"), ${port}, password=${pass}${surge_extra}"
             echo ""
             echo "# Shadowrocket: anytls://${pass}@${host4}:${port}${query}#PD-AnyTLS"
             [ -n "$host6" ] && echo "# Shadowrocket-IPv6: anytls://${pass}@${host6}:${port}${query}#PD-AnyTLS-IPv6" ;;
@@ -3879,57 +3950,45 @@ show_config_only() {
 # 状态 & 配置查看
 # ============================================================
 
+# Compact rows avoid terminal-dependent Chinese/emoji column widths.
+ui_service_state() {
+    local service="$1" state
+    state=$(systemctl is-active "$service" 2>/dev/null || true)
+    case "$state" in
+        active) printf '%b运行中%b' "$GREEN" "$RESET" ;;
+        inactive) printf '%b已停止%b' "$DIM" "$RESET" ;;
+        failed) printf '%b异常%b' "$RED" "$RESET" ;;
+        activating|deactivating|reloading) printf '%b切换中%b' "$YELLOW" "$RESET" ;;
+        *) printf '%b状态未知%b' "$YELLOW" "$RESET" ;;
+    esac
+}
+
 show_status() {
-    echo ""
-    echo -e "${CYAN}╔══════════════════════════════════════╗${RESET}"
-    echo -e "${CYAN}║${RESET}     ${MAGENTA}◆  P D - P R O X Y${RESET}  ${DIM}v${VERSION}${RESET}    ${CYAN}║${RESET}"
-    echo -e "${CYAN}╠══════════════════════════════════════╣${RESET}"
+    local proto key name port ver
+    printf '\nPD-proxy  管理脚本 v%s\n' "$VERSION"
+    echo '--------------------------------'
     for proto in $ALL_PROTOS; do
-        local key=$(pkey "$proto")
-        local name=$(pname "$proto")
-        if state_installed "$(pkey "$proto")" && [ "$proto" = snell ]; then
-            local snell_major
-            snell_major=$(snell_installed_major 2>/dev/null || echo "?")
-            name="Snell v${snell_major}"
-            [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && name="Snell v${snell_major}+STS"
-        fi
+        key=$(pkey "$proto"); name=$(pname "$proto")
         if state_installed "$key"; then
-            local port=$(state_get "$key" "port")
-            local ver=$(state_get "$key" "version")
-            local svc=$(psvc "$proto")
-            local st icon
-            if [ "$proto" = "snell" ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
-                if systemctl is-active --quiet "$svc" 2>/dev/null && systemctl is-active --quiet shadowtls-snell 2>/dev/null; then
-                    st="${GREEN}ONLINE ${RESET}"
-                    icon="${GREEN}◆${RESET}"
+            port=$(state_get "$key" port); ver=$(state_get "$key" version)
+            printf '%s  %s\n' "$name" "$(ui_service_state "$(psvc "$proto")")"
+            printf '  端口 %s | 服务端 %s\n' "${port:-未知}" "${ver:-未知}"
+            if [ "$proto" = snell ]; then
+                if [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
+                    printf '  ShadowTLS: %s\n' "$(ui_service_state shadowtls-snell)"
                 else
-                    st="${RED}OFFLINE${RESET}"
-                    icon="${RED}◇${RESET}"
+                    echo '  ShadowTLS: 未启用'
                 fi
-            elif [ "$proto" = "hy2" ] && [ "$(state_get "$key" "hop")" -ge 3 ] 2>/dev/null; then
-                if systemctl is-active --quiet "$svc" 2>/dev/null && nft list table inet pd_hy2_hop >/dev/null 2>&1; then
-                    st="${GREEN}ONLINE ${RESET}"
-                    icon="${GREEN}◆${RESET}"
-                else
-                    st="${RED}OFFLINE${RESET}"
-                    icon="${RED}◇${RESET}"
-                fi
-            elif systemctl is-active --quiet "$svc" 2>/dev/null; then
-                st="${GREEN}ONLINE ${RESET}"
-                icon="${GREEN}◆${RESET}"
-            else
-                st="${RED}OFFLINE${RESET}"
-                icon="${RED}◇${RESET}"
             fi
-            printf "${CYAN}║${RESET} ${icon} %-12s ${st}  ${BLUE}:%-5s${RESET} ${DIM}%s${RESET} ${CYAN}║${RESET}\n" "$name" "$port" "$ver"
         else
-            printf "${CYAN}║${RESET} ${DIM}◇ %-12s 未安装              ${RESET} ${CYAN}║${RESET}\n" "$name"
+            printf '%s  未安装\n' "$name"
         fi
     done
-    echo -e "${CYAN}╠══════════════════════════════════════╣${RESET}"
-    printf "${CYAN}║${RESET} ${DIM}%-10s │ ${BLUE}%-15s${RESET}${DIM} │ %sMB${RESET}  ${CYAN}║${RESET}\n" "$OS_PRETTY" "$IP" "$MEM_AVAIL"
-    echo -e "${CYAN}╚══════════════════════════════════════╝${RESET}"
-    echo ""
+    echo '--------------------------------'
+    printf '系统: %s\n' "${OS_PRETTY:-未知}"
+    printf '可用内存: %s MB\n' "${MEM_AVAIL:-未知}"
+    echo '运行状态不代表真实代理请求已验收'
+    echo ''
 }
 
 show_config() {
@@ -4883,6 +4942,56 @@ forward_prepare_dir() {
     fi
 }
 
+# Read all resources before any deletion. Unknown output/query failure fails closed.
+forward_runtime_guard() {
+    local dir="$1" tables listing rules line owned=0
+    _PF_HAS_NFT=0; _PF_HAS_CHAIN=0
+    if [ -e "$dir" ] || [ -L "$dir" ]; then
+        [ -d "$dir" ] && [ ! -L "$dir" ] && [ ! -L "$dir/.pd-proxy-owned" ] \
+        && [ -f "$dir/.pd-proxy-owned" ] \
+        && grep -Fxq 'PD-proxy owned resource' "$dir/.pd-proxy-owned" || return 1
+        owned=1
+    fi
+    if ! command -v nft >/dev/null 2>&1; then
+        [ "$owned" = 0 ] || return 1
+        tables=""
+    else
+        tables=$(nft list tables 2>/dev/null) || return 1
+    fi
+    if printf '%s\n' "$tables" | grep -Fxq 'table ip pd_port_forward'; then
+        [ "$owned" = 1 ] || return 1
+        _PF_HAS_NFT=1
+        listing=$(nft list table ip pd_port_forward 2>/dev/null) || return 1
+        printf '%s\n' "$listing" | awk '
+            { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, "") }
+            /^table ip pd_port_forward \{$/ { table++; next }
+            /^chain (prerouting|forward|postrouting) \{$/ { chains++; next }
+            /^type nat hook prerouting priority (dstnat|-100); policy accept;$/ { next }
+            /^type filter hook forward priority (-10|filter - 10); policy accept;$/ { next }
+            /^type nat hook postrouting priority (srcnat|100); policy accept;$/ { next }
+            /^}$/ || /^$/ { next }
+            / comment "PD-proxy:(pf[0-9][0-9][0-9][0-9]|forward-established)"$/ { owned++; next }
+            { bad=1 }
+            END { exit (bad || table != 1 || chains != 3 || owned < 1) ? 1 : 0 }
+        ' || return 1
+    fi
+    if command -v iptables >/dev/null 2>&1; then
+        rules=$(iptables -S 2>/dev/null) || return 1
+        while IFS= read -r line; do
+            case "$line" in
+                '-N PD_PORT_FORWARD') [ "$owned" = 1 ] || return 1; _PF_HAS_CHAIN=1 ;;
+                '-A PD_PORT_FORWARD '*)
+                    [ "$owned" = 1 ] || return 1
+                    printf '%s\n' "$line" | grep -Eq -- '--comment "?PD-proxy:forward-(established)"?( |$)|--comment "?PD-proxy:forward:pf[0-9]{4}"?( |$)' || return 1 ;;
+                *)
+                    if printf '%s\n' "$line" | grep -Eq -- '(-j|-g) PD_PORT_FORWARD( |$)'; then
+                        printf '%s\n' "$line" | grep -Eq -- '^-A FORWARD -m comment --comment "?PD-proxy:forward-jump"? -j PD_PORT_FORWARD$' || return 1
+                    fi ;;
+            esac
+        done <<< "$rules"
+    fi
+}
+
 forward_assert_owned() {
     local dir unit
     dir=$(forward_dir); unit=$(forward_unit_file)
@@ -4893,18 +5002,7 @@ forward_assert_owned() {
     [ ! -L "$unit" ] || { err "端口转发 unit 是符号链接，拒绝操作"; return 1; }
     [ ! -e "$unit" ] || unit_is_pd_owned "$unit" \
         || { err "端口转发 unit 所有权无法确认"; return 1; }
-    if command -v nft >/dev/null 2>&1 && nft list table ip pd_port_forward >/dev/null 2>&1; then
-        [ -f "$dir/.pd-proxy-owned" ] && unit_is_pd_owned "$unit" \
-            || { err "发现所有权未知的 nft table ip pd_port_forward"; return 1; }
-    fi
-    if command -v iptables >/dev/null 2>&1 && iptables -S PD_PORT_FORWARD >/dev/null 2>&1; then
-        [ -f "$dir/.pd-proxy-owned" ] || { err "发现所有权未知的 iptables 链 PD_PORT_FORWARD"; return 1; }
-        if iptables -S PD_PORT_FORWARD 2>/dev/null | grep '^-' \
-            | grep -v '^-N PD_PORT_FORWARD$' | grep -v 'PD-proxy:forward' | grep -q .; then
-            err "PD_PORT_FORWARD 链包含非本脚本规则，拒绝覆盖"
-            return 1
-        fi
-    fi
+    forward_runtime_guard "$dir" || { err "端口转发规则所有权或查询结果无法确认"; return 1; }
 }
 
 forward_rule_line() {
@@ -5096,24 +5194,34 @@ forward_generate_apply_script() {
 #!/usr/bin/env bash
 # PD-proxy owned resource
 set -euo pipefail
-mode="\${1:-apply}"
-nft_bin="\$(command -v nft)"
+EOF
+        declare -f forward_runtime_guard
+        printf 'forward_dir=%q\n' "$(forward_dir)"
+        cat <<'EOF'
+mode="${1:-apply}"
+case "$mode" in apply|remove) ;; *) exit 2 ;; esac
+forward_runtime_guard "$forward_dir" || { echo '端口转发所有权无法确认，拒绝修改' >&2; exit 1; }
+nft_bin="$(command -v nft)"
 remove_runtime() {
-    "\$nft_bin" list table ip pd_port_forward >/dev/null 2>&1 && "\$nft_bin" delete table ip pd_port_forward || true
+    if [ "$_PF_HAS_NFT" = 1 ]; then
+        "$nft_bin" delete table ip pd_port_forward
+    fi
     if command -v iptables >/dev/null 2>&1; then
         while iptables -C FORWARD -m comment --comment PD-proxy:forward-jump -j PD_PORT_FORWARD >/dev/null 2>&1; do
             iptables -D FORWARD -m comment --comment PD-proxy:forward-jump -j PD_PORT_FORWARD
         done
-        if iptables -S PD_PORT_FORWARD >/dev/null 2>&1; then
+        if [ "$_PF_HAS_CHAIN" = 1 ]; then
             iptables -F PD_PORT_FORWARD
             iptables -X PD_PORT_FORWARD
         fi
     fi
 }
 remove_runtime
-[ "\$mode" = remove ] && exit 0
+[ "$mode" = remove ] && exit 0
 sysctl -q -w net.ipv4.ip_forward=1
-"\$nft_bin" -f "$nft"
+EOF
+        printf '"$nft_bin" -f %q\n' "$nft"
+        cat <<'EOF'
 if command -v iptables >/dev/null 2>&1; then
     iptables -N PD_PORT_FORWARD
     iptables -I FORWARD 1 -m comment --comment PD-proxy:forward-jump -j PD_PORT_FORWARD
@@ -5602,6 +5710,7 @@ doctor_protocol() {
     else
         doctor_add "${key}.family" warn "监听族状态缺失或无效（记录 IPv4=${recorded4:-?} IPv6=${recorded6:-?}）"
     fi
+    doctor_add "${key}.proxy" warn "尚未执行真实客户端代理验收；服务和监听正常不代表代理可用"
     doctor_firewall "$key"
     doctor_protocol_extra "$proto" "$port"
     if [ "$proto" = snell ] && [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ]; then
@@ -5802,6 +5911,513 @@ pd_static_self_test() {
     return "$rc"
 }
 
+# ============================================================
+# 交互菜单系统（二级菜单 + 协议配置子菜单）
+# ============================================================
+
+# ---- ShadowTLS交互配置 ----
+menu_prompt_shadowtls_options() {
+    local preserve="${1:-0}" current_values="" current_pass="" current_sni="" current_proto="3"
+    local sni_c sni_custom tls_v pass_input
+    if [ "$preserve" = 1 ]; then
+        current_values=$(snell_shadowtls_unit_values 2>/dev/null || true)
+        current_pass=$(printf '%s\n' "$current_values" | sed -n '1p')
+        current_sni=$(printf '%s\n' "$current_values" | sed -n '2p'); current_sni="${current_sni%:*}"
+        current_proto=$(printf '%s\n' "$current_values" | sed -n '3p')
+        [ -n "$current_sni" ] || current_sni="www.microsoft.com"
+        [ -n "$current_proto" ] || current_proto=3
+    else
+        current_sni="${PD_OPT_SNELL_TLS_SNI:-www.microsoft.com}"
+    fi
+    echo ""
+    echo -e "  ${MAGENTA}ShadowTLS伪装SNI${RESET}"
+    echo "  [1] www.microsoft.com  [2] www.apple.com"
+    echo "  [3] cloudflare.com      [4] 自定义"
+    echo -ne "  选择 [保留/默认 ${current_sni}]: "
+    menu_choice sni_c "1 2 3 4 keep B" "keep" || return $?
+    case "$sni_c" in
+        1) PD_OPT_SNELL_TLS_SNI="www.microsoft.com" ;;
+        2) PD_OPT_SNELL_TLS_SNI="www.apple.com" ;;
+        3) PD_OPT_SNELL_TLS_SNI="cloudflare.com" ;;
+        4) menu_field sni_custom "SNI" "$current_sni" validate_hostname "SNI" || return $?; PD_OPT_SNELL_TLS_SNI="$sni_custom" ;;
+        *) PD_OPT_SNELL_TLS_SNI="$current_sni" ;;
+    esac
+    printf '  ShadowTLS版本 [%s；可选 2/3]: ' "$current_proto"
+    menu_choice tls_v "2 3 B" "$current_proto" || return $?
+    case "$tls_v" in 2) PD_OPT_SNELL_TLS_VERSION="v2" ;; "") PD_OPT_SNELL_TLS_VERSION="v${current_proto}" ;; *) PD_OPT_SNELL_TLS_VERSION="v3" ;; esac
+    if [ "$preserve" = 1 ]; then
+        echo -ne "  新密码（留空保持原密码）: "
+        IFS= read -rs pass_input || { echo ""; _PD_MENU_CANCELLED=1; return 2; }; echo ""
+        PD_OPT_SNELL_TLS_PASS="${pass_input:-$current_pass}"
+    else
+        echo -ne "  自定义密码（留空自动生成）: "
+        IFS= read -rs pass_input || { echo ""; _PD_MENU_CANCELLED=1; return 2; }; echo ""
+        PD_OPT_SNELL_TLS_PASS="$pass_input"
+    fi
+}
+
+# ---- Snell安装子菜单 ----
+menu_snell_config() {
+    local cc
+    while true; do
+        echo ""
+        echo -e "  ${MAGENTA}选择Snell协议版本${RESET}"
+        echo -e "  [1] Snell v4"
+        echo -e "  [2] ${GREEN}Snell v5${RESET}  稳定版               "
+        echo -e "  [3] ${YELLOW}Snell v6${RESET}  允许预发布版           "
+        echo -e "  [B] 返回  [Q] 退出"
+        echo -ne "  选择 [2]: "
+        menu_choice cc "1 2 3 B" "2" || return $?
+        case "$cc" in
+            1) PD_OPT_SNELL_MAJOR=4; break ;;
+            3) PD_OPT_SNELL_MAJOR=6; PD_OPT_SNELL_V6_MODE=default; break ;;
+            [Bb]) return 1 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) PD_OPT_SNELL_MAJOR=5; break ;;
+        esac
+    done
+    echo ""
+    echo -e "  ${MAGENTA}Snell v${PD_OPT_SNELL_MAJOR}是否配置ShadowTLS${RESET}"
+    echo "  [1] 普通Snell"
+    echo "  [2] 配置ShadowTLS（后续可随时关闭）"
+    echo -ne "  选择 [1]: "
+    menu_choice cc "1 2 B" "1" || return $?
+    case "$cc" in
+        2) PD_OPT_SNELL_MODE=shadowtls; menu_prompt_shadowtls_options 0 || return $? ;;
+        *) PD_OPT_SNELL_MODE=standard ;;
+    esac
+    prompt_protocol_port snell || return $?
+    run_write_locked install_protocol snell
+}
+
+# ---- HY2 配置子菜单 ----
+menu_hy2_config() {
+    local hy2_range
+    while true; do
+        echo ""
+        echo -e "  ${MAGENTA}Hysteria2 — 端口模式${RESET}"
+        echo -e "  [1] ${GREEN}单端口${RESET}           标准             "
+        echo -e "  [2] ${MAGENTA}3 端口跳跃${RESET}       轻量混淆         "
+        echo -e "  [3] ${MAGENTA}5 端口跳跃${RESET}       深度混淆 (推荐)  "
+        echo -e "  [4] ${MAGENTA}范围端口跳跃${RESET}     自定义 start-end"
+        echo -e "  [B] 返回  [Q] 退出"
+        echo -ne "  选择: "
+        menu_choice cc "1 2 3 4 B" "1" || return $?
+        case "$cc" in
+            1) PD_OPT_HY2_HOP=0; PD_OPT_HY2_HOP_RANGE=""; prompt_protocol_port hy2 || return $?; break ;;
+            2) PD_OPT_HY2_HOP=3; PD_OPT_HY2_HOP_RANGE=""; prompt_protocol_port hy2 || return $?; break ;;
+            3) PD_OPT_HY2_HOP=5; PD_OPT_HY2_HOP_RANGE=""; prompt_protocol_port hy2 || return $?; break ;;
+            4)
+                menu_field hy2_range "跳跃范围 (例如 30000-30100)" "" apply_hy2_hop_range || return $?
+                apply_hy2_hop_range "$hy2_range"
+                break ;;
+            [Bb]) return 1 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) warn "无效选择" ;;
+        esac
+    done
+    run_write_locked install_protocol hy2 || return $?
+    return 0
+}
+
+# ---- VLESS 配置子菜单 ----
+menu_vless_config() {
+    local cc fp_c
+    while true; do
+        echo ""
+        echo -e "  ${MAGENTA}VLESS Reality — 伪装目标${RESET}"
+        echo -e "  [1] addons.mozilla.org  Mozilla CDN  "
+        echo -e "  [2] www.microsoft.com   微软 CDN     "
+        echo -e "  [3] swdist.apple.com    Apple 分发   "
+        echo -e "  [4] dl.google.com       Google 下载  "
+        echo -e "  [B] 返回  [Q] 退出"
+        echo -ne "  选择 [1]: "
+        menu_choice cc "1 2 3 4 B" "1" || return $?
+        case "$cc" in
+            2) PD_OPT_VLESS_DEST="www.microsoft.com:443"; PD_OPT_VLESS_SNI="www.microsoft.com" ;;
+            3) PD_OPT_VLESS_DEST="swdist.apple.com:443"; PD_OPT_VLESS_SNI="swdist.apple.com" ;;
+            4) PD_OPT_VLESS_DEST="dl.google.com:443"; PD_OPT_VLESS_SNI="dl.google.com" ;;
+            [Bb]) return 1 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) PD_OPT_VLESS_DEST="addons.mozilla.org:443"; PD_OPT_VLESS_SNI="addons.mozilla.org" ;;
+        esac
+
+        PD_OPT_VLESS_TRANSPORT="tcp"
+
+        echo ""
+        echo -e "  ${MAGENTA}浏览器指纹${RESET}"
+        echo -e "  [1] chrome  [2] firefox  [3] safari  [4] ios  [5] 随机"
+        echo -ne "  选择 [1]: "
+        menu_choice fp_c "1 2 3 4 5 B" "1" || return $?
+        case "$fp_c" in
+            2) PD_OPT_VLESS_FP="firefox" ;;
+            3) PD_OPT_VLESS_FP="safari" ;;
+            4) PD_OPT_VLESS_FP="ios" ;;
+            5) PD_OPT_VLESS_FP="randomized" ;;
+            *) PD_OPT_VLESS_FP="chrome" ;;
+        esac
+        prompt_protocol_port vless || return $?
+        break
+    done
+    run_write_locked install_protocol vless || return $?
+    return 0
+}
+
+# ---- AnyTLS 配置子菜单 ----
+menu_anytls_config() {
+    local cc domain_input cert_c cert_path key_path legacy_sni_c
+    echo ""
+    echo -e "  ${MAGENTA}AnyTLS 后端${RESET}"
+    echo -e "  [1] ${GREEN}稳定模式${RESET}: sing-box + 域名 + 有效证书（推荐）"
+    echo -e "  [2] 快速模式: anytls-go 参考实现（legacy/测试）"
+    echo -e "  [B] 返回  [Q] 退出"
+    echo -ne "  选择 [1]: "
+    menu_choice cc "1 2 B" "1" || return $?
+    case "$cc" in
+        2) PD_OPT_ANYTLS_BACKEND="anytls-go" ;;
+        [Bb]) return 1 ;;
+        [Qq]) info "再见 👋"; exit 0 ;;
+        *) PD_OPT_ANYTLS_BACKEND="sing-box" ;;
+    esac
+
+    if [ "$PD_OPT_ANYTLS_BACKEND" = "sing-box" ]; then
+        echo ""
+        echo -e "  ${MAGENTA}AnyTLS 稳定模式域名${RESET}"
+        echo -e "  ${DIM}  建议一台 VPS 一个子域名，Cloudflare 用 DNS only。${RESET}"
+        menu_field domain_input "域名" "${PUBLIC_HOST:-}" validate_hostname "AnyTLS 域名" || return $?
+        PD_OPT_ANYTLS_DOMAIN="$domain_input"
+        PD_OPT_ANYTLS_SNI="$PD_OPT_ANYTLS_DOMAIN"
+        # 让配置输出默认使用该域名，而不是自动探测 IP。
+        PUBLIC_HOST="$PD_OPT_ANYTLS_DOMAIN"
+        PD_PUBLIC_HOST="$PD_OPT_ANYTLS_DOMAIN"
+
+        echo ""
+        echo -e "  ${MAGENTA}证书方式${RESET}"
+        echo -e "  [1] auto：已有证书则复用，否则 certbot 申请（推荐）"
+        echo -e "  [2] existing：使用已有证书路径"
+        echo -e "  [3] self-signed：自签证书，仅测试"
+        echo -ne "  选择 [1]: "
+        menu_choice cert_c "1 2 3 B" "1" || return $?
+        case "$cert_c" in
+            2)
+                PD_OPT_ANYTLS_CERT_MODE="existing"
+                menu_field cert_path "fullchain.pem 路径" "" menu_existing_file || return $?
+                menu_field key_path "privkey.pem 路径" "" menu_existing_file || return $?
+                PD_OPT_ANYTLS_CERT_PATH="$cert_path"
+                PD_OPT_ANYTLS_KEY_PATH="$key_path" ;;
+            3) PD_OPT_ANYTLS_CERT_MODE="self-signed" ;;
+            *) PD_OPT_ANYTLS_CERT_MODE="auto" ;;
+        esac
+        PD_OPT_ANYTLS_PADDING="standard"
+        PD_OPT_ANYTLS_REUSE="auto"
+    else
+        echo ""
+        echo -e "  ${MAGENTA}legacy SNI${RESET}"
+        echo -e "  ${DIM}  anytls-go 模式仅建议临时测试；SNI 只写入客户端。${RESET}"
+        echo -e "  [1] 不写 SNI  [2] www.microsoft.com  [3] www.apple.com  [4] cloudflare.com"
+        echo -ne "  选择 [1]: "
+        menu_choice legacy_sni_c "1 2 3 4 B" "1" || return $?
+        case "$legacy_sni_c" in
+            2) PD_OPT_ANYTLS_SNI="www.microsoft.com" ;;
+            3) PD_OPT_ANYTLS_SNI="www.apple.com" ;;
+            4) PD_OPT_ANYTLS_SNI="cloudflare.com" ;;
+            *) PD_OPT_ANYTLS_SNI="" ;;
+        esac
+        PD_OPT_ANYTLS_CERT_MODE="self-signed"
+        PD_OPT_ANYTLS_PADDING="standard"
+    fi
+    prompt_protocol_port anytls || return $?
+    run_write_locked install_protocol anytls || return $?
+    return 0
+}
+menu_install() {
+    echo -e "  ${MAGENTA}安装协议${RESET}"
+    echo -e "  [1] ${GREEN}Snell${RESET}           ${DIM}v4 / v5 / v6${RESET}     "
+    echo -e "  [2] ${GREEN}Hysteria2${RESET}       ${DIM}Surge + SR${RESET}       "
+    echo -e "  [3] ${GREEN}VLESS Reality${RESET}   ${DIM}Shadowrocket${RESET}     "
+    echo -e "  [4] ${GREEN}AnyTLS${RESET}          ${DIM}Surge + SR${RESET}       "
+    echo -e "  [B] ${DIM}返回主菜单${RESET}                   "
+    echo ""
+    echo -ne "  选择: "
+    menu_choice cc "1 2 3 4 B" "" || return $?
+    case "$cc" in
+        1) menu_snell_config || return $? ;;
+        2) menu_hy2_config || return $? ;;
+        3) menu_vless_config || return $? ;;
+        4) menu_anytls_config || return $? ;;
+        [Bb]) return 1 ;;
+        [Qq]) info "再见 👋"; exit 0 ;;
+        *) warn "无效选择" ;;
+    esac
+    return 0
+}
+
+menu_protocol_manage_generic() {
+    local proto="$1" cc
+    while true; do
+        echo ""
+        echo -e "  ${MAGENTA}$(pname "$proto")管理${RESET}"
+        echo "  [1] 查看配置      [2] 升级服务端"
+        echo "  [3] 重启          [4] 停止"
+        echo "  [5] 启动          [6] 日志"
+        echo "  [7] 卸载          [B] 返回  [Q] 退出"
+        echo -ne "  选择: "; menu_choice cc "1 2 3 4 5 6 7 B" "" || return $?
+        case "$cc" in
+            1) menu_action show_config_only "$proto" ;;
+            2) menu_action run_write_locked upgrade_protocol "$proto" ;;
+            3) menu_action run_write_locked restart_service "$proto" ;;
+            4) menu_action run_write_locked stop_service "$proto" ;;
+            5) menu_action run_write_locked start_service "$proto" ;;
+            6) menu_action show_log "$proto" ;;
+            7) menu_action run_write_locked uninstall_protocol "$proto"; return 1 ;;
+            [Bb]) return 1 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) warn "无效选择" ;;
+        esac
+    done
+}
+
+menu_snell_manage() {
+    local cc confirm major version port sts
+    while true; do
+        major=$(snell_installed_major 2>/dev/null || echo "?")
+        version=$(state_get snell version 2>/dev/null || true)
+        port=$(state_get snell port 2>/dev/null || true)
+        sts="未启用"; [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && sts="已启用"
+        echo ""
+        echo -e "  ${MAGENTA}Snell深入管理${RESET}"
+        echo -e "  版本: ${GREEN}v${major} (${version:-未知})${RESET}  端口: ${port:-未知}  ShadowTLS: ${sts}"
+        echo "  [1] 查看状态与配置    [2] 输出Surge配置"
+        echo "  [3] 启用ShadowTLS     [4] 修改ShadowTLS"
+        echo "  [5] 关闭ShadowTLS     [6] 升级当前大版本服务端"
+        echo "  [7] 重启              [8] 停止/启动"
+        echo "  [9] 查看日志          [10] 卸载Snell"
+        echo "  [B] 返回  [Q] 退出"
+        echo -ne "  选择: "; menu_choice cc "1 2 3 4 5 6 7 8 9 10 B" "" || return $?
+        case "$cc" in
+            1) show_status; menu_action show_config_only snell ;;
+            2) menu_action show_config_only snell ;;
+            3) menu_prompt_shadowtls_options 0 || return $?; menu_action run_write_locked snell_enable_shadowtls ;;
+            4) menu_prompt_shadowtls_options 1 || return $?; menu_action run_write_locked snell_reconfigure_shadowtls ;;
+            5)
+                echo -ne "  确认关闭ShadowTLS并恢复普通Snell？输入yes: "; read -r confirm
+                if [ "$confirm" = yes ]; then menu_action run_write_locked snell_disable_shadowtls; else info "已取消"; fi ;;
+            6) menu_action run_write_locked upgrade_protocol snell ;;
+            7) menu_action run_write_locked restart_service snell ;;
+            8)
+                if systemctl is-active --quiet snell 2>/dev/null; then
+                    menu_action run_write_locked stop_service snell
+                else
+                    menu_action run_write_locked start_service snell
+                fi ;;
+            9) menu_action show_log snell ;;
+            10) menu_action run_write_locked uninstall_protocol snell; return 1 ;;
+            [Bb]) return 1 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) warn "无效选择" ;;
+        esac
+    done
+}
+
+menu_manage() {
+    local cc proto status name major
+    echo -e "  ${MAGENTA}协议管理${RESET}"
+    local i=0
+    local -a protocols=()
+    for proto in $ALL_PROTOS; do
+        protocols+=("$proto"); i=$((i + 1)); name=$(pname "$proto")
+        if state_installed "$(pkey "$proto")"; then
+            status="${GREEN}已安装${RESET}"
+            if [ "$proto" = snell ]; then
+                major=$(snell_installed_major 2>/dev/null || echo "?")
+                name="Snell v${major}"
+                [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && name+=" + ShadowTLS"
+            fi
+        else
+            status="${DIM}未安装${RESET}"
+        fi
+        printf "  [%s] %-23s %b\n" "$i" "$name" "$status"
+    done
+    echo -e "  [A] 查看全部配置   [E] 导出配置         "
+    echo -e "  [B] 返回主菜单  [Q] 退出  "
+    echo -ne "  选择: "; menu_choice cc "1 2 3 4 A a E e B" "" || return $?
+    case "$cc" in
+        [1-4])
+            proto="${protocols[$((cc - 1))]}"
+            state_installed "$(pkey "$proto")" || { warn "$(pname "$proto")未安装，请先从安装协议进入"; return 0; }
+            if [ "$proto" = snell ]; then
+                menu_snell_manage || true
+            else
+                menu_protocol_manage_generic "$proto" || true
+            fi ;;
+        [Aa]) menu_action show_config ;;
+        [Ee]) menu_action run_write_locked run_export ;;
+        [Bb]) return 1 ;;
+        [Qq]) info "再见 👋"; exit 0 ;;
+        *) warn "无效选择" ;;
+    esac
+    return 0
+}
+
+menu_view() {
+    echo -e "  ${MAGENTA}查看配置${RESET}"
+    echo -e "  [1] 单协议配置行                    "
+    echo -e "  [2] 全部协议配置                    "
+    echo -e "  [3] 导出配置文件                    "
+    echo -e "  [B] ${DIM}返回主菜单${RESET}                     "
+    echo ""
+    echo -ne "  选择: "
+    menu_choice cc "1 2 3 B" "" || return $?
+    case "$cc" in
+        1) menu_action pick_proto "配置" show_config_only ;;
+        2) menu_action show_config ;;
+        3) menu_action run_write_locked run_export ;;
+        [Bb]) return 1 ;;
+        [Qq]) info "再见 👋"; exit 0 ;;
+        *) warn "无效选择" ;;
+    esac
+    return 0
+}
+
+forward_show_rules() {
+    local rules id enabled proto listen target target_port name extra status
+    rules=$(forward_rules_file)
+    echo ""
+    echo -e "  ${MAGENTA}端口转发列表${RESET}"
+    status=$(forward_runtime_status || true)
+    echo -e "  运行状态: ${CYAN}$status${RESET}"
+    if [ ! -f "$rules" ] || [ "$(forward_rule_count)" -eq 0 ]; then
+        echo -e "  ${DIM}暂无端口转发${RESET}"
+        return 0
+    fi
+    while IFS='|' read -r id enabled proto listen target target_port name extra; do
+        [ -n "$id" ] || continue
+        status="${DIM}已停用${RESET}"; [ "$enabled" = 1 ] && status="${GREEN}已启用${RESET}"
+        printf '  %s %s (%s) %b\n' "$id" "$name" "$proto" "$status"
+        printf '    :%s -> %s:%s\n' "$listen" "$target" "$target_port"
+    done < "$rules"
+}
+
+menu_forward_prompt_fields() {
+    local pc
+    menu_field PF_NAME "名称" "${1:-}" forward_validate_name || return $?
+    echo '  协议: [1] TCP  [2] UDP  [3] TCP+UDP'
+    case "${2:-tcp}" in tcp) pc=1 ;; udp) pc=2 ;; both) pc=3 ;; esac
+    printf '  选择 [%s]: ' "$pc"
+    menu_choice pc "1 2 3 B" "$pc" || return $?
+    case "$pc" in 1) PF_PROTO=tcp ;; 2) PF_PROTO=udp ;; 3) PF_PROTO=both ;; esac
+    menu_field PF_LISTEN "入口端口" "${3:-}" validate_port "入口" || return $?
+    menu_field PF_TARGET "目标固定 IPv4" "${4:-}" forward_validate_ipv4 || return $?
+    menu_field PF_TARGET_PORT "目标端口" "${5:-}" validate_port "目标" || return $?
+}
+
+menu_forward_add() {
+    local confirm
+    menu_forward_prompt_fields || return $?
+    echo -e "  ${YELLOW}将创建: $PF_PROTO :$PF_LISTEN → $PF_TARGET:$PF_TARGET_PORT${RESET}"
+    echo -ne "  确认？输入 yes: "; read -r confirm
+    [ "$confirm" = yes ] || { _PD_MENU_CANCELLED=1; return 2; }
+    run_write_locked forward_add_rule "$PF_NAME" "$PF_PROTO" "$PF_LISTEN" "$PF_TARGET" "$PF_TARGET_PORT"
+}
+
+menu_forward_modify() {
+    local id line enabled proto listen target target_port name confirm
+    forward_show_rules
+    menu_field id "转发编号（例如 pf0001）" "" forward_validate_id || return $?
+    line=$(forward_rule_line "$id") || { warn "未找到端口转发: $id"; return 1; }
+    IFS='|' read -r _ enabled proto listen target target_port name <<< "$line"
+    menu_forward_prompt_fields "$name" "$proto" "$listen" "$target" "$target_port" || return $?
+    echo -ne "  确认修改？输入 yes: "; read -r confirm
+    [ "$confirm" = yes ] || { _PD_MENU_CANCELLED=1; return 2; }
+    run_write_locked forward_update_rule "$id" "$PF_NAME" "$PF_PROTO" "$PF_LISTEN" "$PF_TARGET" "$PF_TARGET_PORT"
+}
+
+menu_forward_toggle() {
+    local id line enabled action
+    forward_show_rules
+    menu_field id "转发编号（例如 pf0001）" "" forward_validate_id || return $?
+    line=$(forward_rule_line "$id") || { warn "未找到端口转发: $id"; return 1; }
+    IFS='|' read -r _ enabled _ <<< "$line"
+    if [ "$enabled" = 1 ]; then action=0; else action=1; fi
+    run_write_locked forward_set_rule_enabled "$id" "$action"
+}
+
+menu_forward_delete() {
+    local id confirm
+    forward_show_rules
+    menu_field id "转发编号（例如 pf0001）" "" forward_validate_id || return $?
+    forward_rule_line "$id" >/dev/null || { warn "未找到端口转发: $id"; return 1; }
+    echo -ne "  确认删除 $id？输入 yes: "; read -r confirm
+    [ "$confirm" = yes ] || { _PD_MENU_CANCELLED=1; return 2; }
+    run_write_locked forward_delete_rule "$id"
+}
+
+menu_forwarding() {
+    local cc
+    while true; do
+        forward_show_rules
+        echo ""
+        echo -e "  [1] 添加端口转发                    "
+        echo -e "  [2] 修改端口转发                    "
+        echo -e "  [3] 启用/停用端口转发               "
+        echo -e "  [4] 删除端口转发                    "
+        echo -e "  [5] 检查并修复规则                  "
+        echo -e "  [B] 返回主菜单  [Q] 退出                      "
+        echo -ne "  选择: "; menu_choice cc "1 2 3 4 5 B" "" || return $?
+        case "$cc" in
+            1) menu_action menu_forward_add ;;
+            2) menu_action menu_forward_modify ;;
+            3) menu_action menu_forward_toggle ;;
+            4) menu_action menu_forward_delete ;;
+            5) menu_action run_write_locked forward_repair_rules ;;
+            [Bb]) return 0 ;;
+            [Qq]) info "再见 👋"; exit 0 ;;
+            *) warn "无效选择" ;;
+        esac
+    done
+}
+
+menu_system() {
+    local cc
+    echo '  诊断与系统工具'
+    echo '  [1] 只读诊断'
+    echo '  [2] BBR 优化'
+    echo '  [3] 安装/升级 BBRv3 内核'
+    echo '  [4] 卸载全部协议'
+    echo '  [B] 返回  [Q] 退出'
+    printf '  选择: '
+    menu_choice cc "1 2 3 4 B" || return $?
+    case "$cc" in
+        1) menu_action doctor_run 0 ;;
+        2) menu_action run_write_locked enable_bbr ;;
+        3) menu_action run_write_locked enable_bbrv3_kernel ;;
+        4) menu_action run_write_locked remove_all ;;
+    esac
+}
+
+
+menu_main() {
+    local cc
+    while true; do
+        show_status
+        echo '  [1] 安装协议'
+        echo '  [2] 管理协议'
+        echo '  [3] 端口转发'
+        echo '  [4] 诊断与系统工具'
+        echo '  [5] 更新 PD 管理脚本'
+        echo '  [Q] 退出'
+        printf '  选择: '
+        menu_choice cc "1 2 3 4 5" || break
+        case "$cc" in
+            1) menu_action menu_install ;;
+            2) while menu_manage; do :; done ;;
+            3) menu_forwarding || true ;;
+            4) while menu_system; do :; done ;;
+            5) PD_UPDATE=1 menu_action run_write_locked self_install ;;
+        esac
+    done
+}
+
 # 注册协议表
 register_protocols
 
@@ -5935,526 +6551,10 @@ case "${1:-}" in
         check_root; detect_os; detect_arch; run_write_locked enable_bbrv3_kernel; exit $? ;;
     --update)
         check_root; PD_UPDATE=1 run_write_locked self_install
-        info "PD-proxy 修复版已更新"; exit 0 ;;
+        info "PD 管理脚本已更新"; exit 0 ;;
     --remove-all)
         check_root; [ "${2:-}" = "--yes" ] && PD_YES=1; run_write_locked remove_all; exit $? ;;
 esac
-
-# ============================================================
-# 交互菜单系统（二级菜单 + 协议配置子菜单）
-# ============================================================
-
-# ---- ShadowTLS交互配置 ----
-menu_prompt_shadowtls_options() {
-    local preserve="${1:-0}" current_values="" current_pass="" current_sni="" current_proto="3"
-    local sni_c sni_custom tls_v pass_input
-    if [ "$preserve" = 1 ]; then
-        current_values=$(snell_shadowtls_unit_values 2>/dev/null || true)
-        current_pass=$(printf '%s\n' "$current_values" | sed -n '1p')
-        current_sni=$(printf '%s\n' "$current_values" | sed -n '2p'); current_sni="${current_sni%:*}"
-        current_proto=$(printf '%s\n' "$current_values" | sed -n '3p')
-        [ -n "$current_sni" ] || current_sni="www.microsoft.com"
-        [ -n "$current_proto" ] || current_proto=3
-    else
-        current_sni="${PD_OPT_SNELL_TLS_SNI:-www.microsoft.com}"
-    fi
-    echo ""
-    echo -e "  ${MAGENTA}▸ ShadowTLS伪装SNI${RESET}"
-    echo "  [1] www.microsoft.com  [2] www.apple.com"
-    echo "  [3] cloudflare.com      [4] 自定义"
-    echo -ne "  选择 [保留/默认 ${current_sni}]: "
-    read -r sni_c
-    case "$sni_c" in
-        1) PD_OPT_SNELL_TLS_SNI="www.microsoft.com" ;;
-        2) PD_OPT_SNELL_TLS_SNI="www.apple.com" ;;
-        3) PD_OPT_SNELL_TLS_SNI="cloudflare.com" ;;
-        4) echo -ne "  SNI: "; read -r sni_custom; PD_OPT_SNELL_TLS_SNI="${sni_custom:-$current_sni}" ;;
-        *) PD_OPT_SNELL_TLS_SNI="$current_sni" ;;
-    esac
-    echo -ne "  ShadowTLS版本 [3；输入2使用v2]: "
-    read -r tls_v
-    case "$tls_v" in 2) PD_OPT_SNELL_TLS_VERSION="v2" ;; "") PD_OPT_SNELL_TLS_VERSION="v${current_proto}" ;; *) PD_OPT_SNELL_TLS_VERSION="v3" ;; esac
-    if [ "$preserve" = 1 ]; then
-        echo -ne "  新密码（留空保持原密码）: "
-        IFS= read -rs pass_input; echo ""
-        PD_OPT_SNELL_TLS_PASS="${pass_input:-$current_pass}"
-    else
-        echo -ne "  自定义密码（留空自动生成）: "
-        IFS= read -rs pass_input; echo ""
-        PD_OPT_SNELL_TLS_PASS="$pass_input"
-    fi
-}
-
-# ---- Snell安装子菜单 ----
-menu_snell_config() {
-    local cc
-    while true; do
-        echo ""
-        echo -e "  ${MAGENTA}▸ 选择Snell协议版本${RESET}"
-        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
-        echo -e "  ${CYAN}│${RESET} [1] Snell v4                         ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [2] ${GREEN}Snell v5${RESET}  稳定版                ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [3] ${YELLOW}Snell v6${RESET}  当前为Beta            ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回${RESET}                            ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
-        echo -ne "  ${MAGENTA}▸${RESET} 选择 [2]: "
-        read -r cc
-        case "$cc" in
-            1) PD_OPT_SNELL_MAJOR=4; break ;;
-            3) PD_OPT_SNELL_MAJOR=6; PD_OPT_SNELL_V6_MODE=default; break ;;
-            [Bb]) return 1 ;;
-            [Qq]) info "再见 👋"; exit 0 ;;
-            *) PD_OPT_SNELL_MAJOR=5; break ;;
-        esac
-    done
-    echo ""
-    echo -e "  ${MAGENTA}▸ Snell v${PD_OPT_SNELL_MAJOR}是否配置ShadowTLS${RESET}"
-    echo "  [1] 普通Snell"
-    echo "  [2] 配置ShadowTLS（后续可随时关闭）"
-    echo -ne "  选择 [1]: "
-    read -r cc
-    case "$cc" in
-        2) PD_OPT_SNELL_MODE=shadowtls; menu_prompt_shadowtls_options 0 ;;
-        *) PD_OPT_SNELL_MODE=standard ;;
-    esac
-    prompt_protocol_port snell || return 1
-    run_write_locked install_protocol snell
-}
-
-# ---- HY2 配置子菜单 ----
-menu_hy2_config() {
-    local hy2_range
-    while true; do
-        echo ""
-        echo -e "  ${MAGENTA}▸ Hysteria2 — 端口模式${RESET}"
-        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
-        echo -e "  ${CYAN}│${RESET} [1] ${GREEN}单端口${RESET}           标准              ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [2] ${MAGENTA}3 端口跳跃${RESET}       轻量混淆          ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [3] ${MAGENTA}5 端口跳跃${RESET}       深度混淆 (推荐)   ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [4] ${MAGENTA}范围端口跳跃${RESET}     自定义 start-end ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回${RESET}                            ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
-        echo -ne "  ${MAGENTA}▸${RESET} 选择: "
-        read -r cc
-        case "$cc" in
-            1) PD_OPT_HY2_HOP=0; PD_OPT_HY2_HOP_RANGE=""; prompt_protocol_port hy2 || return 1; break ;;
-            2) PD_OPT_HY2_HOP=3; PD_OPT_HY2_HOP_RANGE=""; prompt_protocol_port hy2 || return 1; break ;;
-            3) PD_OPT_HY2_HOP=5; PD_OPT_HY2_HOP_RANGE=""; prompt_protocol_port hy2 || return 1; break ;;
-            4)
-                echo -ne "  输入跳跃范围 (例如 30000-30100): "
-                read -r hy2_range
-                apply_hy2_hop_range "$hy2_range"
-                break ;;
-            [Bb]) return 1 ;;
-            [Qq]) info "再见 👋"; exit 0 ;;
-            *) warn "无效选择" ;;
-        esac
-    done
-    run_write_locked install_protocol hy2
-    return 0
-}
-
-# ---- VLESS 配置子菜单 ----
-menu_vless_config() {
-    while true; do
-        echo ""
-        echo -e "  ${MAGENTA}▸ VLESS Reality — 伪装目标${RESET}"
-        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
-        echo -e "  ${CYAN}│${RESET} [1] addons.mozilla.org  Mozilla CDN   ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [2] www.microsoft.com   微软 CDN      ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [3] swdist.apple.com    Apple 分发    ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [4] dl.google.com       Google 下载   ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回${RESET}                            ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
-        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
-        read -r cc
-        case "$cc" in
-            2) PD_OPT_VLESS_DEST="www.microsoft.com:443"; PD_OPT_VLESS_SNI="www.microsoft.com" ;;
-            3) PD_OPT_VLESS_DEST="swdist.apple.com:443"; PD_OPT_VLESS_SNI="swdist.apple.com" ;;
-            4) PD_OPT_VLESS_DEST="dl.google.com:443"; PD_OPT_VLESS_SNI="dl.google.com" ;;
-            [Bb]) return 1 ;;
-            [Qq]) info "再见 👋"; exit 0 ;;
-            *) PD_OPT_VLESS_DEST="addons.mozilla.org:443"; PD_OPT_VLESS_SNI="addons.mozilla.org" ;;
-        esac
-
-        PD_OPT_VLESS_TRANSPORT="tcp"
-
-        echo ""
-        echo -e "  ${MAGENTA}▸ 浏览器指纹${RESET}"
-        echo -e "  [1] chrome  [2] firefox  [3] safari  [4] ios  [5] 随机"
-        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
-        read -r fp_c
-        case "$fp_c" in
-            2) PD_OPT_VLESS_FP="firefox" ;;
-            3) PD_OPT_VLESS_FP="safari" ;;
-            4) PD_OPT_VLESS_FP="ios" ;;
-            5) PD_OPT_VLESS_FP="randomized" ;;
-            *) PD_OPT_VLESS_FP="chrome" ;;
-        esac
-        prompt_protocol_port vless || return 1
-        break
-    done
-    run_write_locked install_protocol vless
-    return 0
-}
-
-# ---- AnyTLS 配置子菜单 ----
-menu_anytls_config() {
-    local cc domain_input cert_c cert_path key_path legacy_sni_c
-    echo ""
-    echo -e "  ${MAGENTA}▸ AnyTLS 后端${RESET}"
-    echo -e "  [1] ${GREEN}稳定模式${RESET}: sing-box + 域名 + 有效证书（推荐）"
-    echo -e "  [2] 快速模式: anytls-go 参考实现（legacy/测试）"
-    echo -e "  [B] 返回"
-    echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
-    read -r cc
-    case "$cc" in
-        2) PD_OPT_ANYTLS_BACKEND="anytls-go" ;;
-        [Bb]) return 1 ;;
-        [Qq]) info "再见 👋"; exit 0 ;;
-        *) PD_OPT_ANYTLS_BACKEND="sing-box" ;;
-    esac
-
-    if [ "$PD_OPT_ANYTLS_BACKEND" = "sing-box" ]; then
-        echo ""
-        echo -e "  ${MAGENTA}▸ AnyTLS 稳定模式域名${RESET}"
-        echo -e "  ${DIM}  建议一台 VPS 一个子域名，Cloudflare 用 DNS only。${RESET}"
-        echo -ne "  域名${PUBLIC_HOST:+ [$PUBLIC_HOST]}: "
-        read -r domain_input
-        PD_OPT_ANYTLS_DOMAIN="${domain_input:-${PUBLIC_HOST:-}}"
-        [ -n "$PD_OPT_ANYTLS_DOMAIN" ] || { err "sing-box 稳定模式必须填写域名"; return 1; }
-        validate_hostname "$PD_OPT_ANYTLS_DOMAIN" "AnyTLS 域名" || return 1
-        PD_OPT_ANYTLS_SNI="$PD_OPT_ANYTLS_DOMAIN"
-        # 让配置输出默认使用该域名，而不是自动探测 IP。
-        PUBLIC_HOST="$PD_OPT_ANYTLS_DOMAIN"
-        PD_PUBLIC_HOST="$PD_OPT_ANYTLS_DOMAIN"
-
-        echo ""
-        echo -e "  ${MAGENTA}▸ 证书方式${RESET}"
-        echo -e "  [1] auto：已有证书则复用，否则 certbot 申请（推荐）"
-        echo -e "  [2] existing：使用已有证书路径"
-        echo -e "  [3] self-signed：自签证书，仅测试"
-        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
-        read -r cert_c
-        case "$cert_c" in
-            2)
-                PD_OPT_ANYTLS_CERT_MODE="existing"
-                echo -ne "  fullchain.pem 路径: "; read -r cert_path
-                echo -ne "  privkey.pem 路径: "; read -r key_path
-                [ -n "$cert_path" ] && [ -n "$key_path" ] || { err "existing 模式必须填写证书和私钥路径"; return 1; }
-                PD_OPT_ANYTLS_CERT_PATH="$cert_path"
-                PD_OPT_ANYTLS_KEY_PATH="$key_path" ;;
-            3) PD_OPT_ANYTLS_CERT_MODE="self-signed" ;;
-            *) PD_OPT_ANYTLS_CERT_MODE="auto" ;;
-        esac
-        PD_OPT_ANYTLS_PADDING="standard"
-        PD_OPT_ANYTLS_REUSE="auto"
-    else
-        echo ""
-        echo -e "  ${MAGENTA}▸ legacy SNI${RESET}"
-        echo -e "  ${DIM}  anytls-go 模式仅建议临时测试；SNI 只写入客户端。${RESET}"
-        echo -e "  [1] 不写 SNI  [2] www.microsoft.com  [3] www.apple.com  [4] cloudflare.com"
-        echo -ne "  ${MAGENTA}▸${RESET} 选择 [1]: "
-        read -r legacy_sni_c
-        case "$legacy_sni_c" in
-            2) PD_OPT_ANYTLS_SNI="www.microsoft.com" ;;
-            3) PD_OPT_ANYTLS_SNI="www.apple.com" ;;
-            4) PD_OPT_ANYTLS_SNI="cloudflare.com" ;;
-            *) PD_OPT_ANYTLS_SNI="" ;;
-        esac
-        PD_OPT_ANYTLS_CERT_MODE="self-signed"
-        PD_OPT_ANYTLS_PADDING="standard"
-    fi
-    prompt_protocol_port anytls || return 1
-    run_write_locked install_protocol anytls
-    return 0
-}
-menu_install() {
-    echo -e "  ${MAGENTA}▸ 安装协议${RESET}"
-    echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
-    echo -e "  ${CYAN}│${RESET} [1] ${GREEN}Snell${RESET}           ${DIM}v4 / v5 / v6${RESET}      ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [2] ${GREEN}Hysteria2${RESET}       ${DIM}Surge + SR${RESET}        ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [3] ${GREEN}VLESS Reality${RESET}   ${DIM}Shadowrocket${RESET}      ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [4] ${GREEN}AnyTLS${RESET}          ${DIM}Surge + SR${RESET}        ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回主菜单${RESET}                    ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
-    echo ""
-    echo -ne "  ${MAGENTA}▸${RESET} 选择: "
-    read -r cc
-    case "$cc" in
-        1) menu_snell_config || return 1 ;;
-        2) menu_hy2_config || return 1 ;;
-        3) menu_vless_config || return 1 ;;
-        4) menu_anytls_config || return 1 ;;
-        [Bb]) return 1 ;;
-        [Qq]) info "再见 👋"; exit 0 ;;
-        *) warn "无效选择" ;;
-    esac
-    return 0
-}
-
-menu_protocol_manage_generic() {
-    local proto="$1" cc
-    while true; do
-        echo ""
-        echo -e "  ${MAGENTA}▸ $(pname "$proto")管理${RESET}"
-        echo "  [1] 查看配置      [2] 升级"
-        echo "  [3] 重启          [4] 停止"
-        echo "  [5] 启动          [6] 日志"
-        echo "  [7] 卸载          [B] 返回"
-        echo -ne "  选择: "; read -r cc
-        case "$cc" in
-            1) show_config_only "$proto" ;;
-            2) run_write_locked upgrade_protocol "$proto" ;;
-            3) run_write_locked restart_service "$proto" ;;
-            4) run_write_locked stop_service "$proto" ;;
-            5) run_write_locked start_service "$proto" ;;
-            6) show_log "$proto" ;;
-            7) run_write_locked uninstall_protocol "$proto"; return 1 ;;
-            [Bb]) return 1 ;;
-            [Qq]) info "再见 👋"; exit 0 ;;
-            *) warn "无效选择" ;;
-        esac
-    done
-}
-
-menu_snell_manage() {
-    local cc confirm major version port sts
-    while true; do
-        major=$(snell_installed_major 2>/dev/null || echo "?")
-        version=$(state_get snell version 2>/dev/null || true)
-        port=$(state_get snell port 2>/dev/null || true)
-        sts="未启用"; [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && sts="已启用"
-        echo ""
-        echo -e "  ${MAGENTA}▸ Snell深入管理${RESET}"
-        echo -e "  版本: ${GREEN}v${major} (${version:-未知})${RESET}  端口: ${port:-未知}  ShadowTLS: ${sts}"
-        echo "  [1] 查看状态与配置    [2] 输出Surge配置"
-        echo "  [3] 启用ShadowTLS     [4] 修改ShadowTLS"
-        echo "  [5] 关闭ShadowTLS     [6] 更新当前大版本"
-        echo "  [7] 重启              [8] 停止/启动"
-        echo "  [9] 查看日志          [10] 卸载Snell"
-        echo "  [B] 返回"
-        echo -ne "  选择: "; read -r cc
-        case "$cc" in
-            1) show_status; show_config_only snell ;;
-            2) show_config_only snell ;;
-            3) menu_prompt_shadowtls_options 0; run_write_locked snell_enable_shadowtls ;;
-            4) menu_prompt_shadowtls_options 1; run_write_locked snell_reconfigure_shadowtls ;;
-            5)
-                echo -ne "  确认关闭ShadowTLS并恢复普通Snell？输入yes: "; read -r confirm
-                [ "$confirm" = yes ] && run_write_locked snell_disable_shadowtls || info "已取消" ;;
-            6) run_write_locked upgrade_protocol snell ;;
-            7) run_write_locked restart_service snell ;;
-            8)
-                if systemctl is-active --quiet snell 2>/dev/null; then
-                    run_write_locked stop_service snell
-                else
-                    run_write_locked start_service snell
-                fi ;;
-            9) show_log snell ;;
-            10) run_write_locked uninstall_protocol snell; return 1 ;;
-            [Bb]) return 1 ;;
-            [Qq]) info "再见 👋"; exit 0 ;;
-            *) warn "无效选择" ;;
-        esac
-    done
-}
-
-menu_manage() {
-    local cc proto status name major
-    echo -e "  ${MAGENTA}▸ 协议管理${RESET}"
-    echo -e "  ${CYAN}┌────────────────────────────────────────────┐${RESET}"
-    local i=0
-    local -a protocols=()
-    for proto in $ALL_PROTOS; do
-        protocols+=("$proto"); i=$((i + 1)); name=$(pname "$proto")
-        if state_installed "$(pkey "$proto")"; then
-            status="${GREEN}已安装${RESET}"
-            if [ "$proto" = snell ]; then
-                major=$(snell_installed_major 2>/dev/null || echo "?")
-                name="Snell v${major}"
-                [ -f "$SYSTEMD_DIR/shadowtls-snell.service" ] && name+=" + ShadowTLS"
-            fi
-        else
-            status="${DIM}未安装${RESET}"
-        fi
-        printf "  ${CYAN}│${RESET} [%s] %-23s %b ${CYAN}│${RESET}\n" "$i" "$name" "$status"
-    done
-    echo -e "  ${CYAN}│${RESET} [A] 查看全部配置   [E] 导出配置          ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [B] 返回主菜单                           ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}└────────────────────────────────────────────┘${RESET}"
-    echo -ne "  ${MAGENTA}▸${RESET} 选择: "; read -r cc
-    case "$cc" in
-        [1-4])
-            proto="${protocols[$((cc - 1))]}"
-            state_installed "$(pkey "$proto")" || { warn "$(pname "$proto")未安装，请先从安装协议进入"; return 0; }
-            if [ "$proto" = snell ]; then
-                menu_snell_manage || true
-            else
-                menu_protocol_manage_generic "$proto" || true
-            fi ;;
-        [Aa]) show_config ;;
-        [Ee]) run_write_locked run_export ;;
-        [Bb]) return 1 ;;
-        [Qq]) info "再见 👋"; exit 0 ;;
-        *) warn "无效选择" ;;
-    esac
-    return 0
-}
-
-menu_view() {
-    echo -e "  ${MAGENTA}▸ 查看配置${RESET}"
-    echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
-    echo -e "  ${CYAN}│${RESET} [1] 单协议配置行                     ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [2] 全部协议配置                     ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [3] 导出配置文件                     ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回主菜单${RESET}                      ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
-    echo ""
-    echo -ne "  ${MAGENTA}▸${RESET} 选择: "
-    read -r cc
-    case "$cc" in
-        1) pick_proto "配置" show_config_only ;;
-        2) show_config ;;
-        3) run_write_locked run_export ;;
-        [Bb]) return 1 ;;
-        [Qq]) info "再见 👋"; exit 0 ;;
-        *) warn "无效选择" ;;
-    esac
-    return 0
-}
-
-forward_show_rules() {
-    local rules id enabled proto listen target target_port name extra status
-    rules=$(forward_rules_file)
-    echo ""
-    echo -e "  ${MAGENTA}▸ 端口转发列表${RESET}"
-    status=$(forward_runtime_status || true)
-    echo -e "  运行状态: ${CYAN}$status${RESET}"
-    if [ ! -f "$rules" ] || [ "$(forward_rule_count)" -eq 0 ]; then
-        echo -e "  ${DIM}暂无端口转发${RESET}"
-        return 0
-    fi
-    while IFS='|' read -r id enabled proto listen target target_port name extra; do
-        [ -n "$id" ] || continue
-        status="${DIM}已停用${RESET}"; [ "$enabled" = 1 ] && status="${GREEN}运行中${RESET}"
-        printf "  %-6s %-12s %-4s :%-5s → %-15s:%-5s %b\n" \
-            "$id" "$name" "$proto" "$listen" "$target" "$target_port" "$status"
-    done < "$rules"
-}
-
-menu_forward_prompt_fields() {
-    local current_name="${1:-}" current_proto="${2:-tcp}" current_listen="${3:-}" current_target="${4:-}" current_target_port="${5:-}"
-    local input pc
-    echo -ne "  名称${current_name:+ [$current_name]}: "; read -r input
-    PF_NAME="${input:-$current_name}"
-    echo "  协议: [1] TCP  [2] UDP  [3] TCP+UDP"
-    echo -ne "  选择 [当前 $current_proto]: "; read -r pc
-    case "$pc" in 1) PF_PROTO=tcp ;; 2) PF_PROTO=udp ;; 3) PF_PROTO=both ;; *) PF_PROTO="$current_proto" ;; esac
-    echo -ne "  本机入口端口${current_listen:+ [$current_listen]}: "; read -r input
-    PF_LISTEN="${input:-$current_listen}"
-    echo -ne "  目标固定IPv4${current_target:+ [$current_target]}: "; read -r input
-    PF_TARGET="${input:-$current_target}"
-    echo -ne "  目标端口${current_target_port:+ [$current_target_port]}: "; read -r input
-    PF_TARGET_PORT="${input:-$current_target_port}"
-    forward_validate_name "$PF_NAME" || return 1
-    forward_validate_proto "$PF_PROTO" || return 1
-    validate_port "$PF_LISTEN" "入口"
-    forward_validate_ipv4 "$PF_TARGET" || return 1
-    validate_port "$PF_TARGET_PORT" "目标"
-}
-
-menu_forward_add() {
-    local confirm
-    menu_forward_prompt_fields || return 1
-    echo -e "  ${YELLOW}将创建: $PF_PROTO :$PF_LISTEN → $PF_TARGET:$PF_TARGET_PORT${RESET}"
-    echo -ne "  确认？输入 yes: "; read -r confirm
-    [ "$confirm" = yes ] || { info "已取消"; return 0; }
-    run_write_locked forward_add_rule "$PF_NAME" "$PF_PROTO" "$PF_LISTEN" "$PF_TARGET" "$PF_TARGET_PORT"
-}
-
-menu_forward_modify() {
-    local id line enabled proto listen target target_port name confirm
-    forward_show_rules
-    echo -ne "  输入要修改的编号（例如 pf0001）: "; read -r id
-    line=$(forward_rule_line "$id") || { warn "未找到端口转发: $id"; return 1; }
-    IFS='|' read -r _ enabled proto listen target target_port name <<< "$line"
-    menu_forward_prompt_fields "$name" "$proto" "$listen" "$target" "$target_port" || return 1
-    echo -ne "  确认修改？输入 yes: "; read -r confirm
-    [ "$confirm" = yes ] || { info "已取消"; return 0; }
-    run_write_locked forward_update_rule "$id" "$PF_NAME" "$PF_PROTO" "$PF_LISTEN" "$PF_TARGET" "$PF_TARGET_PORT"
-}
-
-menu_forward_toggle() {
-    local id line enabled action
-    forward_show_rules
-    echo -ne "  输入要启用/停用的编号: "; read -r id
-    line=$(forward_rule_line "$id") || { warn "未找到端口转发: $id"; return 1; }
-    IFS='|' read -r _ enabled _ <<< "$line"
-    if [ "$enabled" = 1 ]; then action=0; else action=1; fi
-    run_write_locked forward_set_rule_enabled "$id" "$action"
-}
-
-menu_forward_delete() {
-    local id confirm
-    forward_show_rules
-    echo -ne "  输入要删除的编号: "; read -r id
-    forward_rule_line "$id" >/dev/null || { warn "未找到端口转发: $id"; return 1; }
-    echo -ne "  确认删除 $id？输入 yes: "; read -r confirm
-    [ "$confirm" = yes ] || { info "已取消"; return 0; }
-    run_write_locked forward_delete_rule "$id"
-}
-
-menu_forwarding() {
-    local cc
-    while true; do
-        forward_show_rules
-        echo ""
-        echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
-        echo -e "  ${CYAN}│${RESET} [1] 添加端口转发                     ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [2] 修改端口转发                     ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [3] 启用/停用端口转发                ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [4] 删除端口转发                     ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [5] 检查并修复规则                   ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}│${RESET} [B] 返回主菜单                       ${CYAN}│${RESET}"
-        echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
-        echo -ne "  ${MAGENTA}▸${RESET} 选择: "; read -r cc
-        case "$cc" in
-            1) menu_forward_add || true ;;
-            2) menu_forward_modify || true ;;
-            3) menu_forward_toggle || true ;;
-            4) menu_forward_delete || true ;;
-            5) run_write_locked forward_repair_rules || true ;;
-            [Bb]) return 0 ;;
-            [Qq]) info "再见 👋"; exit 0 ;;
-            *) warn "无效选择" ;;
-        esac
-    done
-}
-
-menu_system() {
-    echo -e "  ${MAGENTA}▸ 系统工具${RESET}"
-    echo -e "  ${CYAN}┌──────────────────────────────────────┐${RESET}"
-    echo -e "  ${CYAN}│${RESET} [1] 安装/更新 XanMod 内核 + BBR v3     ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [2] 卸载 XanMod 内核 ${DIM}(预留)${RESET}              ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [3] BBR 直连/落地优化（智能带宽）      ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [4] 卸载全部协议                       ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}│${RESET} [B] ${DIM}返回主菜单${RESET}                      ${CYAN}│${RESET}"
-    echo -e "  ${CYAN}└──────────────────────────────────────┘${RESET}"
-    echo ""
-    echo -ne "  ${MAGENTA}▸${RESET} 选择: "
-    read -r cc
-    case "$cc" in
-        1) run_write_locked enable_bbrv3_kernel ;;
-        2) warn "XanMod 内核卸载功能暂未集成；如需回退，请先保留云厂商默认内核并手动 apt purge 对应 linux-xanmod 包" ;;
-        3) run_write_locked enable_bbr ;;
-        4) run_write_locked remove_all ;;
-        [Bb]) return 1 ;;
-        [Qq]) info "再见 👋"; exit 0 ;;
-        *) warn "无效选择" ;;
-    esac
-    return 0
-}
 
 # ============================================================
 # 主菜单循环
@@ -6464,22 +6564,4 @@ check_root
 detect_os; detect_arch; get_ip; get_mem
 run_write_locked self_install || warn "pd 更新失败，使用缓存版本"
 
-while true; do
-    show_status
-    echo -e "  ${CYAN}[1]${RESET} 安装协议    ${CYAN}[2]${RESET} 协议管理"
-    echo -e "  ${CYAN}[3]${RESET} 端口转发    ${CYAN}[4]${RESET} 系统工具"
-    echo -e "  ${CYAN}[5]${RESET} 更新脚本"
-    echo -e "  ${CYAN}[Q]${RESET} 退出"
-    echo ""
-    echo -ne "  ${MAGENTA}▸${RESET} 选择: "
-    read -r cc
-    case "$cc" in
-        1) while menu_install; do :; done ;;
-        2) while menu_manage; do :; done ;;
-        3) menu_forwarding ;;
-        4) while menu_system; do :; done ;;
-        5) PD_UPDATE=1 run_write_locked self_install && info "PD-proxy脚本已更新" ;;
-        [Qq]) info "再见 👋"; exit 0 ;;
-        *) ;;
-    esac
-done
+menu_main

@@ -580,18 +580,22 @@ test_run_write_locked_reports_release_failure() {
 }
 
 test_anytls_surge_output() {
+    systemctl() { [ "${1:-}" = is-active ]; }
+    service_port_family_listening() { [ "$(state_get ignored "listen_$4")" = 1 ]; }
     local dir="$TEST_ROOT/anytls-output" output
     pdir() { echo "$dir"; }
     anytls_backend() { echo anytls-go; }
     mkdir -p "$dir"; printf standard > "$dir/.padding"
     IP=203.0.113.10; IP6=""
-    state_get() { [ "$2" = listen_ipv4 ] && echo 1 || echo 0; }
+    state_get() { [ "$2" != port ] || { echo 443; return; }; [ "$2" = listen_ipv4 ] && echo 1 || echo 0; }
     output_header() { :; }; output_footer() { :; }; gen_qr() { :; }
     output=$(anytls_output 443 secret)
     grep -q '^Proxy = anytls, 203\.0\.113\.10, 443, password=secret$' <<< "$output"
 }
 
 test_ipv6_only_protocol_outputs() {
+    systemctl() { [ "${1:-}" = is-active ]; }
+    service_port_family_listening() { [ "$(state_get ignored "listen_$4")" = 1 ]; }
     local dir="$TEST_ROOT/ipv6-outputs" ipv6="2001:db8::42"
     local snell_standard snell_shadow hy2_single hy2_hop vless anytls all_output
     mkdir -p "$dir/snell" "$dir/hy2" "$dir/vless" "$dir/anytls" "$dir/systemd"
@@ -609,6 +613,7 @@ test_ipv6_only_protocol_outputs() {
     gen_qr() { printf 'QR: %s\n' "$1"; }
     state_get() {
         case "$2" in
+            port) echo 443 ;;
             listen_ipv4) echo 0 ;;
             listen_ipv6) echo 1 ;;
             hop) echo "${TEST_HY2_HOP:-0}" ;;
@@ -642,33 +647,36 @@ test_ipv6_only_protocol_outputs() {
     ! grep -Eq ',[[:space:]]*,[[:space:]]*[0-9]' <<< "$all_output"
     ! grep -q -- '-IPv6' <<< "$all_output"
 
-    grep -Fq "Proxy = snell, [$ipv6], 443, psk=snell-secret, version=5" <<< "$snell_standard"
-    grep -Fq "Proxy = snell, [$ipv6], 444, psk=snell-secret, version=4" <<< "$snell_shadow"
-    grep -Fq "Proxy = hysteria2, [$ipv6], 8443, password=hy2-secret" <<< "$hy2_single"
+    grep -Fq "Proxy = snell, $ipv6, 443, psk=snell-secret, version=5" <<< "$snell_standard"
+    grep -Fq "Proxy = snell, $ipv6, 444, psk=snell-secret, version=4" <<< "$snell_shadow"
+    grep -Fq "Proxy = hysteria2, $ipv6, 8443, password=hy2-secret" <<< "$hy2_single"
     grep -Fq "QR: hysteria2://hy2-secret@[$ipv6]:8443?" <<< "$hy2_single"
-    grep -Fq "Proxy = hysteria2, [$ipv6], 9443, password=hy2-secret, sni=www.bing.com, skip-cert-verify=true, port-hopping=9443-9445" <<< "$hy2_hop"
+    grep -Fq "Proxy = hysteria2, $ipv6, 9443, password=hy2-secret, sni=www.bing.com, skip-cert-verify=true, port-hopping=9443-9445" <<< "$hy2_hop"
     grep -Fq "QR: hysteria2://hy2-secret@[$ipv6]:9443-9445?" <<< "$hy2_hop"
     grep -Fq "QR: vless://00000000-0000-0000-0000-000000000001@[$ipv6]:10443?" <<< "$vless"
     grep -Fq "vless://00000000-0000-0000-0000-000000000001@[$ipv6]:10443?" <<< "$vless"
-    grep -Fq "Proxy = anytls, [$ipv6], 11443, password=anytls-secret" <<< "$anytls"
+    grep -Fq "Proxy = anytls, $ipv6, 11443, password=anytls-secret" <<< "$anytls"
     grep -Fq "QR: anytls://anytls-secret@[$ipv6]:11443" <<< "$anytls"
     grep -Fq "anytls://anytls-secret@[$ipv6]:11443" <<< "$anytls"
 }
 
 test_dual_stack_output_is_not_duplicated() {
+    systemctl() { [ "${1:-}" = is-active ]; }
+    service_port_family_listening() { [ "$(state_get ignored "listen_$4")" = 1 ]; }
     local dir="$TEST_ROOT/dual-output" output
     mkdir -p "$dir"
     printf standard > "$dir/.padding"
     pdir() { echo "$dir"; }
     anytls_backend() { echo anytls-go; }
     state_get() {
-        case "$2" in listen_ipv4|listen_ipv6) echo 1 ;; *) echo 0 ;; esac
+        case "$2" in
+            port) echo 443 ;; listen_ipv4|listen_ipv6) echo 1 ;; *) echo 0 ;; esac
     }
     output_header() { :; }; output_footer() { :; }; gen_qr() { :; }
     PUBLIC_HOST=""; IP=203.0.113.10; IP6=2001:db8::10
     output=$(anytls_output 443 secret)
     [ "$(grep -c '^Proxy = anytls, 203\.0\.113\.10, 443' <<< "$output")" -eq 1 ]
-    [ "$(grep -c '^Proxy-IPv6 = anytls, \[2001:db8::10\], 443' <<< "$output")" -eq 1 ]
+    [ "$(grep -c '^Proxy-IPv6 = anytls, 2001:db8::10, 443' <<< "$output")" -eq 1 ]
     [ "$(grep -c '^anytls://secret@203\.0\.113\.10:443' <<< "$output")" -eq 1 ]
     [ "$(grep -c '^anytls://secret@\[2001:db8::10\]:443' <<< "$output")" -eq 1 ]
 }
@@ -792,11 +800,11 @@ test_service_listener_uses_ss_family_filters() {
     family_is no ipv4
     family_is yes ipv6
     TEST_BINDONLY=0
-    family_is yes ipv4
+    family_is no ipv4
     family_is yes ipv6
 
     TEST_SS6='LISTEN 0 128 *:443 *:* users:(("demo",pid=4242,fd=3))'
-    family_is yes ipv4
+    family_is no ipv4
     family_is yes ipv6
 
     TEST_SS6='LISTEN 0 128 [2001:db8::1]:443 [::]:* users:(("demo",pid=4242,fd=3))'
@@ -812,7 +820,7 @@ test_service_listener_uses_ss_family_filters() {
 
 test_verified_families_are_recorded_and_enforced() {
     local recorded="$TEST_ROOT/family-state"
-    service_port_family_listening() { return 0; }
+    service_port_family_probe() { echo 1; }
     state_set() { printf '%s=%s\n' "$2" "$3" >> "$recorded"; }
     PD_EFFECTIVE_LISTEN_FAMILY=dual
     verify_and_record_listen_families anytls 443 tcp anytls || return 1
@@ -1289,10 +1297,13 @@ test_snell_latest_asset_parsing_prefers_rc() {
 }
 
 test_hy2_surge_port_hopping_uses_official_parameter() {
+    systemctl() { [ "${1:-}" = is-active ]; }
+    service_port_family_listening() { [ "$(state_get ignored "listen_$4")" = 1 ]; }
     local output
     IP=203.0.113.10; IP6=""; PUBLIC_HOST=""
     state_get() {
         case "$2" in
+            port) echo 443 ;;
             listen_ipv4) echo 1 ;;
             listen_ipv6) echo 0 ;;
             hop) echo 4 ;;
@@ -1307,6 +1318,8 @@ test_hy2_surge_port_hopping_uses_official_parameter() {
 }
 
 test_hy2_config_export_uses_official_port_hopping() {
+    systemctl() { [ "${1:-}" = is-active ]; }
+    service_port_family_listening() { [ "$(state_get ignored "listen_$4")" = 1 ]; }
     local output
     IP=203.0.113.10; IP6=""; PUBLIC_HOST=""
     state_installed() { [ "$1" = hy2 ]; }
@@ -1358,6 +1371,394 @@ test_forward_rules_generate_owned_dnat_and_masquerade() {
     grep -Fq 'udp dport 443 masquerade comment "PD-proxy:pf0001"' "$nft"
 }
 
+
+test_unknown_family_rejects_dual_without_state_write() {
+    local marker="$TEST_ROOT/unknown-family"
+    service_port_family_probe() { [ "$4" != ipv4 ] || return 2; echo 1; }
+    state_set() { : > "$marker"; }
+    PD_EFFECTIVE_LISTEN_FAMILY=dual
+    if verify_and_record_listen_families snell 443 tcp snell >/dev/null 2>&1; then return 1; fi
+    [ ! -e "$marker" ]
+    PD_EFFECTIVE_LISTEN_FAMILY=ipv6
+    if verify_and_record_listen_families snell 443 tcp snell >/dev/null 2>&1; then return 1; fi
+    [ ! -e "$marker" ]
+}
+
+test_cached_family_flags_do_not_authorize_output() {
+    IP=203.0.113.10; IP6=2001:db8::10; PUBLIC_HOST=""
+    state_get() { case "$2" in port) echo 443 ;; *) echo 1 ;; esac; }
+    systemctl() { return 0; }
+    service_port_family_probe() { [ "$4" != ipv4 ] || return 2; echo 1; }
+    output_hosts snell
+    [ -z "$OUTPUT_HOST4" ]
+    [ "$OUTPUT_HOST6" = '[2001:db8::10]' ]
+    service_port_family_probe() { return 2; }
+    if output_hosts snell >/dev/null 2>&1; then return 1; fi
+    [ -z "$OUTPUT_HOST4$OUTPUT_HOST6" ]
+}
+
+forward_runtime_fixture() {
+    local dir mock
+    dir=$(mktemp -d "$TEST_ROOT/runtime-forward-XXXXXX")
+    mock=$(mktemp -d "$TEST_ROOT/runtime-bin-XXXXXX")
+    export PF_TEST_DIR="$dir"
+    printf '%s\n' 'PD-proxy owned resource' > "$dir/.pd-proxy-owned"
+    : > "$dir/rules"
+    forward_dir() { echo "$PF_TEST_DIR"; }
+    forward_generate_apply_script
+    cat > "$dir/table" <<'TABLE'
+table ip pd_port_forward {
+ chain prerouting {
+ type nat hook prerouting priority dstnat; policy accept;
+ }
+ chain forward {
+ type filter hook forward priority -10; policy accept;
+ ct state established,related accept comment "PD-proxy:forward-established"
+ }
+ chain postrouting {
+ type nat hook postrouting priority srcnat; policy accept;
+ }
+}
+TABLE
+    printf '%s\n' '-N PD_PORT_FORWARD' '-A PD_PORT_FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment PD-proxy:forward-established -j ACCEPT' > "$dir/iptables"
+    cat > "$mock/nft" <<'MOCK'
+#!/usr/bin/env bash
+case "$*" in
+ 'list tables') [ ! -e "$PF_TEST_DIR/query-fail" ] || exit 1; echo 'table ip pd_port_forward' ;;
+ 'list table ip pd_port_forward') cat "$PF_TEST_DIR/table" ;;
+ *) echo nft-mutation >> "$PF_TEST_DIR/mutations"; [ ! -e "$PF_TEST_DIR/delete-fail" ] ;;
+esac
+MOCK
+    cat > "$mock/iptables" <<'MOCK'
+#!/usr/bin/env bash
+case "$1" in
+ -S) cat "$PF_TEST_DIR/iptables" ;;
+ -C) exit 1 ;;
+ *) echo iptables-mutation >> "$PF_TEST_DIR/mutations" ;;
+esac
+MOCK
+    chmod +x "$mock/nft" "$mock/iptables"
+    export PATH="$mock:$PATH"
+}
+
+test_forward_runtime_rejects_foreign_nft_rule() {
+    forward_runtime_fixture
+    printf '%s\n' 'tcp dport 9999 accept' >> "$PF_TEST_DIR/table"
+    if bash "$PF_TEST_DIR/apply.sh" remove >/dev/null 2>&1; then return 1; fi
+    [ ! -e "$PF_TEST_DIR/mutations" ]
+}
+
+test_forward_runtime_rejects_foreign_iptables_rule() {
+    forward_runtime_fixture
+    printf '%s\n' '-A PD_PORT_FORWARD -p tcp --dport 9999 -j ACCEPT' >> "$PF_TEST_DIR/iptables"
+    if bash "$PF_TEST_DIR/apply.sh" remove >/dev/null 2>&1; then return 1; fi
+    [ ! -e "$PF_TEST_DIR/mutations" ]
+}
+
+test_forward_runtime_rejects_foreign_jump() {
+    forward_runtime_fixture
+    printf '%s\n' '-A DOCKER-USER -j PD_PORT_FORWARD' >> "$PF_TEST_DIR/iptables"
+    if bash "$PF_TEST_DIR/apply.sh" remove >/dev/null 2>&1; then return 1; fi
+    [ ! -e "$PF_TEST_DIR/mutations" ]
+}
+
+test_forward_runtime_query_and_delete_failures() {
+    forward_runtime_fixture
+    : > "$PF_TEST_DIR/query-fail"
+    if bash "$PF_TEST_DIR/apply.sh" remove >/dev/null 2>&1; then return 1; fi
+    [ ! -e "$PF_TEST_DIR/mutations" ]
+    rm "$PF_TEST_DIR/query-fail"
+    : > "$PF_TEST_DIR/delete-fail"
+    if bash "$PF_TEST_DIR/apply.sh" remove >/dev/null 2>&1; then return 1; fi
+    ! grep -q iptables "$PF_TEST_DIR/mutations"
+}
+
+test_forward_runtime_owned_cleanup_and_marker() {
+    forward_runtime_fixture
+    bash -n "$PF_TEST_DIR/apply.sh"
+    bash "$PF_TEST_DIR/apply.sh" remove || { echo "owned cleanup failed"; return 1; }
+    grep -q nft-mutation "$PF_TEST_DIR/mutations" || { echo "missing nft mutation"; return 1; }
+    grep -q iptables-mutation "$PF_TEST_DIR/mutations" || { echo "missing iptables mutation"; return 1; }
+    rm "$PF_TEST_DIR/mutations" "$PF_TEST_DIR/.pd-proxy-owned"
+    if bash "$PF_TEST_DIR/apply.sh" remove >/dev/null 2>&1; then return 1; fi
+    [ ! -e "$PF_TEST_DIR/mutations" ]
+}
+
+test_acceptance_checks_content_and_all_requests() {
+    local mock="$TEST_ROOT/accept-bin" output digest
+    mkdir -p "$mock"
+    export ACCEPT_CALLS="$TEST_ROOT/accept-calls"
+    cat > "$mock/curl" <<'MOCK'
+#!/usr/bin/env bash
+[ "$1" = -q ] || exit 98
+proxy=0; bypass=0; out=''
+while [ "$#" -gt 0 ]; do
+ case "$1" in
+  --proxy) [ "$2" = socks5h://127.0.0.1:1080 ] || exit 97; proxy=1; shift ;;
+  --noproxy) [ -z "$2" ] || exit 96; bypass=1; shift ;;
+  --output) out="$2"; shift ;;
+ esac
+ shift
+done
+[ "$proxy$bypass" = 11 ] || exit 95
+echo call >> "$ACCEPT_CALLS"
+[ "${ACCEPT_FAIL:-0}" = 0 ] || exit 7
+printf accepted > "$out"
+printf 200
+MOCK
+    chmod +x "$mock/curl"
+    PATH="$mock:$PATH"; export PATH
+    printf accepted > "$TEST_ROOT/expected-body"
+    digest=$(sha256_file "$TEST_ROOT/expected-body")
+    output=$(bash "$ROOT/tests/accept-proxy.sh" socks5h://127.0.0.1:1080 https://example.invalid/probe "$digest")
+    grep -q '3 passed, 0 failed' <<< "$output"
+    [ "$(wc -l < "$ACCEPT_CALLS" | tr -d ' ')" = 3 ]
+    if output=$(bash "$ROOT/tests/accept-proxy.sh" socks5h://127.0.0.1:1080 https://example.invalid/probe "$(printf '%064d' 0)" 2>/dev/null); then return 1; fi
+    grep -q '0 passed, 3 failed' <<< "$output"
+    if output=$(ACCEPT_FAIL=1 bash "$ROOT/tests/accept-proxy.sh" socks5h://127.0.0.1:1080 https://example.invalid/probe "$digest" 2>/dev/null); then return 1; fi
+    grep -q '0 passed, 3 failed' <<< "$output"
+}
+
+test_public_hostname_cannot_bypass_unconfirmed_family() {
+    IP=203.0.113.10; IP6=2001:db8::10; PUBLIC_HOST=proxy.example.com
+    state_get() { echo 443; }
+    systemctl() { return 0; }
+    service_port_family_probe() { [ "$4" != ipv4 ] || return 2; echo 1; }
+    output_hosts snell
+    [ -z "$OUTPUT_HOST4" ]
+    [ "$OUTPUT_HOST6" = '[2001:db8::10]' ]
+    IP6=""
+    if output_hosts snell >/dev/null 2>&1; then return 1; fi
+    service_port_family_probe() { echo 1; }
+    output_hosts snell
+    [ "$OUTPUT_HOST4" = proxy.example.com ]
+}
+
+test_surge_export_ipv6_format_and_uri_preservation() {
+    local dir="$TEST_ROOT/surge-export" output family tls proto TEST_EXPORT_HOP
+    mkdir -p "$dir" "$dir/systemd"
+    printf fixture > "$dir/.password"
+    SYSTEMD_DIR="$dir/systemd"
+    pkey() { echo "$1"; }
+    pdir() { echo "$dir"; }
+    state_installed() { return 0; }
+    systemctl() { [ "$1" = is-active ]; }
+    service_port_family_listening() { [ "$4" = ipv6 ] || [ "$family" = dual ]; }
+    state_get() { case "$2" in port) echo 443 ;; hop) echo "$TEST_EXPORT_HOP" ;; esac; }
+    conf_value() { echo fixture; }
+    yaml_value() { echo fixture; }
+    anytls_backend() { echo anytls-go; }
+    snell_installed_major() { echo 6; }
+    snell_current_mode() { [ "$tls" = 1 ] && echo unsafe-raw || echo default; }
+    snell_shadowtls_unit_values() {
+        [ "$tls" = 1 ] || return 1
+        printf 'fixture\nexample.com:443\n3\n'
+    }
+    output_header() { :; }; output_footer() { :; }
+    PUBLIC_HOST=""; IP6=2001:db8::42
+    for family in ipv6 dual; do
+        IP=""; [ "$family" != dual ] || IP=203.0.113.10
+        for tls in 0 1; do
+            for TEST_EXPORT_HOP in 0 3; do
+                for proto in snell hy2 anytls; do
+                    output=$(show_config_only "$proto")
+                    ! grep -Eq '^Proxy(-IPv6)? = [^,]+, \[' <<< "$output"
+                    grep -Eq '^Proxy(-IPv6)? = [^,]+, 2001:db8::42, 443,' <<< "$output"
+                    if [ "$family" = dual ]; then
+                        grep -Eq '^Proxy = [^,]+, 203\.0\.113\.10, 443,' <<< "$output"
+                    else
+                        ! grep -q '^Proxy-IPv6' <<< "$output"
+                    fi
+                    case "$proto" in
+                        snell)
+                            grep -Fq 'version=6' <<< "$output"
+                            if [ "$tls" = 1 ]; then grep -Fq 'mode=unsafe-raw' <<< "$output"; fi
+                            output=$(snell_output 443 fixture)
+                            grep -Eq '^Proxy(-IPv6)? = snell, 2001:db8::42, 443,' <<< "$output"
+                            ! grep -Eq '^Proxy(-IPv6)? = snell, \[' <<< "$output" ;;
+                        hy2|anytls)
+                            grep -Fq '@[2001:db8::42]:443' <<< "$output"
+                            if [ "$proto" = hy2 ] && [ "$TEST_EXPORT_HOP" = 3 ]; then
+                                grep -Fq '@[2001:db8::42]:443-445?' <<< "$output"
+                            fi ;;
+                    esac
+                done
+            done
+        done
+    done
+}
+
+test_menu_invalid_input_and_cancellation() {
+    local choice=unchanged rc=0
+    menu_choice choice "1 2 B" 1 >/dev/null <<< $'oops\n2'
+    [ "$choice" = 2 ]
+    menu_choice choice "1 2 B" 1 >/dev/null <<< ''
+    [ "$choice" = 1 ]
+    menu_choice choice "1 2 B" 1 >/dev/null <<< B || rc=$?
+    [ "$rc" = 2 ]
+    rc=0
+    menu_choice choice "1 2 B" 1 </dev/null || rc=$?
+    [ "$rc" = 2 ]
+}
+
+test_menu_field_retries_without_exiting() {
+    local selected=old
+    menu_field selected '端口' '' validate_port '端口' >/dev/null 2>&1 <<< $'bad\n70000\n12345'
+    [ "$selected" = 12345 ]
+    local rc=0
+    menu_field selected '端口' '' validate_port '端口' >/dev/null <<< B || rc=$?
+    [ "$rc" = 2 ]
+    [ "$selected" = 12345 ]
+}
+
+test_menu_action_reports_failure_without_false_success() {
+    local output marker="$TEST_ROOT/menu-false-success"
+    menu_failure() { return 23; }
+    output=$(menu_action menu_failure 2>&1)
+    grep -q '退出码 23' <<< "$output"
+    ! grep -q '操作结束\|已取消' <<< "$output"
+    [[ $- == *e* ]]
+    menu_cancel() { _PD_MENU_CANCELLED=1; return 2; }
+    output=$(menu_action menu_cancel)
+    grep -q '已取消' <<< "$output"
+    ! grep -q '操作未完成' <<< "$output"
+    worker_exit_two() { return 2; }
+    output=$(menu_action worker_exit_two 2>&1)
+    grep -q '操作未完成' <<< "$output"
+    ! grep -q '已取消' <<< "$output"
+    # Real write worker must still stop after the first failure in UI contexts.
+    write_lock_acquire() { _PD_LOCK_DEPTH=1; }
+    write_lock_release() { _PD_LOCK_DEPTH=0; }
+    ui_worker_failure() { false; : > "$1"; }
+    menu_action run_write_locked ui_worker_failure "$marker" >/dev/null 2>&1
+    [ ! -e "$marker" ]
+}
+
+test_menu_pause_does_not_consume_redirected_input() {
+    local remaining
+    { menu_pause; IFS= read -r remaining; [ "$remaining" = next ]; } <<< next
+}
+
+test_home_displays_independent_service_states() {
+    local output
+    ALL_PROTOS='snell hy2 anytls'
+    pkey() { echo "$1"; }; pname() { echo "$1"; }; psvc() { echo "$1"; }
+    state_installed() { [ "$1" != anytls ]; }
+    state_get() { case "$2" in port) echo 443 ;; version) echo v6.0.0 ;; esac; }
+    systemctl() {
+        case "$2" in snell) echo active ;; shadowtls-snell) echo failed ;; *) echo inactive ;; esac
+    }
+    mkdir -p "$SYSTEMD_DIR"
+    : > "$SYSTEMD_DIR/shadowtls-snell.service"
+    output=$(show_status)
+    grep -q 'snell  运行中' <<< "$output"
+    grep -q 'ShadowTLS: 异常' <<< "$output"
+    grep -q 'hy2  已停止' <<< "$output"
+    grep -q 'anytls  未安装' <<< "$output"
+    grep -q '管理脚本 v' <<< "$output"
+    ! grep -Eq 'ONLINE|OFFLINE|[╔║◆]' <<< "$output"
+}
+
+test_forward_display_separates_enabled_and_runtime() {
+    local UI_RULE_PATH="$TEST_ROOT/ui-forward-rules" output
+    printf 'pf0001|1|tcp|12000|198.51.100.20|443|demo\n' > "$UI_RULE_PATH"
+    forward_rules_file() { echo "$UI_RULE_PATH"; }
+    forward_runtime_status() { echo '需修复'; return 1; }
+    output=$(forward_show_rules)
+    grep -q '需修复' <<< "$output"
+    grep -q '已启用' <<< "$output"
+    ! grep -q '运行中' <<< "$output"
+}
+
+test_install_wizard_cancel_never_starts_write() {
+    local marker="$TEST_ROOT/cancel-install-write" rc=0
+    run_write_locked() { : > "$marker"; }
+    menu_install >/dev/null 2>&1 < <(printf '1\nB\n') || rc=$?
+    [ "$rc" = 2 ]
+    [ ! -e "$marker" ]
+    rc=0
+    # EOF at the hidden ShadowTLS password prompt must cancel, not install.
+    menu_install >/dev/null 2>&1 < <(printf '1\n3\n2\n1\n3\n') || rc=$?
+    [ "$rc" = 2 ]
+    [ ! -e "$marker" ]
+}
+
+test_forward_wizard_preserves_prior_fields() {
+    menu_forward_prompt_fields >/dev/null 2>&1 < <(printf 'demo\ninvalid\n3\nbad\n12000\ninvalid\n198.51.100.20\n70000\n443\n')
+    [ "$PF_NAME" = demo ]
+    [ "$PF_PROTO" = both ]
+    [ "$PF_LISTEN" = 12000 ]
+    [ "$PF_TARGET" = 198.51.100.20 ]
+    [ "$PF_TARGET_PORT" = 443 ]
+}
+
+test_shadowtls_custom_sni_and_preserved_defaults() {
+    PD_OPT_SNELL_TLS_SNI=www.microsoft.com
+    menu_prompt_shadowtls_options 0 >/dev/null 2>&1 < <(printf '4\nnode.example.com\n2\n\n')
+    [ "$PD_OPT_SNELL_TLS_SNI" = node.example.com ]
+    [ "$PD_OPT_SNELL_TLS_VERSION" = v2 ]
+    snell_shadowtls_unit_values() { printf 'fixture\nkept.example.com:443\n2\n'; }
+    menu_prompt_shadowtls_options 1 >/dev/null < <(printf '\n\n\n')
+    [ "$PD_OPT_SNELL_TLS_SNI" = kept.example.com ]
+    [ "$PD_OPT_SNELL_TLS_VERSION" = v2 ]
+    [ "$PD_OPT_SNELL_TLS_PASS" = fixture ]
+}
+
+test_anytls_domain_cannot_replace_verified_numeric_host() {
+    local dir="$TEST_ROOT/anytls-stable-export" output
+    mkdir -p "$dir"
+    printf fixture > "$dir/.password"
+    printf node.example.com > "$dir/.domain"
+    printf node.example.com > "$dir/.sni"
+    pdir() { echo "$dir"; }; pkey() { echo anytls; }
+    state_installed() { return 0; }
+    state_get() { [ "$2" = port ] && echo 443; }
+    anytls_backend() { echo sing-box; }
+    select_output_hosts() { OUTPUT_HOST4='[2001:db8::42]'; OUTPUT_HOST6=''; }
+    output_header() { :; }; output_footer() { :; }; gen_qr() { :; }
+    output=$(anytls_output 443 fixture)
+    grep -Fq 'Proxy = anytls, 2001:db8::42, 443,' <<< "$output"
+    grep -Fq 'sni=node.example.com' <<< "$output"
+    grep -Fq 'anytls://fixture@[2001:db8::42]:443?' <<< "$output"
+    output=$(show_config_only anytls)
+    grep -Fq 'Proxy = anytls, 2001:db8::42, 443,' <<< "$output"
+    grep -Fq 'sni=node.example.com' <<< "$output"
+    grep -Fq 'anytls://fixture@[2001:db8::42]:443?' <<< "$output"
+}
+
+test_forward_return_keeps_main_menu_alive() {
+    local marker="$TEST_ROOT/main-menu-update"
+    show_status() { :; }
+    forward_show_rules() { :; }
+    run_write_locked() { printf '%s\n' "$1" >> "$marker"; }
+    # Return from forwarding, then select update; EOF/Q must not affect services.
+    ( menu_main ) >/dev/null < <(printf '3\nB\n5\nQ\n')
+    [ "$(cat "$marker")" = self_install ]
+}
+
+run_test "returning from forwarding keeps the main menu available" test_forward_return_keeps_main_menu_alive
+run_test "ShadowTLS custom SNI input and retained v2 defaults work" test_shadowtls_custom_sni_and_preserved_defaults
+run_test "AnyTLS stable output keeps the confirmed address and independent TLS SNI" test_anytls_domain_cannot_replace_verified_numeric_host
+run_test "installation wizard cancellation/EOF never starts a write" test_install_wizard_cancel_never_starts_write
+run_test "forward wizard retries only invalid fields and retains earlier input" test_forward_wizard_preserves_prior_fields
+run_test "menu rejects invalid choices and handles defaults, cancellation and EOF" test_menu_invalid_input_and_cancellation
+run_test "field errors reprompt without losing prior values or exiting" test_menu_field_retries_without_exiting
+run_test "UI results distinguish failure/cancel and preserve write-worker errexit" test_menu_action_reports_failure_without_false_success
+run_test "noninteractive UI pause preserves input" test_menu_pause_does_not_consume_redirected_input
+run_test "home reports Snell and ShadowTLS states independently" test_home_displays_independent_service_states
+run_test "forward enabled flag does not claim runtime success" test_forward_display_separates_enabled_and_runtime
+
+run_test "Surge install/export IPv6 syntax preserves URI brackets and Snell v6 modes" test_surge_export_ipv6_format_and_uri_preservation
+run_test "public hostname cannot bypass an unconfirmed address family" test_public_hostname_cannot_bypass_unconfirmed_family
+run_test "unknown families reject explicit dual/IPv6 before recording state" test_unknown_family_rejects_dual_without_state_write
+run_test "cached family flags cannot authorize unconfirmed output" test_cached_family_flags_do_not_authorize_output
+run_test "systemd helper preserves unmarked nft rules" test_forward_runtime_rejects_foreign_nft_rule
+run_test "systemd helper preserves foreign iptables rules before nft deletion" test_forward_runtime_rejects_foreign_iptables_rule
+run_test "systemd helper preserves foreign references to its chain" test_forward_runtime_rejects_foreign_jump
+run_test "systemd helper stops on query or deletion failure" test_forward_runtime_query_and_delete_failures
+run_test "systemd helper cleans owned resources and rejects missing markers" test_forward_runtime_owned_cleanup_and_marker
+run_test "client acceptance requires repeated requests and matching content" test_acceptance_checks_content_and_all_requests
+
 run_test "test runner preserves errexit after an earlier failed assertion" test_framework_errexit_self_check
 run_test "explicit transaction rollback survives die/exit" test_transaction_control_flow
 run_test "no ERR rollback trap is installed" test_no_err_rollback_trap
@@ -1383,7 +1784,7 @@ run_test "AnyTLS emits Surge Proxy = anytls" test_anytls_surge_output
 run_test "HY2 Surge port hopping uses the official parameter" test_hy2_surge_port_hopping_uses_official_parameter
 run_test "HY2 config/export uses the official port hopping parameter" test_hy2_config_export_uses_official_port_hopping
 run_test "port forwarding generates owned DNAT and masquerade rules" test_forward_rules_generate_owned_dnat_and_masquerade
-run_test "IPv6-only protocol outputs always use a bracketed primary host" test_ipv6_only_protocol_outputs
+run_test "IPv6-only outputs use bare Surge hosts and bracketed URI hosts" test_ipv6_only_protocol_outputs
 run_test "dual-stack output keeps one primary and one IPv6 addition" test_dual_stack_output_is_not_duplicated
 run_test "uninstall CLI preserves a failing operation exit code" test_uninstall_failure_exit_is_preserved
 run_test "unknown CLI parameters have a reserved rejection test" test_unknown_cli_parameter_framework
